@@ -172,6 +172,7 @@ mod live {
             "type": "traceroute",
             "target": "1.1.1.1",
             "protocol": "ICMP",
+            "timeout": 10,
             "ipVersion": 4,
             "inProgressUpdates": true,
         });

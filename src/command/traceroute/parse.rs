@@ -28,6 +28,8 @@ pub struct TracerouteHop {
 #[serde(rename_all = "camelCase")]
 pub struct ParsedTraceroute {
     pub status: TracerouteStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_source: Option<String>,
     pub raw_output: String,
     pub resolved_address: Option<String>,
     pub resolved_hostname: Option<String>,
@@ -55,6 +57,7 @@ pub fn parse(raw_output: &str) -> ParsedTraceroute {
 
     let failed = |raw: &str| ParsedTraceroute {
         status: TracerouteStatus::Failed,
+        failure_source: None,
         raw_output: raw.to_string(),
         resolved_address: None,
         resolved_hostname: None,
@@ -99,6 +102,7 @@ pub fn parse(raw_output: &str) -> ParsedTraceroute {
 
     ParsedTraceroute {
         status: TracerouteStatus::Finished,
+        failure_source: None,
         raw_output: output_lines.join("\n"),
         resolved_address,
         resolved_hostname,

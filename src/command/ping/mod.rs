@@ -118,7 +118,7 @@ impl PingCommand {
 fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
     ParsedPing {
         status: PingStatus::Failed,
-        failure_source: Some(error.failure_source().to_string()),
+        failure_source: Some(error.failure_source_or("internal").to_string()),
         raw_output: error.public_message(),
         resolved_address: None,
         resolved_hostname: None,

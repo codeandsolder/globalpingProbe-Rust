@@ -46,6 +46,8 @@ pub mod parse {
     #[serde(rename_all = "camelCase")]
     pub struct ParsedMtr {
         pub status: MtrStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub failure_source: Option<String>,
         pub raw_output: String,
         pub resolved_address: Option<String>,
         pub resolved_hostname: Option<String>,
@@ -428,13 +430,15 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
+use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
 use crate::util::private_ip::is_ip_private;
+use crate::util::resolve_target::{ResolveTargetError, resolve_command_target};
 use crate::util::validate::is_safe_host;
 use parse::{MtrStatus, ParsedMtr, build_output, parse_raw};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MtrOptions {
     pub target: String,
@@ -448,6 +452,7 @@ pub struct MtrOptions {
     pub ip_version: u8,
     #[serde(default)]
     pub in_progress_updates: bool,
+    pub timeout: u32,
 }
 
 fn default_protocol() -> String {
@@ -491,16 +496,18 @@ fn validate(opts: &MtrOptions) -> Result<()> {
 
 #[must_use]
 pub fn build_args(opts: &MtrOptions) -> Vec<String> {
+    let budget = mtr_budget(opts.packets, opts.timeout);
     let mut args: Vec<String> = vec![
         format!("-{}", opts.ip_version),
         "--interval".into(),
-        "1.0".into(),
+        budget.interval.to_string(),
         "--gracetime".into(),
-        "3".into(),
+        budget.grace.to_string(),
         "--max-ttl".into(),
         "30".into(),
         "--timeout".into(),
-        "15".into(),
+        budget.native_timeout.to_string(),
+        "-n".into(),
     ];
 
     let proto = opts.protocol.to_uppercase();
@@ -531,7 +538,6 @@ impl MtrCommand {
     /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: MtrOptions = serde_json::from_value(options)?;
-        validate(&opts)?;
         let result = run_mtr(&opts).await?;
         Ok(serde_json::to_value(result)?)
     }
@@ -539,29 +545,90 @@ impl MtrCommand {
 
 // ── Internal runner ───────────────────────────────────────────────────────────
 
+fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
+    ParsedMtr {
+        status: MtrStatus::Failed,
+        failure_source: Some(error.failure_source_or("internal").to_string()),
+        raw_output: error.public_message(),
+        resolved_address: None,
+        resolved_hostname: None,
+        hops: vec![],
+    }
+}
+
+struct NativeMtrOutput {
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+}
+
+async fn run_native_mtr(args: &[String], process_timeout: Duration) -> Result<NativeMtrOutput> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+    let mut child = Command::new("mtr")
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("mtr stdout pipe unavailable"))?;
+    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("mtr stderr pipe unavailable"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text).await;
+        text
+    });
+    let mut raw_stdout = String::new();
+    let completed = timeout(process_timeout, async {
+        while let Some(line) = stdout_lines.next_line().await? {
+            raw_stdout.push_str(&line);
+            raw_stdout.push('\n');
+        }
+        child.wait().await.map(|_| ())
+    })
+    .await;
+    let timed_out = completed.is_err();
+    if timed_out {
+        child.kill().await.ok();
+        child.wait().await.ok();
+    } else {
+        completed??;
+    }
+    Ok(NativeMtrOutput {
+        stdout: raw_stdout,
+        stderr: stderr_task.await.unwrap_or_default(),
+        timed_out,
+    })
+}
+
 async fn run_mtr(opts: &MtrOptions) -> Result<ParsedMtr> {
     validate(opts)?;
-    let args = build_args(opts);
+    let deadline = MeasurementDeadline::new(opts.timeout);
+    let budget = mtr_budget(opts.packets, opts.timeout);
+    let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
+    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
+        Ok(target) => target,
+        Err(error) => return Ok(resolution_failure(&error)),
+    };
+    let mut resolved_options = opts.clone();
+    resolved_options.target = target.address.to_string();
+    let native = run_native_mtr(&build_args(&resolved_options), deadline.process_timeout()).await?;
 
-    // mtr runs for (packets × interval) + gracetime seconds; cap with a hard timeout
-    let output = timeout(
-        Duration::from_secs(60),
-        Command::new("mtr").args(&args).output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("mtr command timed out"))?
-    .map_err(|e| anyhow::anyhow!("failed to spawn mtr: {e}"))?;
-
-    let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    if raw_stdout.trim().is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if native.stdout.trim().is_empty() {
         return Ok(ParsedMtr {
             status: MtrStatus::Failed,
-            raw_output: if stderr.trim().is_empty() {
+            failure_source: Some("internal".to_string()),
+            raw_output: if native.stderr.trim().is_empty() {
                 "Test failed. Please try again.".into()
             } else {
-                stderr
+                native.stderr
             },
             resolved_address: None,
             resolved_hostname: None,
@@ -569,41 +636,45 @@ async fn run_mtr(opts: &MtrOptions) -> Result<ParsedMtr> {
         });
     }
 
-    let mut hops = parse_raw(&raw_stdout, true);
-
-    // Kill-switch: target IP resolved to a private range
-    let last_real = hops.iter().rev().find(|h| h.resolved_address.is_some());
-    if let Some(hop) = last_real
-        && let Some(addr) = &hop.resolved_address
-        && let Ok(ip) = addr.parse()
-        && is_ip_private(ip)
-    {
-        return Ok(ParsedMtr {
-            status: MtrStatus::Failed,
-            raw_output: "Private IP ranges are not allowed.".into(),
-            resolved_address: None,
-            resolved_hostname: None,
-            hops: vec![],
-        });
-    }
-
-    // ASN lookup (best-effort, non-blocking)
-    let addresses: Vec<Option<String>> = hops.iter().map(|h| h.resolved_address.clone()).collect();
+    let mut hops = parse_raw(&native.stdout, true);
+    let addresses: Vec<Option<String>> = hops
+        .iter()
+        .map(|hop| hop.resolved_address.clone())
+        .collect();
     let asns = lookup_asns(&addresses).await;
     for (hop, asn_nums) in hops.iter_mut().zip(asns) {
         hop.asn = asn_nums;
     }
-
-    let last_hop = hops.iter().rev().find(|h| h.resolved_address.is_some());
-    let resolved_address = last_hop.and_then(|h| h.resolved_address.clone());
-    let resolved_hostname = last_hop.and_then(|h| h.resolved_hostname.clone());
-    let raw_output = build_output(&hops);
-
+    let target_address = target.address.to_string();
+    let target_responded = hops.last().is_some_and(|hop| {
+        hop.resolved_address.as_deref() == Some(target_address.as_str())
+            && hop.timings.iter().any(|timing| timing.rtt.is_some())
+    });
+    let has_drop = hops.iter().any(|hop| hop.stats.drop > 0);
+    let mut raw_output = build_output(&hops);
+    let mut status = MtrStatus::Finished;
+    let mut failure_source = None;
+    if native.timed_out {
+        status = MtrStatus::Failed;
+        failure_source = Some(
+            if !target_responded && has_drop {
+                "target"
+            } else {
+                "internal"
+            }
+            .to_string(),
+        );
+        if !raw_output.is_empty() {
+            raw_output.push('\n');
+        }
+        raw_output.push_str("The measurement command timed out.");
+    }
     Ok(ParsedMtr {
-        status: MtrStatus::Finished,
+        status,
+        failure_source,
         raw_output,
-        resolved_address,
-        resolved_hostname,
+        resolved_address: Some(target_address),
+        resolved_hostname: Some(target.hostname),
         hops,
     })
 }
@@ -693,6 +764,7 @@ pub async fn run_measurement(target: &str, protocol: &str, ip_version: u8) -> Re
         packets: 3,
         ip_version,
         in_progress_updates: false,
+        timeout: 10,
     };
     run_mtr(&opts).await
 }
@@ -926,6 +998,7 @@ x 3 1";
             packets: 3,
             ip_version: 4,
             in_progress_updates: false,
+            timeout: 10,
         });
         assert!(args.contains(&"-4".to_string()));
         assert!(!args.contains(&"--icmp".to_string()));
@@ -943,6 +1016,7 @@ x 3 1";
             packets: 3,
             ip_version: 4,
             in_progress_updates: false,
+            timeout: 10,
         });
         assert!(args.contains(&"--tcp".to_string()));
         assert!(args.contains(&"-P".to_string()));
@@ -958,6 +1032,7 @@ x 3 1";
             packets: 3,
             ip_version: 6,
             in_progress_updates: false,
+            timeout: 10,
         });
         assert!(args.contains(&"-6".to_string()));
         assert!(args.contains(&"--udp".to_string()));
@@ -972,6 +1047,7 @@ x 3 1";
             packets: 3,
             ip_version: 4,
             in_progress_updates: false,
+            timeout: 10,
         };
         assert!(validate(&opts).is_err());
     }
@@ -985,6 +1061,7 @@ x 3 1";
             packets: 0,
             ip_version: 4,
             in_progress_updates: false,
+            timeout: 10,
         };
         assert!(validate(&opts).is_err());
     }
@@ -1000,6 +1077,7 @@ x 3 1";
                     packets: 3,
                     ip_version: *ver,
                     in_progress_updates: false,
+                    timeout: 10,
                 };
                 assert!(
                     validate(&opts).is_ok(),

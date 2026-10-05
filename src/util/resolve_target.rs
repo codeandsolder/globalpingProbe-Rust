@@ -40,8 +40,12 @@ impl std::error::Error for ResolveTargetError {}
 
 impl ResolveTargetError {
     #[must_use]
-    pub const fn failure_source(&self) -> &'static str {
-        "target"
+    pub const fn failure_source_or<'a>(&self, fallback: &'a str) -> &'a str {
+        match self {
+            Self::PrivateIp => "target",
+            Self::TimedOut => "resolver",
+            Self::NotFound | Self::Lookup(_) => fallback,
+        }
     }
 
     #[must_use]
@@ -59,7 +63,7 @@ impl ResolveTargetError {
     }
 }
 
-async fn reverse_lookup(address: IpAddr, budget: Duration) -> Option<String> {
+pub async fn reverse_lookup(address: IpAddr, budget: Duration) -> Option<String> {
     if budget.is_zero() {
         return None;
     }
@@ -132,7 +136,7 @@ mod tests {
             .await
             .expect_err("loopback must be rejected");
         assert!(matches!(error, ResolveTargetError::PrivateIp));
-        assert_eq!(error.failure_source(), "target");
+        assert_eq!(error.failure_source_or("internal"), "target");
     }
 
     #[tokio::test]
