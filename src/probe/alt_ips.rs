@@ -1,8 +1,8 @@
-use std::net::IpAddr;
+use rust_socketio::asynchronous::Client;
 use serde::Deserialize;
+use std::net::IpAddr;
 use tokio::time::Duration;
 use tracing::{info, warn};
-use rust_socketio::asynchronous::Client;
 
 enum AltIpError {
     Rejected(String), // HTTP 400 — API explicitly rejected this IP
@@ -11,6 +11,7 @@ enum AltIpError {
 
 /// Enumerate all public IP addresses from local network interfaces.
 /// Uses `ip -o addr show scope global` to filter out loopback and link-local.
+#[must_use]
 pub fn get_local_public_ips() -> Vec<IpAddr> {
     let Ok(out) = std::process::Command::new("ip")
         .args(["-o", "addr", "show", "scope", "global"])
@@ -49,7 +50,10 @@ struct AltIpResponse {
 
 /// POST to `/alternative-ip` with the request bound to `local_ip` so the API
 /// can verify the probe actually owns that address. Returns (ip, token) on success.
-async fn fetch_alt_ip_token(local_ip: IpAddr, http_host: &str) -> Result<(String, String), AltIpError> {
+async fn fetch_alt_ip_token(
+    local_ip: IpAddr,
+    http_host: &str,
+) -> Result<(String, String), AltIpError> {
     let client = reqwest::Client::builder()
         .local_address(local_ip)
         .timeout(Duration::from_secs(15))
@@ -94,10 +98,9 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
         return;
     }
 
-    let results = futures::future::join_all(
-        alt_ips.iter().map(|&ip| fetch_alt_ip_token(ip, http_host)),
-    )
-    .await;
+    let results =
+        futures::future::join_all(alt_ips.iter().map(|&ip| fetch_alt_ip_token(ip, http_host)))
+            .await;
 
     let mut tokens: Vec<serde_json::Value> = Vec::new();
     let mut confirmed_ips: Vec<String> = vec![main_ip.to_string()];
@@ -109,20 +112,34 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
                 }
                 tokens.push(serde_json::json!([confirmed_ip, token]));
             }
-            Err(AltIpError::Rejected(reason)) => warn!(target: "api:connect:alt-ips-handler", "IP {ip} rejected: {reason}"),
-            Err(AltIpError::Failed(error))    => warn!(target: "api:connect:alt-ips-handler", "{error} (via {ip})."),
+            Err(AltIpError::Rejected(reason)) => {
+                warn!(target: "api:connect:alt-ips-handler", "IP {ip} rejected: {reason}");
+            }
+            Err(AltIpError::Failed(error)) => {
+                warn!(target: "api:connect:alt-ips-handler", "{error} (via {ip}).");
+            }
         }
     }
 
     // Sort so IPv4 addresses appear before IPv6
     confirmed_ips.sort_by_key(|ip| {
-        let parsed: std::net::IpAddr = ip.parse().ok().unwrap_or(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-        matches!(parsed, std::net::IpAddr::V6(_)) as u8
+        let parsed: std::net::IpAddr = ip
+            .parse()
+            .ok()
+            .unwrap_or(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+        u8::from(matches!(parsed, std::net::IpAddr::V6(_)))
     });
-    let noun = if confirmed_ips.len() == 1 { "IP address" } else { "IP addresses" };
+    let noun = if confirmed_ips.len() == 1 {
+        "IP address"
+    } else {
+        "IP addresses"
+    };
     info!("{noun} of the probe: {}.", confirmed_ips.join(", "));
 
-    if let Err(e) = socket.emit("probe:alt-ips", serde_json::Value::Array(tokens)).await {
+    if let Err(e) = socket
+        .emit("probe:alt-ips", serde_json::Value::Array(tokens))
+        .await
+    {
         warn!("Failed to emit probe:alt-ips: {e}");
     }
 }

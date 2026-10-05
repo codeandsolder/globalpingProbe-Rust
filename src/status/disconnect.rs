@@ -2,15 +2,18 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const MAX_DISCONNECTS: usize = 3;
-const TTL: Duration = Duration::from_secs(5 * 60);
+const TTL: Duration = Duration::from_mins(5);
 
 pub struct DisconnectTracker {
     entries: HashMap<String, Instant>,
 }
 
 impl DisconnectTracker {
+    #[must_use]
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     pub fn record(&mut self) -> bool {
@@ -27,6 +30,12 @@ impl DisconnectTracker {
     pub fn count(&mut self) -> usize {
         self.evict_expired();
         self.entries.len()
+    }
+}
+
+impl Default for DisconnectTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

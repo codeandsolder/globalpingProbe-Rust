@@ -1,9 +1,7 @@
 /// Integration tests for in-progress measurement streaming.
 /// Verifies that ping and traceroute emit partial results on the progress channel
 /// as they run, before the final result is returned.
-use globalping_probe::command::{
-    ping::PingCommand, traceroute::TracerouteCommand, MeasurementCommand,
-};
+use globalping_probe::command::{ping::PingCommand, traceroute::TracerouteCommand};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -11,40 +9,19 @@ use tokio::sync::mpsc;
 
 /// Verify the progress channel path exists and is type-correct (compile check).
 #[test]
-fn ping_run_with_progress_signature_compiles() {
-    // Just checks the function exists and has the right signature at compile time.
-    let _: &dyn MeasurementCommand = &PingCommand;
-}
-
-#[test]
-fn traceroute_run_with_progress_signature_compiles() {
-    let _: &dyn MeasurementCommand = &TracerouteCommand;
-}
-
-/// Verify that a closed sender doesn't panic the command.
-#[tokio::test]
-async fn ping_with_closed_channel_still_returns_result() {
-    let (tx, _rx) = mpsc::unbounded_channel::<serde_json::Value>();
-    // Drop the receiver immediately — the sender becomes closed.
-    // The command must not panic when tx.send() fails.
-    let options = json!({
-        "type": "ping",
-        "target": "127.0.0.1",
-        "packets": 1,
-        "ipVersion": 4,
-        "inProgressUpdates": true,
-    });
-    // We can't actually run ping in a unit test environment, so just verify
-    // that the send-on-closed-channel path (.ok()) is safe.
-    drop(tx);
-}
-
-#[tokio::test]
-async fn traceroute_with_closed_channel_does_not_panic() {
+fn progress_methods_are_constructible() {
     let (tx, _rx) = mpsc::unbounded_channel();
-    drop(_rx); // close receiver
-    // Sending on a closed channel returns Err but .ok() swallows it.
-    tx.send(json!({"test": 1})).ok();
+    let ping_future = PingCommand.run_with_progress(json!({}), tx.clone());
+    let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx);
+    drop((ping_future, traceroute_future));
+}
+
+/// Verify producers can detect a dropped progress receiver without panicking.
+#[test]
+fn closed_progress_channel_send_returns_error() {
+    let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    drop(rx);
+    assert!(tx.send(json!({"status": "in-progress"})).is_err());
 }
 
 // ── Channel mechanics ─────────────────────────────────────────────────────────
@@ -111,21 +88,30 @@ async fn progress_channel_accepts_partial_traceroute_shape() {
 #[test]
 fn in_progress_flag_defaults_to_false() {
     let opts = json!({ "type": "ping", "target": "1.1.1.1" });
-    let flag = opts.get("inProgressUpdates").and_then(|v| v.as_bool()).unwrap_or(false);
+    let flag = opts
+        .get("inProgressUpdates")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(!flag);
 }
 
 #[test]
 fn in_progress_flag_true_is_read() {
     let opts = json!({ "type": "traceroute", "target": "1.1.1.1", "inProgressUpdates": true });
-    let flag = opts.get("inProgressUpdates").and_then(|v| v.as_bool()).unwrap_or(false);
+    let flag = opts
+        .get("inProgressUpdates")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(flag);
 }
 
 #[test]
 fn in_progress_flag_false_is_read() {
     let opts = json!({ "type": "ping", "target": "1.1.1.1", "inProgressUpdates": false });
-    let flag = opts.get("inProgressUpdates").and_then(|v| v.as_bool()).unwrap_or(false);
+    let flag = opts
+        .get("inProgressUpdates")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(!flag);
 }
 
@@ -149,23 +135,31 @@ mod live {
         });
 
         // Run measurement and collect progress concurrently
-        let measure = tokio::spawn(async move {
-            PingCommand.run_with_progress(options, tx).await
-        });
+        let measure = tokio::spawn(async move { PingCommand.run_with_progress(options, tx).await });
 
         let mut partial_count = 0usize;
         while let Some(partial) = rx.recv().await {
             partial_count += 1;
-            assert_eq!(partial["status"], "in-progress", "partial status should be in-progress");
-            assert!(partial["timings"].as_array().map_or(false, |t| !t.is_empty()),
-                "partial should have at least one timing");
+            assert_eq!(
+                partial["status"], "in-progress",
+                "partial status should be in-progress"
+            );
+            assert!(
+                partial["timings"]
+                    .as_array()
+                    .map_or(false, |t| !t.is_empty()),
+                "partial should have at least one timing"
+            );
         }
 
         let final_result = measure.await.unwrap().unwrap();
         println!("Ping progress events: {partial_count}");
         println!("Final status: {}", final_result["status"]);
 
-        assert!(partial_count >= 1, "expected at least 1 progress event for 3 packets");
+        assert!(
+            partial_count >= 1,
+            "expected at least 1 progress event for 3 packets"
+        );
         assert_eq!(final_result["status"], "finished");
     }
 
@@ -181,9 +175,8 @@ mod live {
             "inProgressUpdates": true,
         });
 
-        let measure = tokio::spawn(async move {
-            TracerouteCommand.run_with_progress(options, tx).await
-        });
+        let measure =
+            tokio::spawn(async move { TracerouteCommand.run_with_progress(options, tx).await });
 
         let mut hop_counts: Vec<usize> = vec![];
         while let Some(partial) = rx.recv().await {

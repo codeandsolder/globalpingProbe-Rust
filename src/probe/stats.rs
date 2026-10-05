@@ -1,19 +1,20 @@
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 /// Tracks how many measurements were started and finished in the current
 /// reporting window.  All methods are lock-free (atomic operations).
 pub struct MeasurementStats {
-    started:  AtomicU64,
+    started: AtomicU64,
     finished: AtomicU64,
 }
 
 impl MeasurementStats {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            started:  AtomicU64::new(0),
+            started: AtomicU64::new(0),
             finished: AtomicU64::new(0),
         })
     }
@@ -26,8 +27,12 @@ impl MeasurementStats {
         self.finished.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn started(&self) -> u64  { self.started.load(Ordering::Relaxed) }
-    pub fn finished(&self) -> u64 { self.finished.load(Ordering::Relaxed) }
+    pub fn started(&self) -> u64 {
+        self.started.load(Ordering::Relaxed)
+    }
+    pub fn finished(&self) -> u64 {
+        self.finished.load(Ordering::Relaxed)
+    }
 
     /// Take a snapshot and reset both counters to zero atomically.
     pub fn take(&self) -> (u64, u64) {
@@ -101,7 +106,9 @@ mod tests {
                 s2.record_finish();
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
         assert_eq!(s.started(), 10);
         assert_eq!(s.finished(), 10);
     }

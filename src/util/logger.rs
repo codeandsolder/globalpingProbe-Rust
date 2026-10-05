@@ -1,12 +1,11 @@
-use std::fmt;
 use chrono::Utc;
+use std::fmt;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{
+    EnvFilter, Layer,
     fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
-    registry::LookupSpan,
-    EnvFilter,
-    Layer,
     layer::SubscriberExt,
+    registry::LookupSpan,
     util::SubscriberInitExt,
 };
 
@@ -40,17 +39,21 @@ where
 
         let level = match *event.metadata().level() {
             tracing::Level::ERROR => "[ERROR]",
-            tracing::Level::WARN  => "[WARN]",
-            tracing::Level::INFO  => "[INFO]",
+            tracing::Level::WARN => "[WARN]",
+            tracing::Level::INFO => "[INFO]",
             tracing::Level::DEBUG => "[DEBUG]",
             tracing::Level::TRACE => "[TRACE]",
         };
-        write!(writer, "{} ", level)?;
+        write!(writer, "{level} ")?;
 
         // Rust module paths (containing "::") map to "general".
         // Explicit scopes like "api:connect:location" are passed through as-is.
-        let scope = if target.contains("::") { "general" } else { target };
-        write!(writer, "[{}] ", scope)?;
+        let scope = if target.contains("::") {
+            "general"
+        } else {
+            target
+        };
+        write!(writer, "[{scope}] ")?;
 
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
@@ -61,8 +64,7 @@ pub fn init() {
     // Apply filter per-layer so each layer is independently filtered.
     // A single registry-level filter would be bypassed by outer layers.
     let filter_str = "debug,hyper=warn,reqwest=warn,h2=warn,rustls=warn,log=warn";
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(filter_str));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_str));
     let filter2 = EnvFilter::new(filter_str);
 
     // GpFormat skips "log" target events directly (log-bridge events bypass per-layer

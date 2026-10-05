@@ -1,14 +1,14 @@
+use chrono::Utc;
+use serde::Serialize;
+use serde_json::json;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Mutex;
-use chrono::Utc;
-use once_cell::sync::Lazy;
-use serde::Serialize;
-use serde_json::json;
 use tracing::{Event, Subscriber};
-use tracing_subscriber::{layer::Context, registry::LookupSpan, Layer};
+use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
-pub static API_LOG_BUFFER: Lazy<ApiLogsBuffer> = Lazy::new(ApiLogsBuffer::new);
+pub static API_LOG_BUFFER: std::sync::LazyLock<ApiLogsBuffer> =
+    std::sync::LazyLock::new(ApiLogsBuffer::new);
 
 // ── Wire types ────────────────────────────────────────────────────────────────
 
@@ -28,7 +28,11 @@ struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { is_active: false, send_interval_ms: 10_000, max_buffer_size: 100 }
+        Self {
+            is_active: false,
+            send_interval_ms: 10_000,
+            max_buffer_size: 100,
+        }
     }
 }
 
@@ -45,6 +49,7 @@ pub struct ApiLogsBuffer {
 }
 
 impl ApiLogsBuffer {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -66,24 +71,39 @@ impl ApiLogsBuffer {
         }
     }
 
-    pub fn update(&self, is_active: Option<bool>, send_interval_ms: Option<u64>, max_buffer_size: Option<usize>) {
+    pub fn update(
+        &self,
+        is_active: Option<bool>,
+        send_interval_ms: Option<u64>,
+        max_buffer_size: Option<usize>,
+    ) {
         let Ok(mut g) = self.inner.lock() else { return };
-        if let Some(v) = is_active { g.settings.is_active = v; }
-        if let Some(v) = send_interval_ms { g.settings.send_interval_ms = v; }
-        if let Some(v) = max_buffer_size { g.settings.max_buffer_size = v; }
+        if let Some(v) = is_active {
+            g.settings.is_active = v;
+        }
+        if let Some(v) = send_interval_ms {
+            g.settings.send_interval_ms = v;
+        }
+        if let Some(v) = max_buffer_size {
+            g.settings.max_buffer_size = v;
+        }
     }
 
     pub fn is_active(&self) -> bool {
-        self.inner.lock().map(|g| g.settings.is_active).unwrap_or(false)
+        self.inner.lock().is_ok_and(|g| g.settings.is_active)
     }
 
     pub fn send_interval_ms(&self) -> u64 {
-        self.inner.lock().map(|g| g.settings.send_interval_ms).unwrap_or(10_000)
+        self.inner
+            .lock()
+            .map_or(10_000, |g| g.settings.send_interval_ms)
     }
 
     /// Take buffered entries for sending. Returns None if inactive or empty.
     pub fn take(&self) -> Option<serde_json::Value> {
-        let Ok(mut g) = self.inner.lock() else { return None };
+        let Ok(mut g) = self.inner.lock() else {
+            return None;
+        };
         if !g.settings.is_active || g.entries.is_empty() {
             return None;
         }
@@ -91,6 +111,12 @@ impl ApiLogsBuffer {
         let skipped = g.dropped;
         g.dropped = 0;
         Some(json!({ "logs": logs, "skipped": skipped }))
+    }
+}
+
+impl Default for ApiLogsBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -145,15 +171,17 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ApiLogsLayer {
 
 // ── Background flush loop ─────────────────────────────────────────────────────
 
-use tokio::time::{sleep, Duration};
 use rust_socketio::asynchronous::Client;
+use tokio::time::{Duration, sleep};
 
 pub async fn run_logs_loop(client: Client) {
     loop {
         let interval = API_LOG_BUFFER.send_interval_ms();
         sleep(Duration::from_millis(interval)).await;
 
-        let Some(payload) = API_LOG_BUFFER.take() else { continue };
+        let Some(payload) = API_LOG_BUFFER.take() else {
+            continue;
+        };
         client.emit("probe:logs", payload).await.ok();
     }
 }

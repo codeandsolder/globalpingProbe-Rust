@@ -1,15 +1,15 @@
 pub mod parse;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-use super::{MeasurementCommand, ProgressTx};
+use super::ProgressTx;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
-use parse::{parse, ParsedTraceroute, TracerouteStatus};
+use parse::{ParsedTraceroute, TracerouteStatus, parse};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -27,9 +27,15 @@ pub struct TracerouteOptions {
     pub in_progress_updates: bool,
 }
 
-fn default_protocol() -> String { "ICMP".into() }
-fn default_port() -> u16 { 80 }
-fn default_ip_version() -> u8 { 4 }
+fn default_protocol() -> String {
+    "ICMP".into()
+}
+const fn default_port() -> u16 {
+    80
+}
+const fn default_ip_version() -> u8 {
+    4
+}
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -44,23 +50,28 @@ fn validate(opts: &TracerouteOptions) -> Result<()> {
     if proto != "ICMP" && proto != "TCP" && proto != "UDP" {
         bail!("protocol must be ICMP, TCP, or UDP");
     }
-    if let Ok(ip) = opts.target.parse() {
-        if is_ip_private(ip) {
-            bail!("Private IP ranges are not allowed");
-        }
+    if let Ok(ip) = opts.target.parse()
+        && is_ip_private(ip)
+    {
+        bail!("Private IP ranges are not allowed");
     }
     Ok(())
 }
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 
+#[must_use]
 pub fn build_args(opts: &TracerouteOptions) -> Vec<String> {
     let mut args: Vec<String> = vec![
         format!("-{}", opts.ip_version),
-        "-m".into(), "20".into(),
-        "-w".into(), "2".into(),
-        "-q".into(), "2".into(),
-        "-N".into(), "20".into(),
+        "-m".into(),
+        "20".into(),
+        "-w".into(),
+        "2".into(),
+        "-q".into(),
+        "2".into(),
+        "-N".into(),
+        "20".into(),
         format!("--{}", opts.protocol.to_lowercase()),
     ];
 
@@ -77,16 +88,23 @@ pub fn build_args(opts: &TracerouteOptions) -> Vec<String> {
 
 pub struct TracerouteCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for TracerouteCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl TracerouteCommand {
+    /// Execute a traceroute command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process/IO failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: TracerouteOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_traceroute(&opts, None).await?;
         Ok(serde_json::to_value(result)?)
     }
 
-    async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+    /// Execute traceroute while streaming partial hop results.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process/IO failures, or serialization failures.
+    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
         let opts: TracerouteOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_traceroute(&opts, Some(tx)).await?;
@@ -94,12 +112,10 @@ impl MeasurementCommand for TracerouteCommand {
     }
 }
 
-// Matches any traceroute hop line: starts with whitespace + hop number
-static HOP_LINE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-    regex::Regex::new(r"^\s*\d+\s").unwrap()
-});
-
-async fn run_traceroute(opts: &TracerouteOptions, progress: Option<ProgressTx>) -> Result<ParsedTraceroute> {
+async fn run_traceroute(
+    opts: &TracerouteOptions,
+    progress: Option<ProgressTx>,
+) -> Result<ParsedTraceroute> {
     validate(opts)?;
     let args = build_args(opts);
 
@@ -109,7 +125,10 @@ async fn run_traceroute(opts: &TracerouteOptions, progress: Option<ProgressTx>) 
         .stderr(std::process::Stdio::piped())
         .spawn()?;
 
-    let stdout = child.stdout.take().expect("stdout was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .context("child stdout pipe was unavailable")?;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     let mut raw_lines: Vec<String> = vec![];
@@ -118,19 +137,23 @@ async fn run_traceroute(opts: &TracerouteOptions, progress: Option<ProgressTx>) 
         raw_lines.push(line.clone());
 
         // Emit a partial result after every hop line
-        if let Some(tx) = &progress {
-            if HOP_LINE.is_match(&line) {
-                let accumulated = raw_lines.join("\n");
-                let partial = parse(&accumulated);
-                if !partial.hops.is_empty() {
-                    tx.send(json!({
-                        "status":            "in-progress",
-                        "rawOutput":         accumulated,
-                        "resolvedAddress":   partial.resolved_address,
-                        "resolvedHostname":  partial.resolved_hostname,
-                        "hops":              partial.hops,
-                    })).ok();
-                }
+        if let Some(tx) = &progress
+            && line
+                .split_whitespace()
+                .next()
+                .is_some_and(|field| field.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            let accumulated = raw_lines.join("\n");
+            let partial = parse(&accumulated);
+            if !partial.hops.is_empty() {
+                tx.send(json!({
+                    "status":            "in-progress",
+                    "rawOutput":         accumulated,
+                    "resolvedAddress":   partial.resolved_address,
+                    "resolvedHostname":  partial.resolved_hostname,
+                    "hops":              partial.hops,
+                }))
+                .ok();
             }
         }
     }
@@ -151,14 +174,13 @@ async fn run_traceroute(opts: &TracerouteOptions, progress: Option<ProgressTx>) 
 
     let mut parsed = parse(&raw);
 
-    if let Some(addr) = &parsed.resolved_address {
-        if let Ok(ip) = addr.parse() {
-            if is_ip_private(ip) {
-                parsed.status = TracerouteStatus::Failed;
-                parsed.raw_output = "Private IP ranges are not allowed.".into();
-                parsed.hops.clear();
-            }
-        }
+    if let Some(addr) = &parsed.resolved_address
+        && let Ok(ip) = addr.parse()
+        && is_ip_private(ip)
+    {
+        parsed.status = TracerouteStatus::Failed;
+        parsed.raw_output = "Private IP ranges are not allowed.".into();
+        parsed.hops.clear();
     }
 
     Ok(parsed)
@@ -166,6 +188,10 @@ async fn run_traceroute(opts: &TracerouteOptions, progress: Option<ProgressTx>) 
 
 // ── Helper for integration tests ──────────────────────────────────────────────
 
+/// Run one traceroute measurement without the socket layer.
+///
+/// # Errors
+/// Returns an error for invalid options or process/IO failures.
 pub async fn run_trace(target: &str, protocol: &str, ip_version: u8) -> Result<ParsedTraceroute> {
     let opts = TracerouteOptions {
         target: target.to_string(),
@@ -249,7 +275,12 @@ mod tests {
         for proto in &["ICMP", "TCP", "UDP"] {
             for ver in &[4u8, 6u8] {
                 let opts = make_opts(proto, *ver);
-                assert!(validate(&opts).is_ok(), "expected ok for {} v{}", proto, ver);
+                assert!(
+                    validate(&opts).is_ok(),
+                    "expected ok for {} v{}",
+                    proto,
+                    ver
+                );
             }
         }
     }

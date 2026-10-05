@@ -17,27 +17,36 @@ pub struct MeasurementLimiter {
 }
 
 impl MeasurementLimiter {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_capacity(MAX_CONCURRENT)
     }
 
+    #[must_use]
     pub fn with_capacity(n: usize) -> Self {
-        Self { semaphore: Arc::new(Semaphore::new(n)), capacity: n }
+        Self {
+            semaphore: Arc::new(Semaphore::new(n)),
+            capacity: n,
+        }
     }
 
     /// Attempt to acquire a slot without blocking.
     /// Returns `Some(slot)` if capacity is available, `None` if full.
+    #[must_use]
     pub fn try_acquire(&self) -> Option<MeasurementSlot> {
         Arc::clone(&self.semaphore).try_acquire_owned().ok()
     }
 
     /// Number of measurements currently running.
+    #[must_use]
     pub fn in_flight(&self) -> usize {
-        self.capacity.saturating_sub(self.semaphore.available_permits())
+        self.capacity
+            .saturating_sub(self.semaphore.available_permits())
     }
 
     /// Maximum simultaneous measurements.
-    pub fn capacity(&self) -> usize {
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
         self.capacity
     }
 
@@ -48,16 +57,26 @@ impl MeasurementLimiter {
     /// are released immediately on return, so callers that start measurements
     /// afterwards will still be able to acquire slots normally.
     pub async fn wait_idle(&self) {
-        let _guard = self.semaphore
-            .acquire_many(self.capacity as u32)
-            .await
-            .expect("semaphore unexpectedly closed");
-        // _guard dropped here, all permits returned
+        if self.capacity == 0 {
+            return;
+        }
+        let Ok(mut all_permits) = self.semaphore.acquire().await else {
+            return;
+        };
+        for _ in 1..self.capacity {
+            let Ok(permit) = self.semaphore.acquire().await else {
+                return;
+            };
+            all_permits.merge(permit);
+        }
+        // `all_permits` now represents the full capacity, so in-flight work is drained.
     }
 }
 
 impl Default for MeasurementLimiter {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -131,7 +150,9 @@ mod tests {
     async fn released_slot_is_immediately_reacquirable() {
         let lim = MeasurementLimiter::with_capacity(1);
         for _ in 0..10 {
-            let s = lim.try_acquire().expect("slot should be free at start of each iter");
+            let s = lim
+                .try_acquire()
+                .expect("slot should be free at start of each iter");
             drop(s);
         }
     }

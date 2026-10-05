@@ -1,6 +1,6 @@
 /// Integration tests for rawOutput size limiting.
 use globalping_probe::util::output_limit::{
-    limit_raw_output, truncate_output, MAX_RAW_OUTPUT_BYTES,
+    MAX_RAW_OUTPUT_BYTES, limit_raw_output, truncate_output,
 };
 use serde_json::json;
 
@@ -45,7 +45,10 @@ fn truncated_output_is_valid_utf8() {
     // The cut at MAX_RAW_OUTPUT_BYTES falls inside the emoji; truncate_output
     // must walk back to a valid boundary and not produce invalid UTF-8.
     let out = truncate_output(&s, MAX_RAW_OUTPUT_BYTES);
-    assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "output must be valid UTF-8");
+    assert!(
+        std::str::from_utf8(out.as_bytes()).is_ok(),
+        "output must be valid UTF-8"
+    );
     assert!(out.contains("[...truncated]"));
 }
 
@@ -79,11 +82,17 @@ fn ping_result_within_limit_unchanged() {
 
 #[test]
 fn oversized_ping_result_is_capped() {
-    let big_raw = format!("PING 1.1.1.1\n{}", "64 bytes from 1.1.1.1: seq=0 ttl=58 time=5ms\n".repeat(500));
+    let big_raw = format!(
+        "PING 1.1.1.1\n{}",
+        "64 bytes from 1.1.1.1: seq=0 ttl=58 time=5ms\n".repeat(500)
+    );
     let mut v = json!({ "status": "finished", "rawOutput": big_raw });
     limit_raw_output(&mut v);
     let raw = v["rawOutput"].as_str().unwrap();
-    assert!(raw.contains("[...truncated]"), "large ping rawOutput should be capped");
+    assert!(
+        raw.contains("[...truncated]"),
+        "large ping rawOutput should be capped"
+    );
     assert!(raw.len() <= MAX_RAW_OUTPUT_BYTES + "[...truncated]\n".len());
 }
 
@@ -103,7 +112,11 @@ fn oversized_traceroute_result_is_capped() {
     limit_raw_output(&mut v);
     let raw = v["rawOutput"].as_str().unwrap();
     assert!(raw.contains("[...truncated]"));
-    assert_eq!(v["hops"].as_array().unwrap().len(), 0, "other fields unchanged");
+    assert_eq!(
+        v["hops"].as_array().unwrap().len(),
+        0,
+        "other fields unchanged"
+    );
 }
 
 // ── limit_raw_output — progress event ────────────────────────────────────────
@@ -117,8 +130,16 @@ fn in_progress_event_rawoutput_capped() {
         "timings": [{"rtt": 10.0}],
     });
     limit_raw_output(&mut partial);
-    assert!(partial["rawOutput"].as_str().unwrap().contains("[...truncated]"));
-    assert_eq!(partial["status"], "in-progress", "status field must survive");
+    assert!(
+        partial["rawOutput"]
+            .as_str()
+            .unwrap()
+            .contains("[...truncated]")
+    );
+    assert_eq!(
+        partial["status"], "in-progress",
+        "status field must survive"
+    );
     assert_eq!(partial["timings"][0]["rtt"], 10.0, "timings must survive");
 }
 

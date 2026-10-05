@@ -7,6 +7,7 @@ pub const UUID_PATH: &str = "/.globalping-probe-uuid";
 
 /// Resolve the actual UUID file path: use `/.globalping-probe-uuid` if writable (root),
 /// otherwise fall back to `$HOME/.globalping-probe-uuid`.
+#[must_use]
 pub fn resolve_uuid_path() -> String {
     // Try the canonical path first (works when running as root)
     if std::fs::OpenOptions::new()
@@ -37,17 +38,15 @@ impl ProbeUuid {
                 if !id.is_empty() {
                     return Self { id };
                 }
-                Self::generate(path)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 tracing::info!("No UUID file at {path}. Generating new UUID.");
-                Self::generate(path)
             }
-            Err(e) => {
-                tracing::warn!("Failed to read UUID file ({e}). Generating new UUID.");
-                Self::generate(path)
+            Err(error) => {
+                tracing::warn!("Failed to read UUID file ({error}). Generating new UUID.");
             }
         }
+        Self::generate(path)
     }
 
     fn generate(path: &str) -> Self {

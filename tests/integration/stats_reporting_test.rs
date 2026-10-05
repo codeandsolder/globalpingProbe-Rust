@@ -68,8 +68,12 @@ fn stats_multiple_takes_are_independent() {
 #[test]
 fn stats_start_and_finish_independence() {
     let s = MeasurementStats::new();
-    for _ in 0..5 { s.record_start(); }
-    for _ in 0..3 { s.record_finish(); }
+    for _ in 0..5 {
+        s.record_start();
+    }
+    for _ in 0..3 {
+        s.record_finish();
+    }
     assert_eq!(s.started(), 5);
     assert_eq!(s.finished(), 3);
 }
@@ -87,7 +91,9 @@ async fn stats_shared_arc_accumulates_from_concurrent_tasks() {
             s2.record_finish();
         }));
     }
-    for h in handles { h.await.unwrap(); }
+    for h in handles {
+        h.await.unwrap();
+    }
     assert_eq!(s.started(), 20);
     assert_eq!(s.finished(), 20);
 }
@@ -95,7 +101,9 @@ async fn stats_shared_arc_accumulates_from_concurrent_tasks() {
 #[tokio::test]
 async fn stats_take_while_writers_finish() {
     let s = MeasurementStats::new();
-    for _ in 0..5 { s.record_start(); }
+    for _ in 0..5 {
+        s.record_start();
+    }
 
     // Take a snapshot mid-way
     let (snapshot_started, _) = s.take();
@@ -110,14 +118,20 @@ async fn stats_take_while_writers_finish() {
 
 #[test]
 fn measurement_timeout_is_thirty_seconds() {
-    assert_eq!(MEASUREMENT_TIMEOUT, Duration::from_secs(30),
-        "hard measurement timeout must be 30 s");
+    assert_eq!(
+        MEASUREMENT_TIMEOUT,
+        Duration::from_secs(30),
+        "hard measurement timeout must be 30 s"
+    );
 }
 
 #[test]
 fn stats_interval_is_sixty_seconds() {
-    assert_eq!(STATS_INTERVAL, Duration::from_secs(60),
-        "stats flush interval must be 60 s");
+    assert_eq!(
+        STATS_INTERVAL,
+        Duration::from_secs(60),
+        "stats flush interval must be 60 s"
+    );
 }
 
 // ── Timeout mechanics ─────────────────────────────────────────────────────────
@@ -134,21 +148,13 @@ async fn timeout_fires_for_hanging_future() {
 
 #[tokio::test]
 async fn timeout_passes_for_fast_future() {
-    let result = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { 42u32 },
-    )
-    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), async { 42u32 }).await;
     assert_eq!(result.unwrap(), 42);
 }
 
 #[tokio::test]
 async fn timeout_wraps_result_value() {
-    let r: Result<u32, _> = tokio::time::timeout(
-        Duration::from_millis(50),
-        async { 7u32 },
-    )
-    .await;
+    let r: Result<u32, _> = tokio::time::timeout(Duration::from_millis(50), async { 7u32 }).await;
     assert_eq!(r.unwrap(), 7);
 }
 
@@ -179,11 +185,7 @@ async fn stats_recorded_on_success_path() {
     let s = MeasurementStats::new();
 
     s.record_start();
-    let r = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { "done" },
-    )
-    .await;
+    let r = tokio::time::timeout(Duration::from_secs(5), async { "done" }).await;
     s.record_finish();
 
     assert_eq!(r.unwrap(), "done");

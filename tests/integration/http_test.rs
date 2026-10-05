@@ -1,6 +1,6 @@
 use globalping_probe::command::http::parse::{
-    build_raw_output, dedup_headers, parse_header_file, parse_status_text,
-    parse_tls_verbose, truncate_headers, HttpStatus,
+    build_raw_output, dedup_headers, parse_header_file, parse_status_text, parse_tls_verbose,
+    truncate_headers,
 };
 
 // ── Fixture-based parser tests ────────────────────────────────────────────────
@@ -59,7 +59,10 @@ fn dedup_sets_cookies_as_array() {
 fn dedup_single_header_is_string() {
     let pairs = parse_header_file(HEADER_FILE_HTTP11);
     let map = dedup_headers(&pairs);
-    assert_eq!(map["content-type"], serde_json::Value::String("text/html; charset=utf-8".into()));
+    assert_eq!(
+        map["content-type"],
+        serde_json::Value::String("text/html; charset=utf-8".into())
+    );
 }
 
 #[test]
@@ -76,7 +79,12 @@ fn truncate_shrinks_large_value() {
     let res = truncate_headers(pairs);
     assert!(res.truncated);
     assert!(res.headers[0].1.ends_with("...[truncated]"));
-    let total: usize = res.headers.iter().map(|(k, v)| k.len() + v.len() + 3).sum::<usize>() - 1;
+    let total: usize = res
+        .headers
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 3)
+        .sum::<usize>()
+        - 1;
     assert!(total <= 10_000, "size after truncation: {total}");
 }
 
@@ -87,7 +95,12 @@ fn truncate_drops_excess_headers() {
         .collect();
     let res = truncate_headers(pairs);
     assert!(res.truncated);
-    let total: usize = res.headers.iter().map(|(k, v)| k.len() + v.len() + 3).sum::<usize>().saturating_sub(1);
+    let total: usize = res
+        .headers
+        .iter()
+        .map(|(k, v)| k.len() + v.len() + 3)
+        .sum::<usize>()
+        .saturating_sub(1);
     assert!(total <= 10_000, "total {total} exceeds limit");
 }
 
@@ -132,7 +145,13 @@ fn parse_tls_verbose_no_tls_returns_none() {
 
 #[test]
 fn build_raw_output_head() {
-    let out = build_raw_output(Some("1.1"), Some(200), Some("Content-Type: text/html"), None, "HEAD");
+    let out = build_raw_output(
+        Some("1.1"),
+        Some(200),
+        Some("Content-Type: text/html"),
+        None,
+        "HEAD",
+    );
     let s = out.unwrap();
     assert!(s.starts_with("HTTP/1.1 200"));
     assert!(s.contains("Content-Type: text/html"));
@@ -141,7 +160,13 @@ fn build_raw_output_head() {
 
 #[test]
 fn build_raw_output_get_with_body() {
-    let out = build_raw_output(Some("2"), Some(200), Some("Content-Type: text/html"), Some("<html>hello</html>"), "GET");
+    let out = build_raw_output(
+        Some("2"),
+        Some(200),
+        Some("Content-Type: text/html"),
+        Some("<html>hello</html>"),
+        "GET",
+    );
     let s = out.unwrap();
     assert!(s.starts_with("HTTP/2 200"));
     assert!(s.contains("\n\n<html>hello</html>"));
@@ -151,7 +176,7 @@ fn build_raw_output_get_with_body() {
 
 #[cfg(target_os = "linux")]
 mod live {
-    use globalping_probe::command::http::{run_measurement, parse::HttpStatus};
+    use globalping_probe::command::http::{parse::HttpStatus, run_measurement};
 
     #[tokio::test]
     async fn live_https_head_cloudflare() {
@@ -159,7 +184,12 @@ mod live {
             .await
             .expect("run_measurement failed");
 
-        assert_eq!(r.status, HttpStatus::Finished, "raw_output: {:?}", r.raw_output);
+        assert_eq!(
+            r.status,
+            HttpStatus::Finished,
+            "raw_output: {:?}",
+            r.raw_output
+        );
         assert!(r.status_code.is_some(), "should have status code");
         assert!(r.resolved_address.is_some(), "should have resolved address");
         assert!(r.timings.total.is_some());
@@ -168,15 +198,27 @@ mod live {
 
         println!(
             "HTTPS HEAD 1.1.1.1: status={} version={:?} resolved={:?}",
-            r.status_code.unwrap(), r.http_version, r.resolved_address
+            r.status_code.unwrap(),
+            r.http_version,
+            r.resolved_address
         );
-        println!("  timings: total={:?}ms dns={:?}ms tcp={:?}ms tls={:?}ms first_byte={:?}ms",
-            r.timings.total, r.timings.dns, r.timings.tcp, r.timings.tls, r.timings.first_byte);
+        println!(
+            "  timings: total={:?}ms dns={:?}ms tcp={:?}ms tls={:?}ms first_byte={:?}ms",
+            r.timings.total, r.timings.dns, r.timings.tcp, r.timings.tls, r.timings.first_byte
+        );
         if let Some(tls) = &r.tls {
-            println!("  TLS: authorized={} protocol={:?} cipher={:?}",
-                tls.authorized, tls.protocol, tls.cipher_name);
-            println!("       subject.CN={:?} issuer.CN={:?}", tls.subject.cn, tls.issuer.cn);
-            println!("       created={:?} expires={:?}", tls.created_at, tls.expires_at);
+            println!(
+                "  TLS: authorized={} protocol={:?} cipher={:?}",
+                tls.authorized, tls.protocol, tls.cipher_name
+            );
+            println!(
+                "       subject.CN={:?} issuer.CN={:?}",
+                tls.subject.cn, tls.issuer.cn
+            );
+            println!(
+                "       created={:?} expires={:?}",
+                tls.created_at, tls.expires_at
+            );
         }
     }
 
@@ -186,13 +228,22 @@ mod live {
             .await
             .expect("run_measurement failed");
 
-        assert_eq!(r.status, HttpStatus::Finished, "raw_output: {:?}", r.raw_output);
+        assert_eq!(
+            r.status,
+            HttpStatus::Finished,
+            "raw_output: {:?}",
+            r.raw_output
+        );
         // GET should return a body (redirect or content)
         println!(
             "HTTPS GET 1.1.1.1: status={:?} body_len={:?}",
-            r.status_code, r.raw_body.as_ref().map(|b| b.len())
+            r.status_code,
+            r.raw_body.as_ref().map(|b| b.len())
         );
-        println!("rawOutput:\n{}", r.raw_output.as_deref().unwrap_or("(none)"));
+        println!(
+            "rawOutput:\n{}",
+            r.raw_output.as_deref().unwrap_or("(none)")
+        );
     }
 
     #[tokio::test]
@@ -201,7 +252,12 @@ mod live {
             .await
             .expect("run_measurement failed");
 
-        assert_eq!(r.status, HttpStatus::Finished, "raw_output: {:?}", r.raw_output);
+        assert_eq!(
+            r.status,
+            HttpStatus::Finished,
+            "raw_output: {:?}",
+            r.raw_output
+        );
         // HTTP2 should negotiate h2 protocol
         if let Some(ver) = &r.http_version {
             println!("HTTP2 HEAD 1.1.1.1: negotiated version={ver}");
@@ -215,7 +271,10 @@ mod live {
             .expect("run_measurement returned Err (not Failed)");
 
         // Port 80 on example.com may be blocked in some CI/WSL environments — just print
-        println!("HTTP HEAD 93.184.216.34: status={:?} code={:?}", r.status, r.status_code);
+        println!(
+            "HTTP HEAD 93.184.216.34: status={:?} code={:?}",
+            r.status, r.status_code
+        );
         println!("  raw_output: {:?}", r.raw_output);
     }
 

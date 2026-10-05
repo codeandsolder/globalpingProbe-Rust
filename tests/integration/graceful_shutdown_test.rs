@@ -1,10 +1,7 @@
 /// Integration tests for graceful-shutdown drain behaviour.
 /// Verifies that `MeasurementLimiter::wait_idle` correctly blocks until all
 /// in-flight slots are released and that the drain-timeout constant is sane.
-use globalping_probe::probe::{
-    client::DRAIN_TIMEOUT,
-    limiter::MeasurementLimiter,
-};
+use globalping_probe::probe::{client::DRAIN_TIMEOUT, limiter::MeasurementLimiter};
 use tokio::time::Duration;
 
 // ── wait_idle — no slots held ─────────────────────────────────────────────────
@@ -37,7 +34,10 @@ async fn wait_idle_blocks_while_slot_is_held() {
 
     // wait_idle should NOT complete while slot is held.
     let result = tokio::time::timeout(Duration::from_millis(50), lim.wait_idle()).await;
-    assert!(result.is_err(), "wait_idle should block while a slot is held");
+    assert!(
+        result.is_err(),
+        "wait_idle should block while a slot is held"
+    );
 
     drop(slot);
     // Now it should complete.
@@ -130,9 +130,11 @@ async fn drain_timeout_fires_when_measurement_too_slow() {
 
     tokio::time::sleep(Duration::from_millis(5)).await;
 
-    let drained = tokio::time::timeout(Duration::from_millis(30), lim.wait_idle())
-        .await;
-    assert!(drained.is_err(), "drain timeout should fire before slow measurement finishes");
+    let drained = tokio::time::timeout(Duration::from_millis(30), lim.wait_idle()).await;
+    assert!(
+        drained.is_err(),
+        "drain timeout should fire before slow measurement finishes"
+    );
     assert_eq!(lim.in_flight(), 1, "slot still held after timeout");
 }
 
@@ -164,10 +166,14 @@ async fn drain_waits_for_all_concurrent_measurements() {
 
 #[test]
 fn drain_timeout_constant_is_reasonable() {
-    assert!(DRAIN_TIMEOUT >= Duration::from_secs(1),
-        "drain timeout must be at least 1 s to allow measurements to finish");
-    assert!(DRAIN_TIMEOUT <= Duration::from_secs(30),
-        "drain timeout must not exceed 30 s to avoid slow shutdowns");
+    assert!(
+        DRAIN_TIMEOUT >= Duration::from_secs(1),
+        "drain timeout must be at least 1 s to allow measurements to finish"
+    );
+    assert!(
+        DRAIN_TIMEOUT <= Duration::from_secs(30),
+        "drain timeout must not exceed 30 s to avoid slow shutdowns"
+    );
 }
 
 #[test]

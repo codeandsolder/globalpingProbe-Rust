@@ -1,12 +1,14 @@
 use crate::util::private_ip::is_ip_private;
 
 /// Read nameserver entries from /etc/resolv.conf, masking private IPs as "private".
-/// Mirrors getDnsServers() in src/lib/dns.ts.
+/// Mirrors `getDnsServers()` in src/lib/dns.ts.
+#[must_use]
 pub fn get_dns_servers() -> Vec<String> {
     let content = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     parse_resolv_conf(&content)
 }
 
+#[must_use]
 pub fn parse_resolv_conf(content: &str) -> Vec<String> {
     content
         .lines()
@@ -16,16 +18,18 @@ pub fn parse_resolv_conf(content: &str) -> Vec<String> {
             // Strip any trailing port (e.g. "8.8.8.8#53" or "[::1]:53")
             let ip = ip
                 .trim_start_matches('[')
-                .split(|c| c == ']' || c == '#')
+                .split([']', '#'])
                 .next()
                 .unwrap_or(ip)
                 .trim();
-            if ip.is_empty() { return None; }
+            if ip.is_empty() {
+                return None;
+            }
             // Mask private IPs
-            if let Ok(addr) = ip.parse() {
-                if is_ip_private(addr) {
-                    return Some("private".to_string());
-                }
+            if let Ok(addr) = ip.parse()
+                && is_ip_private(addr)
+            {
+                return Some("private".to_string());
             }
             Some(ip.to_string())
         })

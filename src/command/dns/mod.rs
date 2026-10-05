@@ -1,15 +1,14 @@
 pub mod parse;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-use super::MeasurementCommand;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
-use parse::{parse_classic, parse_trace, ClassicResult, DnsStatus, TraceResult};
+use parse::{ClassicResult, TraceResult, parse_classic, parse_trace};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -38,16 +37,24 @@ pub struct QueryOptions {
     pub record_type: String,
 }
 
-fn default_protocol() -> String { "UDP".into() }
-fn default_port() -> u16 { 53 }
-fn default_ip_version() -> u8 { 4 }
-fn default_query_type() -> String { "A".into() }
+fn default_protocol() -> String {
+    "UDP".into()
+}
+const fn default_port() -> u16 {
+    53
+}
+const fn default_ip_version() -> u8 {
+    4
+}
+fn default_query_type() -> String {
+    "A".into()
+}
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
 const ALLOWED_TYPES: &[&str] = &[
-    "A", "AAAA", "ANY", "CNAME", "DNSKEY", "DS", "HTTPS", "MX", "NS",
-    "NSEC", "PTR", "RRSIG", "SOA", "TXT", "SRV", "SVCB",
+    "A", "AAAA", "ANY", "CNAME", "DNSKEY", "DS", "HTTPS", "MX", "NS", "NSEC", "PTR", "RRSIG",
+    "SOA", "TXT", "SRV", "SVCB",
 ];
 const ALLOWED_PROTOCOLS: &[&str] = &["UDP", "TCP"];
 
@@ -55,7 +62,10 @@ fn validate(opts: &DnsOptions) -> Result<()> {
     if !ALLOWED_TYPES.contains(&opts.query.record_type.as_str()) {
         bail!("unsupported query type: {}", opts.query.record_type);
     }
-    if !ALLOWED_PROTOCOLS.iter().any(|p| p.eq_ignore_ascii_case(&opts.protocol)) {
+    if !ALLOWED_PROTOCOLS
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(&opts.protocol))
+    {
         bail!("protocol must be UDP or TCP");
     }
     if opts.ip_version != 4 && opts.ip_version != 6 {
@@ -74,10 +84,10 @@ fn validate(opts: &DnsOptions) -> Result<()> {
         if !is_safe_host(resolver) {
             bail!("Invalid resolver.");
         }
-        if let Ok(ip) = resolver.parse() {
-            if is_ip_private(ip) {
-                bail!("Private IP ranges are not allowed.");
-            }
+        if let Ok(ip) = resolver.parse()
+            && is_ip_private(ip)
+        {
+            bail!("Private IP ranges are not allowed.");
         }
     }
     Ok(())
@@ -85,6 +95,7 @@ fn validate(opts: &DnsOptions) -> Result<()> {
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 
+#[must_use]
 pub fn build_args(opts: &DnsOptions) -> Vec<String> {
     let mut args: Vec<String> = vec![];
 
@@ -99,7 +110,7 @@ pub fn build_args(opts: &DnsOptions) -> Vec<String> {
     args.push(opts.target.clone());
 
     if let Some(resolver) = &opts.resolver {
-        args.push(format!("@{}", resolver));
+        args.push(format!("@{resolver}"));
     }
 
     args.push("-p".into());
@@ -125,9 +136,12 @@ pub fn build_args(opts: &DnsOptions) -> Vec<String> {
 
 pub struct DnsCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for DnsCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl DnsCommand {
+    /// Execute a DNS command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, rejected targets, process failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: DnsOptions = serde_json::from_value(options)?;
         validate(&opts)?;
 
@@ -156,7 +170,10 @@ async fn run_dig(opts: &DnsOptions) -> Result<String> {
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    let stdout = child.stdout.take().expect("stdout was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .context("child stdout pipe was unavailable")?;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let mut raw = String::new();
 
@@ -172,6 +189,9 @@ async fn run_dig(opts: &DnsOptions) -> Result<String> {
 // ── Helpers for integration tests ─────────────────────────────────────────────
 
 /// Run a classic query and return the parsed result directly (no socket layer).
+///
+/// # Errors
+/// Returns an error if the `dig` process cannot be executed or its output cannot be read.
 pub async fn query_classic(
     target: &str,
     record_type: &str,
@@ -183,7 +203,9 @@ pub async fn query_classic(
         port: 53,
         resolver: resolver.map(str::to_string),
         trace: false,
-        query: QueryOptions { record_type: record_type.to_string() },
+        query: QueryOptions {
+            record_type: record_type.to_string(),
+        },
         ip_version: 4,
         in_progress_updates: false,
     };
@@ -192,6 +214,9 @@ pub async fn query_classic(
 }
 
 /// Run a trace query and return the parsed result directly.
+///
+/// # Errors
+/// Returns an error if the `dig` process cannot be executed or its output cannot be read.
 pub async fn query_trace(target: &str, resolver: Option<&str>) -> Result<TraceResult> {
     let opts = DnsOptions {
         target: target.to_string(),
@@ -199,7 +224,9 @@ pub async fn query_trace(target: &str, resolver: Option<&str>) -> Result<TraceRe
         port: 53,
         resolver: resolver.map(str::to_string),
         trace: true,
-        query: QueryOptions { record_type: "A".to_string() },
+        query: QueryOptions {
+            record_type: "A".to_string(),
+        },
         ip_version: 4,
         in_progress_updates: false,
     };
@@ -220,7 +247,9 @@ mod tests {
             port: 53,
             resolver: None,
             trace,
-            query: QueryOptions { record_type: record_type.into() },
+            query: QueryOptions {
+                record_type: record_type.into(),
+            },
             ip_version: 4,
             in_progress_updates: false,
         }
@@ -306,7 +335,13 @@ mod tests {
     #[test]
     fn validate_rejects_private_resolver() {
         // Prevents using the probe as an internal port scanner over DNS (SSRF).
-        for bad in ["10.0.0.1", "127.0.0.1", "169.254.169.254", "::1", "::ffff:127.0.0.1"] {
+        for bad in [
+            "10.0.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "::ffff:127.0.0.1",
+        ] {
             let mut opts = make_opts("A", false, "UDP");
             opts.resolver = Some(bad.into());
             assert!(validate(&opts).is_err(), "should reject resolver {bad:?}");

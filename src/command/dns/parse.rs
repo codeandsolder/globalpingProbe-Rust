@@ -1,20 +1,20 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::util::private_ip::is_ip_private;
 
 // ── Shared types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsStatus {
     Finished,
     Failed,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct DnsAnswer {
     pub name: String,
     #[serde(rename = "type")]
@@ -24,7 +24,7 @@ pub struct DnsAnswer {
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct DnsTimings {
     pub total: u32,
 }
@@ -62,28 +62,49 @@ pub struct TraceResult {
 
 // ── Regex patterns ────────────────────────────────────────────────────────────
 
-static SECTION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(;; )(\S+)( SECTION:)").unwrap());
-static QUERY_TIME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Query\s+time:\s+(\d+)").unwrap());
-static RESOLVER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"SERVER:.*?\((.*?)\)").unwrap());
-static STATUS_CODE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"status:\s*([A-Z]+)").unwrap());
+fn compile_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(pattern).ok()
+}
+
+static SECTION_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"(;; )(\S+)( SECTION:)"));
+static QUERY_TIME_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"Query\s+time:\s+(\d+)"));
+static RESOLVER_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"SERVER:.*?\((.*?)\)"));
+static STATUS_CODE_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"status:\s*([A-Z]+)"));
 // Trace: ";; Received N bytes from IP#53(name) in N ms"
-static TRACE_RECEIVED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"from\s+\S+\(([^)]+)\)\s+in\s+(\d+)\s+ms").unwrap()
-});
+static TRACE_RECEIVED_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"from\s+\S+\(([^)]+)\)\s+in\s+(\d+)\s+ms"));
 // Match an IPv4 or IPv6 address in a SERVER line
-static IP_IN_SERVER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"SERVER:\s*([^\s#]+)").unwrap()
-});
+static IP_IN_SERVER_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"SERVER:\s*([^\s#]+)"));
 
 // ── Status code map ───────────────────────────────────────────────────────────
 
-static STATUS_MAP: Lazy<HashMap<&'static str, u16>> = Lazy::new(|| {
+static STATUS_MAP: LazyLock<HashMap<&'static str, u16>> = LazyLock::new(|| {
     [
-        ("noerror", 0), ("formerr", 1), ("servfail", 2), ("nxdomain", 3),
-        ("notimp", 4), ("refused", 5), ("yxdomain", 6), ("yxrrset", 7),
-        ("nxrrset", 8), ("notauth", 9), ("notzone", 10), ("dsotypeni", 11),
-        ("badvers", 16), ("badsig", 16), ("badkey", 17), ("badtime", 18),
-        ("badmode", 19), ("badname", 20), ("badalg", 21), ("badtrunc", 22),
+        ("noerror", 0),
+        ("formerr", 1),
+        ("servfail", 2),
+        ("nxdomain", 3),
+        ("notimp", 4),
+        ("refused", 5),
+        ("yxdomain", 6),
+        ("yxrrset", 7),
+        ("nxrrset", 8),
+        ("notauth", 9),
+        ("notzone", 10),
+        ("dsotypeni", 11),
+        ("badvers", 16),
+        ("badsig", 16),
+        ("badkey", 17),
+        ("badtime", 18),
+        ("badmode", 19),
+        ("badname", 20),
+        ("badalg", 21),
+        ("badtrunc", 22),
         ("badcookie", 23),
     ]
     .into_iter()
@@ -107,7 +128,11 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
         raw_output: output.to_string(),
     };
 
-    if lines.len() < 6 || lines.first().map_or(false, |l| l.starts_with(";; Got bad packet:")) {
+    if lines.len() < 6
+        || lines
+            .first()
+            .is_some_and(|l| l.starts_with(";; Got bad packet:"))
+    {
         return failed(&rewritten);
     }
 
@@ -120,23 +145,27 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
     let mut section_changed;
 
     for line in &lines {
-        if let Some(caps) = QUERY_TIME_RE.captures(line) {
+        if let Some(caps) = QUERY_TIME_RE.as_ref().and_then(|re| re.captures(line)) {
             timings.total = caps[1].parse().unwrap_or(0);
         }
-        if let Some(caps) = STATUS_CODE_RE.captures(line) {
+        if let Some(caps) = STATUS_CODE_RE.as_ref().and_then(|re| re.captures(line)) {
             let name = caps[1].to_string();
             status_code = STATUS_MAP.get(name.to_lowercase().as_str()).copied();
             status_code_name = Some(name);
         }
-        if let Some(caps) = RESOLVER_RE.captures(line) {
+        if let Some(caps) = RESOLVER_RE.as_ref().and_then(|re| re.captures(line)) {
             let ip = &caps[1];
-            resolver = Some(if ip == "x.x.x.x" { "private".into() } else { ip.to_string() });
+            resolver = Some(if ip == "x.x.x.x" {
+                "private".into()
+            } else {
+                ip.to_string()
+            });
         }
 
         section_changed = false;
         if line.is_empty() {
             section = "";
-        } else if let Some(caps) = SECTION_RE.captures(line) {
+        } else if let Some(caps) = SECTION_RE.as_ref().and_then(|re| re.captures(line)) {
             section = match &caps[2] {
                 s if s.eq_ignore_ascii_case("ANSWER") => "answer",
                 s if s.eq_ignore_ascii_case("QUESTION") => "question",
@@ -150,10 +179,11 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
         if section.is_empty() || section_changed {
             continue;
         }
-        if section == "answer" && !line.starts_with(';') {
-            if let Some(answer) = parse_answer_line(line) {
-                answers.push(answer);
-            }
+        if section == "answer"
+            && !line.starts_with(';')
+            && let Some(answer) = parse_answer_line(line)
+        {
+            answers.push(answer);
         }
     }
 
@@ -169,6 +199,7 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
 }
 
 /// Parse `dig +trace` output.
+#[must_use]
 pub fn parse_trace(raw: &str) -> TraceResult {
     let lines: Vec<&str> = raw.split('\n').collect();
 
@@ -178,7 +209,11 @@ pub fn parse_trace(raw: &str) -> TraceResult {
         raw_output: raw.to_string(),
     };
 
-    if lines.len() < 3 || lines.first().map_or(false, |l| l.starts_with(";; Got bad packet:")) {
+    if lines.len() < 3
+        || lines
+            .first()
+            .is_some_and(|l| l.starts_with(";; Got bad packet:"))
+    {
         return failed();
     }
 
@@ -203,12 +238,12 @@ fn rewrite_classic(raw: &str) -> String {
                 return line.to_string();
             }
             // Extract the IP before '#'
-            if let Some(caps) = IP_IN_SERVER_RE.captures(line) {
+            if let Some(caps) = IP_IN_SERVER_RE.as_ref().and_then(|re| re.captures(line)) {
                 let ip_str = &caps[1];
-                if let Ok(ip) = ip_str.parse() {
-                    if is_ip_private(ip) {
-                        return line.replace(ip_str, "x.x.x.x");
-                    }
+                if let Ok(ip) = ip_str.parse()
+                    && is_ip_private(ip)
+                {
+                    return line.replace(ip_str, "x.x.x.x");
                 }
             }
             line.to_string()
@@ -246,7 +281,7 @@ fn parse_trace_hops(lines: &[&str]) -> Vec<TraceHop> {
         if !answers.is_empty() || resolver.is_some() {
             hops.push(TraceHop {
                 answers: std::mem::take(answers),
-                timings: std::mem::replace(timings, DnsTimings::default()),
+                timings: std::mem::take(timings),
                 resolver: resolver.take(),
             });
         }
@@ -263,7 +298,7 @@ fn parse_trace_hops(lines: &[&str]) -> Vec<TraceHop> {
             continue;
         }
         if line.starts_with(";;") {
-            if let Some(caps) = TRACE_RECEIVED_RE.captures(line) {
+            if let Some(caps) = TRACE_RECEIVED_RE.as_ref().and_then(|re| re.captures(line)) {
                 current_resolver = Some(caps[1].to_string());
                 current_timings.total = caps[2].parse().unwrap_or(0);
             }

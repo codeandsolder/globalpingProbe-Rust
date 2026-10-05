@@ -1,26 +1,56 @@
 use ipnet::IpNet;
-use once_cell::sync::Lazy;
-use std::net::{IpAddr, Ipv4Addr};
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-// All RFC-reserved ranges — mirrors src/lib/private-ip.ts in the Node.js probe
-static PRIVATE_RANGES: Lazy<Vec<IpNet>> = Lazy::new(|| {
-    [
-        // IPv4
-        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-        "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
-        "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
-        "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
-        // IPv6
-        "::/128", "::1/128", "64:ff9b:1::/48", "100::/64",
-        "2001::/32", "2001:10::/28", "2001:20::/28", "2001:db8::/32",
-        "2002::/16", "fc00::/7", "fe80::/10", "ff00::/8",
-    ]
-    .iter()
-    .map(|s| s.parse().expect("invalid CIDR range"))
-    .collect()
-});
+// All RFC-reserved ranges — mirrors src/lib/private-ip.ts in the Node.js probe.
+// `new_assert` is const, so an invalid prefix is a compile-time error rather than
+// a runtime parse failure in probe startup.
+const PRIVATE_RANGES: &[IpNet] = &[
+    // IPv4
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 24),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), 24),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 88, 99, 0)), 24),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)), 4),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4),
+    IpNet::new_assert(IpAddr::V4(Ipv4Addr::BROADCAST), 32),
+    // IPv6
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 128),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+    IpNet::new_assert(
+        IpAddr::V6(Ipv6Addr::new(0x0064, 0xff9b, 1, 0, 0, 0, 0, 0)),
+        48,
+    ),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x0100, 0, 0, 0, 0, 0, 0, 0)), 64),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0)), 32),
+    IpNet::new_assert(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x0010, 0, 0, 0, 0, 0, 0)),
+        28,
+    ),
+    IpNet::new_assert(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x0020, 0, 0, 0, 0, 0, 0)),
+        28,
+    ),
+    IpNet::new_assert(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0)),
+        32,
+    ),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0)), 16),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+    IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8),
+];
 
+#[must_use]
 pub fn is_ip_private(ip: IpAddr) -> bool {
     // Normalise IPv6 forms that embed an IPv4 address so that e.g.
     // `::ffff:127.0.0.1` (IPv4-mapped) or `64:ff9b::a.b.c.d` (NAT64) cannot be

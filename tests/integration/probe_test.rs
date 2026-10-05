@@ -1,10 +1,10 @@
 /// Integration tests for the probe module (UUID, sysinfo, DNS servers, client wire types, reconnect, limiter).
 /// Live tests are gated on #[cfg(target_os = "linux")].
 use globalping_probe::probe::{
-    client::{connection_url, ClientConfig, MeasurementRequest, VERSION},
+    client::{ClientConfig, MeasurementRequest, VERSION, connection_url},
     dns_servers::parse_resolv_conf,
-    limiter::{MeasurementLimiter, MAX_CONCURRENT},
-    reconnect::{classify_error, reconnect_delay, ConnectOutcome, ExponentialBackoff},
+    limiter::{MAX_CONCURRENT, MeasurementLimiter},
+    reconnect::{ConnectOutcome, ExponentialBackoff, classify_error, reconnect_delay},
     sysinfo::{parse_df_output, parse_meminfo_total},
     uuid::ProbeUuid,
 };
@@ -139,8 +139,12 @@ fn test_cfg() -> ClientConfig {
 fn client_url_has_all_required_params() {
     let url = connection_url(&test_cfg());
     for param in &[
-        "version=", "nodeVersion=v22.22.3", "totalMemory=",
-        "totalDiskSize=", "availableDiskSpace=", "uuid=integ-uuid-0000",
+        "version=",
+        "nodeVersion=v22.22.3",
+        "totalMemory=",
+        "totalDiskSize=",
+        "availableDiskSpace=",
+        "uuid=integ-uuid-0000",
     ] {
         assert!(url.contains(param), "missing {param} in: {url}");
     }
@@ -277,23 +281,35 @@ fn reconnect_classify_geoip() {
 
 #[test]
 fn reconnect_classify_metadata() {
-    assert_eq!(classify_error("metadata error"), ConnectOutcome::MetadataError);
+    assert_eq!(
+        classify_error("metadata error"),
+        ConnectOutcome::MetadataError
+    );
 }
 
 #[test]
 fn reconnect_classify_invalid_version() {
     // Matches what the API actually sends
-    assert_eq!(classify_error("invalid probe version (0.1.0)"), ConnectOutcome::InvalidVersion);
+    assert_eq!(
+        classify_error("invalid probe version (0.1.0)"),
+        ConnectOutcome::InvalidVersion
+    );
 }
 
 #[test]
 fn reconnect_classify_server_terminating() {
-    assert_eq!(classify_error("server-terminating"), ConnectOutcome::ServerTerminating);
+    assert_eq!(
+        classify_error("server-terminating"),
+        ConnectOutcome::ServerTerminating
+    );
 }
 
 #[test]
 fn reconnect_classify_unknown_is_transient() {
-    assert_eq!(classify_error("connection reset"), ConnectOutcome::Transient);
+    assert_eq!(
+        classify_error("connection reset"),
+        ConnectOutcome::Transient
+    );
     assert_eq!(classify_error(""), ConnectOutcome::Transient);
 }
 
@@ -318,13 +334,19 @@ fn reconnect_delay_metadata_is_one_minute() {
 #[test]
 fn reconnect_delay_clean_shutdown_is_none() {
     let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-    assert_eq!(reconnect_delay(&ConnectOutcome::CleanShutdown, &mut bo), None);
+    assert_eq!(
+        reconnect_delay(&ConnectOutcome::CleanShutdown, &mut bo),
+        None
+    );
 }
 
 #[test]
 fn reconnect_delay_invalid_version_is_none() {
     let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-    assert_eq!(reconnect_delay(&ConnectOutcome::InvalidVersion, &mut bo), None);
+    assert_eq!(
+        reconnect_delay(&ConnectOutcome::InvalidVersion, &mut bo),
+        None
+    );
 }
 
 #[test]
@@ -399,7 +421,10 @@ fn limiter_returns_none_when_at_capacity() {
     let lim = MeasurementLimiter::with_capacity(2);
     let _s1 = lim.try_acquire().unwrap();
     let _s2 = lim.try_acquire().unwrap();
-    assert!(lim.try_acquire().is_none(), "limiter must reject at capacity");
+    assert!(
+        lim.try_acquire().is_none(),
+        "limiter must reject at capacity"
+    );
 }
 
 #[test]
@@ -427,7 +452,9 @@ fn limiter_clone_shares_pool() {
 async fn limiter_slot_can_be_cycled_many_times() {
     let lim = MeasurementLimiter::with_capacity(1);
     for i in 0..20 {
-        let s = lim.try_acquire().unwrap_or_else(|| panic!("failed at iteration {i}"));
+        let s = lim
+            .try_acquire()
+            .unwrap_or_else(|| panic!("failed at iteration {i}"));
         assert_eq!(lim.in_flight(), 1);
         drop(s);
         assert_eq!(lim.in_flight(), 0);
@@ -441,7 +468,9 @@ fn limiter_multiple_slots_all_released_together() {
     let s2 = lim.try_acquire().unwrap();
     let s3 = lim.try_acquire().unwrap();
     assert_eq!(lim.in_flight(), 3);
-    drop(s1); drop(s2); drop(s3);
+    drop(s1);
+    drop(s2);
+    drop(s3);
     assert_eq!(lim.in_flight(), 0);
     assert!(lim.try_acquire().is_some());
 }

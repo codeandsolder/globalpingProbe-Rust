@@ -40,6 +40,10 @@ pub struct StatsConfig {
 }
 
 impl AppConfig {
+    /// Load optional file configuration plus `GP__*` environment overrides.
+    ///
+    /// # Errors
+    /// Returns an error when configuration sources cannot be built or deserialized.
     pub fn load() -> anyhow::Result<Self> {
         let cfg = config::Config::builder()
             .add_source(config::File::with_name("config/default").required(false))
