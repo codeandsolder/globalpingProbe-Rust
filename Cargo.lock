@@ -937,7 +937,6 @@ dependencies = [
 name = "globalping-behavior"
 version = "0.1.0"
 dependencies = [
- "globalping-probe",
  "serde_json",
  "wit-bindgen 0.61.1",
 ]

@@ -21,6 +21,5 @@ todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
-globalping-probe = { path = "../..", default-features = false, features = ["wasm-core"] }
 serde_json = "1"
 wit-bindgen = "0.61"
