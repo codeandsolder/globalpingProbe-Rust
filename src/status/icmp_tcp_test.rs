@@ -70,7 +70,7 @@ impl IcmpTcpTest {
             self.measure_once(targets).await;
         }
         if self.failed {
-            warn!(target: "status-manager", "ICMP/TCP ping RTT diff exceeds the threshold. Retrying in 1 hour. Probe temporarily disconnected.");
+            warn!(target: "status:icmp-tcp", "ICMP/TCP ping RTT diff exceeds the threshold. Retrying in 1 hour. Probe temporarily disconnected.");
         }
         self.failed
     }

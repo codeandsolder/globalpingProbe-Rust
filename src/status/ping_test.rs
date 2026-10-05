@@ -35,7 +35,7 @@ impl PingTest {
         );
         self.failed = !ipv4_ok && !ipv6_ok;
         if self.failed {
-            warn!(target: "status-manager", "Both ping tests failed due to bad internet connection. Retrying in 10 minutes. Probe temporarily disconnected.");
+            warn!(target: "status:ping", "Both ping tests failed due to bad internet connection. Retrying in 10 minutes. Probe temporarily disconnected.");
         }
         (ipv4_ok, ipv6_ok)
     }
@@ -71,11 +71,11 @@ async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
         if let TrialOutcome::Fail { loss, raw } = outcome {
             match loss {
                 Some(l) if *l > 0.0 => warn!(
-                    target: "status-manager",
+                    target: "status:ping",
                     "IPv{ip_version} ping test unsuccessful for {target}: {l}% packet loss{pass_text}."
                 ),
                 _ => warn!(
-                    target: "status-manager",
+                    target: "status:ping",
                     "IPv{ip_version} ping test unsuccessful: {raw}{pass_text}."
                 ),
             }
@@ -84,7 +84,7 @@ async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
 
     if !meets_threshold {
         warn!(
-            target: "status-manager",
+            target: "status:ping",
             "IPv{ip_version} ping tests failed. Retrying in 10 minutes. Probe marked as not supporting IPv{ip_version}."
         );
     }

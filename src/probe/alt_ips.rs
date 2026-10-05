@@ -113,10 +113,10 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
                 tokens.push(serde_json::json!([confirmed_ip, token]));
             }
             Err(AltIpError::Rejected(reason)) => {
-                warn!(target: "api:connect:alt-ips-handler", "IP {ip} rejected: {reason}");
+                warn!(target: "probe-alt-ips", "IP {ip} rejected: {reason}");
             }
             Err(AltIpError::Failed(error)) => {
-                warn!(target: "api:connect:alt-ips-handler", "{error} (via {ip}).");
+                warn!(target: "probe-alt-ips", "{error} (via {ip}).");
             }
         }
     }

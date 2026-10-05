@@ -132,6 +132,9 @@ fn test_cfg() -> ClientConfig {
         uuid: "integ-uuid-0000".into(),
         ping_target: "api.globalping.io".into(),
         adoption_token: None,
+        is_hardware: None,
+        hardware_device: None,
+        hardware_device_firmware: None,
     }
 }
 

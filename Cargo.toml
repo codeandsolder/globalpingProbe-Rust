@@ -46,6 +46,10 @@ futures     = "0.3"
 futures-util  = "0.3"
 rust_socketio = { version = "0.5", features = ["async"] }
 reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.8.9"
+rand = "0.9"
+if-addrs = "0.15.0"
+url = "2.5.8"
 
 [dev-dependencies]
 bytes         = "1"

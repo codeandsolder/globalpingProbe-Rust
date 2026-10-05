@@ -19,9 +19,11 @@ use crate::command::{
 };
 use crate::probe::progress::{ProgressEmitter, ProgressTransform};
 use crate::probe::{
+    adoption::{AdoptionServer, local_ips},
     dns_servers::get_dns_servers,
     jobs::ActiveJobs,
     reconnect::{ConnectOutcome, classify_error, reconnect_delay},
+    settings::ProbeSettingsStore,
     stats::get_cpu_usage,
     sysinfo::{disk_info_mb, total_memory_bytes},
 };
@@ -30,6 +32,7 @@ use crate::status::{
     ping_test::PingTest,
     status_manager::StatusManager,
 };
+use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
 use crate::util::progress_buffer::BufferMode;
@@ -57,6 +60,9 @@ pub struct ClientConfig {
     pub uuid: String,
     pub ping_target: String,
     pub adoption_token: Option<String>,
+    pub is_hardware: Option<String>,
+    pub hardware_device: Option<String>,
+    pub hardware_device_firmware: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -66,6 +72,9 @@ impl Default for ClientConfig {
             uuid: String::new(),
             ping_target: "api.globalping.io".into(),
             adoption_token: None,
+            is_hardware: None,
+            hardware_device: None,
+            hardware_device_firmware: None,
         }
     }
 }
@@ -77,15 +86,27 @@ impl Default for ClientConfig {
 pub fn connection_url(cfg: &ClientConfig) -> String {
     let mem = total_memory_bytes();
     let (total_disk, avail_disk) = disk_info_mb();
-    let mut url = format!(
-        "{}?version={VERSION}&nodeVersion={NODE_VERSION}&totalMemory={mem}&totalDiskSize={total_disk}&availableDiskSpace={avail_disk}&uuid={}",
-        cfg.api_host, cfg.uuid,
-    );
-    if let Some(token) = &cfg.adoption_token {
-        url.push_str("&adoptionToken=");
-        url.push_str(token);
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("version", VERSION)
+        .append_pair("nodeVersion", NODE_VERSION)
+        .append_pair("totalMemory", &mem.to_string())
+        .append_pair("totalDiskSize", &total_disk.to_string())
+        .append_pair("availableDiskSpace", &avail_disk.to_string())
+        .append_pair("uuid", &cfg.uuid);
+    if let Some(value) = &cfg.is_hardware {
+        query.append_pair("isHardware", value);
     }
-    url
+    if let Some(value) = &cfg.hardware_device {
+        query.append_pair("hardwareDevice", value);
+    }
+    if let Some(value) = &cfg.hardware_device_firmware {
+        query.append_pair("hardwareDeviceFirmware", value);
+    }
+    if let Some(token) = &cfg.adoption_token {
+        query.append_pair("adoptionToken", token);
+    }
+    format!("{}?{}", cfg.api_host, query.finish())
 }
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -299,7 +320,7 @@ pub async fn dispatch(
     let mut result_json = match run_result {
         Ok(v) => v,
         Err(e) => {
-            error!(target: "test-error-handler", "Failed to run the measurement: {e}");
+            error!(target: "general", "Failed to run the measurement: {e}");
             json!({ "status": "failed", "failureSource": "internal", "rawOutput": e.to_string() })
         }
     };
@@ -458,15 +479,26 @@ pub async fn run_status_loop(
 #[derive(Clone)]
 struct ConnectionHandlers {
     status_manager: Arc<Mutex<StatusManager>>,
+    settings: Arc<ProbeSettingsStore>,
+    adoption: Arc<AdoptionServer>,
+    is_hardware: bool,
     jobs: ActiveJobs,
     signal: OutcomeSignal,
     already_connected: Arc<AtomicBool>,
 }
 
 impl ConnectionHandlers {
-    fn new(status_manager: Arc<Mutex<StatusManager>>) -> Self {
+    fn new(
+        status_manager: Arc<Mutex<StatusManager>>,
+        settings: Arc<ProbeSettingsStore>,
+        adoption: Arc<AdoptionServer>,
+        is_hardware: bool,
+    ) -> Self {
         Self {
             status_manager,
+            settings,
+            adoption,
+            is_hardware,
             jobs: ActiveJobs::new(),
             signal: OutcomeSignal::new(),
             already_connected: Arc::new(AtomicBool::new(false)),
@@ -485,12 +517,12 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
         .emit("probe:dns:update", json!(get_dns_servers()))
         .await
         .ok();
-    debug!("Connection to API established.");
+    debug!(target: "api-connection", "Connection to API established.");
 }
 
 async fn handle_close(state: ConnectionHandlers, payload: Payload, client: Client) {
     let reason = extract_first_string(&payload).unwrap_or_default();
-    debug!(target: "api:error", "Disconnected from API: ({reason}).");
+    debug!(target: "api-connection", "Disconnected from API: ({reason}).");
     if reason == "ping timeout" || reason == "transport error" {
         let status = {
             let mut manager = state.status_manager.lock().await;
@@ -506,11 +538,11 @@ async fn handle_error(state: ConnectionHandlers, payload: Payload) {
     let (message, ip_address) = parse_connect_error(&payload);
     let outcome = classify_error(&message);
     if !matches!(outcome, ConnectOutcome::ServerTerminating) {
-        error!(target: "api:error", "Connection to API failed: {message}");
+        error!(target: "api-connection", "Connection to API failed: {message}");
     }
     if matches!(outcome, ConnectOutcome::ProbePolicyError) && message.contains("ip limit") {
         let ip = ip_address.as_deref().unwrap_or("");
-        error!(target: "api:error",
+        error!(target: "api-connection",
             "Only 1 connection per IP address is allowed. Please make sure you don't have another probe running on IP {ip}.");
     }
     state.signal.signal(outcome).await;
@@ -546,7 +578,7 @@ async fn handle_location(payload: Payload, client: Client) {
             })
             .unwrap_or_else(|| "?".to_string());
         info!(
-            target: "api:connect:location",
+            target: "probe-location",
             "Connected from {}, {}, {} ({}, ASN: {}, lat: {} long: {}).",
             text("city"), text("country"), text("continent"), text("network"), asn,
             number("latitude"), number("longitude"),
@@ -558,8 +590,8 @@ async fn handle_location(payload: Payload, client: Client) {
         .ok();
 }
 
-fn handle_adoption(payload: &Payload) {
-    let Some(value) = extract_first_value(payload) else {
+async fn handle_adoption(state: ConnectionHandlers, payload: Payload, client: Client) {
+    let Some(value) = extract_first_value(&payload) else {
         return;
     };
     let message = value
@@ -571,9 +603,58 @@ fn handle_adoption(payload: &Payload) {
         .and_then(|field| field.as_str())
         .unwrap_or("info")
     {
-        "warn" => warn!(target: "api:connect:adoption", "{message}"),
-        "error" => error!(target: "api:connect:adoption", "{message}"),
-        _ => info!(target: "api:connect:adoption", "{message}"),
+        "warn" => warn!(target: "adoption-status", "{message}"),
+        "error" => error!(target: "adoption-status", "{message}"),
+        _ => info!(target: "adoption-status", "{message}"),
+    }
+
+    let adopted = value
+        .get("adopted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !adopted && state.is_hardware {
+        match state.adoption.start().await {
+            Ok(session) => {
+                client
+                    .emit(
+                        "probe:adoption:ready",
+                        json!({
+                            "token": session.token,
+                            "expiresAt": session.expires_at,
+                            "ips": local_ips(32),
+                        }),
+                    )
+                    .await
+                    .ok();
+            }
+            Err(error) => {
+                error!(target: "adoption-server", %error, "Failed to start local adoption server.");
+            }
+        }
+    } else {
+        state.adoption.stop().await;
+    }
+}
+
+fn handle_adoption_code(payload: &Payload) {
+    let Some(value) = extract_first_value(payload) else {
+        return;
+    };
+    let Some(code) = value.get("code").and_then(Value::as_str) else {
+        return;
+    };
+    warn!(
+        target: "adoption-code",
+        "Your adoption code is: {code}"
+    );
+}
+
+async fn handle_settings(state: ConnectionHandlers, payload: Payload, client: Client) {
+    let Some(settings) = extract_first_value(&payload) else {
+        return;
+    };
+    if state.settings.update(&settings).await {
+        client.emit("probe:settings:update", settings).await.ok();
     }
 }
 
@@ -657,6 +738,8 @@ fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) 
     let proxy = state.clone();
     let measurement = state.clone();
     let restart = state.clone();
+    let adoption = state.clone();
+    let settings = state.clone();
     builder
         .on("open", move |_, client| {
             let state = open.clone();
@@ -684,11 +767,16 @@ fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) 
         .on("api:connect:location", |payload, client| {
             async move { handle_location(payload, client).await }.boxed()
         })
-        .on("api:connect:adoption", |payload, _| {
-            async move { handle_adoption(&payload) }.boxed()
+        .on("api:connect:adoption", move |payload, client| {
+            let state = adoption.clone();
+            async move { handle_adoption(state, payload, client).await }.boxed()
         })
         .on("api:connect:ip", |payload, client| {
             async move { handle_ip(&payload, client) }.boxed()
+        })
+        .on("api:settings:update", move |payload, client| {
+            let state = settings.clone();
+            async move { handle_settings(state, payload, client).await }.boxed()
         })
         .on("api:connect:isProxy", move |payload, client| {
             let state = proxy.clone();
@@ -696,6 +784,9 @@ fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) 
         })
         .on("api:logs-transport:set", |payload, _| {
             async move { handle_logs_transport(&payload) }.boxed()
+        })
+        .on("probe:adoption:code", |payload, _| {
+            async move { handle_adoption_code(&payload) }.boxed()
         })
         .on("probe:measurement:request", move |payload, client| {
             let state = measurement.clone();
@@ -707,6 +798,7 @@ struct ConnectionTasks {
     health: tokio::task::JoinHandle<()>,
     metrics: tokio::task::JoinHandle<()>,
     logs: tokio::task::JoinHandle<()>,
+    log_scopes: tokio::task::JoinHandle<()>,
 }
 
 impl ConnectionTasks {
@@ -719,6 +811,7 @@ impl ConnectionTasks {
             )),
             metrics: tokio::spawn(run_stats_loop(state.jobs.clone(), socket.clone())),
             logs: tokio::spawn(run_logs_loop(socket.clone())),
+            log_scopes: tokio::spawn(report_log_scopes(socket.clone())),
         }
     }
 
@@ -726,7 +819,16 @@ impl ConnectionTasks {
         self.health.abort();
         self.metrics.abort();
         self.logs.abort();
+        self.log_scopes.abort();
     }
+}
+
+async fn report_log_scopes(client: Client) {
+    tokio::time::sleep(log_scope_report_delay()).await;
+    client
+        .emit("probe:log-scopes", json!(REGISTERED_SCOPES))
+        .await
+        .ok();
 }
 
 async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_timeout: Duration) {
@@ -753,16 +855,23 @@ async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_ti
 async fn connect_once(
     cfg: &ClientConfig,
     status_manager: Arc<Mutex<StatusManager>>,
+    settings: Arc<ProbeSettingsStore>,
+    adoption: Arc<AdoptionServer>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> ConnectOutcome {
-    let state = ConnectionHandlers::new(status_manager);
+    let state = ConnectionHandlers::new(
+        status_manager,
+        settings,
+        adoption,
+        cfg.is_hardware.is_some(),
+    );
     let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
     let socket = match register_socket_handlers(builder, &state).connect().await {
         Ok(socket) => socket,
         Err(error) => {
-            error!(target: "api:error", "Connection to API failed: {error}");
+            error!(target: "api-connection", "Connection to API failed: {error}");
             return ConnectOutcome::Transient;
         }
     };
@@ -795,11 +904,26 @@ async fn connect_once(
 /// Returns an error if process-signal setup or a fatal client operation fails.
 pub async fn run(cfg: ClientConfig) -> Result<()> {
     let status = Arc::new(Mutex::new(StatusManager::with_api_host(&cfg.ping_target)));
+    let settings = Arc::new(ProbeSettingsStore::production());
+    let adoption = Arc::new(AdoptionServer::production());
 
     info!(
         "Starting probe version {VERSION} in a production mode with UUID {}.",
         &cfg.uuid[..cfg.uuid.len().min(8)]
     );
+    if cfg.is_hardware.is_some() {
+        let device = cfg
+            .hardware_device
+            .as_deref()
+            .and_then(|value| value.strip_prefix('v'))
+            .unwrap_or("unknown");
+        let firmware = cfg
+            .hardware_device_firmware
+            .as_deref()
+            .and_then(|value| value.strip_prefix('v'))
+            .unwrap_or("unknown");
+        info!(target: "general", "Hardware probe version {device} running firmware version {firmware}.");
+    }
 
     // One signal handler for the entire lifetime of the process.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -816,12 +940,19 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
             break;
         }
 
-        let outcome = connect_once(&cfg, Arc::clone(&status), shutdown_rx.clone()).await;
+        let outcome = connect_once(
+            &cfg,
+            Arc::clone(&status),
+            Arc::clone(&settings),
+            Arc::clone(&adoption),
+            shutdown_rx.clone(),
+        )
+        .await;
 
         match reconnect_delay(&outcome) {
             None => {
                 if matches!(outcome, ConnectOutcome::InvalidVersion) {
-                    info!(target: "api:error", "Detected an outdated probe. Restarting.");
+                    info!(target: "api-connection", "Detected an outdated probe. Restarting.");
                     std::process::exit(0);
                 }
                 break;
@@ -829,13 +960,13 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
             Some(delay) => {
                 match &outcome {
                     ConnectOutcome::ProbePolicyError => {
-                        error!(target: "api:error", "Retrying in 1 hour. Probe temporarily disconnected.");
+                        error!(target: "api-connection", "Retrying in 1 hour. Probe temporarily disconnected.");
                     }
                     ConnectOutcome::MetadataError => {
-                        error!(target: "api:error", "Retrying in 1 minute. Probe temporarily disconnected.");
+                        error!(target: "api-connection", "Retrying in 1 minute. Probe temporarily disconnected.");
                     }
                     ConnectOutcome::ServerTerminating => {
-                        debug!(target: "api:error", "The server is terminating. Connecting to another one.");
+                        debug!(target: "api-connection", "The server is terminating. Connecting to another one.");
                     }
                     _ => {}
                 }
@@ -850,7 +981,8 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         }
     }
 
-    debug!("Closing process.");
+    adoption.stop().await;
+    debug!(target: "general", "Closing process.");
     Ok(())
 }
 
@@ -924,6 +1056,9 @@ mod tests {
             uuid: uuid.into(),
             ping_target: "api.globalping.io".into(),
             adoption_token: None,
+            is_hardware: None,
+            hardware_device: None,
+            hardware_device_firmware: None,
         }
     }
 
@@ -958,6 +1093,18 @@ mod tests {
     fn url_omits_adoption_token_when_none() {
         let url = connection_url(&cfg("u"));
         assert!(!url.contains("adoptionToken"), "url: {url}");
+    }
+
+    #[test]
+    fn url_includes_hardware_metadata() {
+        let mut c = cfg("u");
+        c.is_hardware = Some("true".into());
+        c.hardware_device = Some("v1".into());
+        c.hardware_device_firmware = Some("v2.3".into());
+        let url = connection_url(&c);
+        assert!(url.contains("isHardware=true"), "url: {url}");
+        assert!(url.contains("hardwareDevice=v1"), "url: {url}");
+        assert!(url.contains("hardwareDeviceFirmware=v2.3"), "url: {url}");
     }
 
     // ── OutcomeSignal ─────────────────────────────────────────────────────────
