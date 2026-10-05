@@ -11,7 +11,6 @@ use tokio::time::timeout;
 
 use super::ProgressTx;
 use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
-use crate::util::private_ip::is_ip_private;
 use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, resolve_command_target};
 use crate::util::tcp_ping::{TcpPingProbe, compute_tcp_stats, tcp_ping_single};
 use crate::util::validate::is_safe_host;
@@ -60,11 +59,6 @@ fn validate(opts: &PingOptions) -> Result<()> {
     }
     if opts.ip_version != 4 && opts.ip_version != 6 {
         bail!("ipVersion must be 4 or 6");
-    }
-    if let Ok(ip) = opts.target.parse()
-        && is_ip_private(ip)
-    {
-        bail!("Private IP ranges are not allowed.");
     }
     Ok(())
 }
@@ -486,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_private_ip_target() {
+    fn validate_accepts_private_literal_for_structured_runtime_rejection() {
         let opts = PingOptions {
             target: "10.0.0.1".into(),
             packets: 3,
@@ -496,8 +490,7 @@ mod tests {
             in_progress_updates: false,
             timeout: 10,
         };
-        let err = validate(&opts).unwrap_err();
-        assert!(err.to_string().contains("Private IP"));
+        assert!(validate(&opts).is_ok());
     }
 
     #[test]

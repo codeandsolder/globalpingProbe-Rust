@@ -62,6 +62,8 @@ pub mod parse {
     #[serde(rename_all = "camelCase")]
     pub struct ParsedHttp {
         pub status: HttpStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub failure_source: Option<String>,
         pub status_code: Option<u16>,
         pub status_code_name: Option<String>,
         pub resolved_address: Option<String>,
@@ -571,6 +573,7 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, timeout};
 
+use crate::util::measurement_timeout::{MeasurementDeadline, http_dns_timeout};
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::{is_safe_host, is_safe_url_component};
 use parse::{
@@ -606,6 +609,7 @@ pub struct HttpOptions {
     pub ip_version: u8,
     #[serde(default)]
     pub in_progress_updates: bool,
+    pub timeout: u32,
     pub request: HttpRequestOptions,
 }
 
@@ -644,12 +648,10 @@ fn validate(opts: &HttpOptions) -> Result<()> {
     // A custom resolver must be a clean host and must not be private (SSRF /
     // internal port-scan via dig — see resolve_target).
     if let Some(resolver) = &opts.resolver {
-        if !is_safe_host(resolver) {
-            bail!("Invalid resolver.");
-        }
-        if let Ok(ip) = resolver.parse()
-            && is_ip_private(ip)
-        {
+        let ip: std::net::IpAddr = resolver
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid resolver."))?;
+        if is_ip_private(ip) {
             bail!("Private IP ranges are not allowed.");
         }
     }
@@ -676,63 +678,83 @@ fn validate(opts: &HttpOptions) -> Result<()> {
         }
     }
     // Private IP check if target is already an IP
-    if let Ok(ip) = opts.target.parse()
-        && is_ip_private(ip)
-    {
-        bail!("Private IP ranges are not allowed");
-    }
     Ok(())
 }
 
 // ── DNS pre-resolution ────────────────────────────────────────────────────────
 
-/// If `target` is a hostname, resolve it using dig and return (ip, `dns_ms`).
-/// If it's already an IP address, return (target, 0) with `dns_ms` = None.
+#[derive(Debug)]
+enum HttpResolveError {
+    TimedOut,
+    PrivateIp,
+    Failed(String),
+}
+
+impl HttpResolveError {
+    const fn failure_source(&self) -> &'static str {
+        match self {
+            Self::TimedOut => "resolver",
+            Self::PrivateIp | Self::Failed(_) => "target",
+        }
+    }
+
+    fn public_message(&self) -> String {
+        match self {
+            Self::TimedOut => "The measurement timed out during DNS resolution.".to_string(),
+            Self::PrivateIp => "Private IP ranges are not allowed.".to_string(),
+            Self::Failed(message) => message.clone(),
+        }
+    }
+}
+
 async fn resolve_target(
     target: &str,
     resolver: Option<&str>,
     ip_version: u8,
-) -> Result<(String, Option<u64>)> {
-    if target.parse::<std::net::IpAddr>().is_ok() {
-        return Ok((target.to_string(), None)); // already an IP, no DNS needed
+    timeout_seconds: u32,
+) -> std::result::Result<(String, Option<u64>), HttpResolveError> {
+    if let Ok(ip) = target.parse::<std::net::IpAddr>() {
+        if is_ip_private(ip) {
+            return Err(HttpResolveError::PrivateIp);
+        }
+        return Ok((target.to_string(), None));
     }
 
     let query_type = if ip_version == 6 { "AAAA" } else { "A" };
-    let mut args: Vec<String> = Vec::new();
-    if let Some(r) = resolver {
-        args.push(format!("@{r}"));
+    let mut args = Vec::new();
+    if let Some(resolver) = resolver {
+        args.push(format!("@{resolver}"));
     }
     args.push(target.to_string());
     args.push(query_type.to_string());
     args.push("+short".into());
-    args.push("+time=2".into());
     args.push("+tries=1".into());
 
+    let dns_budget = Duration::from_secs_f64(http_dns_timeout(timeout_seconds));
     let start = Instant::now();
-    let output = timeout(
-        Duration::from_secs(5),
-        Command::new("dig").args(&args).output(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("DNS resolution timed out for {target}"))??;
+    let output = timeout(dns_budget, Command::new("dig").args(&args).output())
+        .await
+        .map_err(|_| HttpResolveError::TimedOut)?
+        .map_err(|error| HttpResolveError::Failed(format!("DNS resolution failed: {error}")))?;
     let dns_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let ip = stdout
+    let address = stdout
         .lines()
         .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with(';') && l.parse::<std::net::IpAddr>().is_ok())
-        .map(std::string::ToString::to_string)
-        .ok_or_else(|| anyhow::anyhow!("DNS resolution returned no results for {target}"))?;
-
-    // Check if resolved IP is private
-    if let Ok(parsed_ip) = ip.parse()
-        && is_ip_private(parsed_ip)
-    {
-        bail!("Private IP ranges are not allowed");
+        .filter_map(|line| line.parse::<std::net::IpAddr>().ok())
+        .find(|address| {
+            matches!(
+                (ip_version, address),
+                (4, std::net::IpAddr::V4(_)) | (6, std::net::IpAddr::V6(_))
+            )
+        })
+        .ok_or_else(|| {
+            HttpResolveError::Failed(format!("DNS resolution returned no results for {target}"))
+        })?;
+    if is_ip_private(address) {
+        return Err(HttpResolveError::PrivateIp);
     }
-
-    Ok((ip, Some(dns_ms)))
+    Ok((address.to_string(), Some(dns_ms)))
 }
 
 // ── URL builder ───────────────────────────────────────────────────────────────
@@ -785,6 +807,7 @@ fn build_curl_args(
     resolved_ip: &str,
     headers_path: &str,
     body_path: &str,
+    max_time: Duration,
 ) -> Vec<String> {
     let proto = opts.protocol.to_uppercase();
     let method = opts.request.method.to_uppercase();
@@ -801,7 +824,7 @@ fn build_curl_args(
         "-v".into(),           // verbose → TLS info on stderr
         "--compressed".into(), // accept gzip/brotli
         "--max-time".into(),
-        "10".into(),
+        max_time.as_secs_f64().max(0.001).to_string(),
         "-X".into(),
         method,
         format!("-{}", opts.ip_version),
@@ -871,6 +894,7 @@ async fn run_capturing(
     use tokio::io::AsyncWriteExt;
     let mut child = Command::new(cmd)
         .args(args)
+        .kill_on_drop(true)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -914,7 +938,13 @@ async fn read_capped(path: &str, cap: usize) -> Vec<u8> {
 /// — there is NO shell and NO temp file. Earlier this used `sh -c` with the
 /// servername interpolated into the command string, which was a command-injection
 /// (RCE) vector because the Host-header override flows in here unvalidated-for-DNS.
-async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
+async fn enrich_tls(
+    tls: &mut TlsInfo,
+    ip: &str,
+    port: u16,
+    servername: &str,
+    deadline: MeasurementDeadline,
+) {
     let connect_addr = if ip.contains(':') {
         format!("[{ip}]:{port}")
     } else {
@@ -934,8 +964,11 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
     // s_client prints connection info + the PEM cert + "Verify return code" to
     // stdout. Feed it a single newline (like `echo |`) so it finishes the
     // handshake and exits instead of waiting for application data.
-    let Some(sc_stdout) = run_capturing("openssl", &sc_args, b"\n", Duration::from_secs(10)).await
-    else {
+    let s_client_budget = deadline.remaining().min(Duration::from_secs(10));
+    if s_client_budget.is_zero() {
+        return;
+    }
+    let Some(sc_stdout) = run_capturing("openssl", &sc_args, b"\n", s_client_budget).await else {
         return;
     };
     let full_text = String::from_utf8_lossy(&sc_stdout);
@@ -961,13 +994,11 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
         "-serial".into(),
         "-text".into(),
     ];
-    let Some(x509_stdout) = run_capturing(
-        "openssl",
-        &x509_args,
-        pem.as_bytes(),
-        Duration::from_secs(4),
-    )
-    .await
+    let x509_budget = deadline.remaining().min(Duration::from_secs(4));
+    if x509_budget.is_zero() {
+        return;
+    }
+    let Some(x509_stdout) = run_capturing("openssl", &x509_args, pem.as_bytes(), x509_budget).await
     else {
         return;
     };
@@ -1050,39 +1081,77 @@ async fn remove_curl_files(headers_path: &str, body_path: &str) {
     let _ = fs::remove_file(body_path).await;
 }
 
+#[derive(Debug)]
+enum CurlRunError {
+    TimedOut(String),
+    Spawn(String),
+}
+
+fn curl_timeout_message(verbose: &str, is_https: bool) -> String {
+    if verbose.contains("< HTTP/") || verbose.contains("< HTTP/2") {
+        return "Request timed out while downloading the response.".to_string();
+    }
+    let tls_established = verbose.contains("SSL connection using")
+        || verbose.contains("ALPN: server accepted")
+        || verbose.contains("SSL certificate verify result");
+    if tls_established || (!is_https && verbose.contains("Connected to")) {
+        return "Request timed out while waiting for the first response byte.".to_string();
+    }
+    if is_https && verbose.contains("Connected to") {
+        return "Request timed out during the TLS handshake.".to_string();
+    }
+    "Request timed out while establishing the TCP connection.".to_string()
+}
+
 async fn execute_curl(
     opts: &HttpOptions,
     url: &str,
     port: u16,
     resolved_ip: &str,
-) -> Result<CurlCapture> {
+    remaining: Duration,
+    is_https: bool,
+) -> std::result::Result<CurlCapture, CurlRunError> {
     let id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let headers_path = format!("/tmp/gp_hdr_{id}.txt");
     let body_path = format!("/tmp/gp_body_{id}.txt");
-    let args = build_curl_args(opts, url, port, resolved_ip, &headers_path, &body_path);
-
-    let curl_result = timeout(
-        Duration::from_secs(15),
-        Command::new("curl").args(&args).output(),
-    )
-    .await;
+    let args = build_curl_args(
+        opts,
+        url,
+        port,
+        resolved_ip,
+        &headers_path,
+        &body_path,
+        remaining,
+    );
+    let mut command = Command::new("curl");
+    command.args(&args).kill_on_drop(true);
+    let curl_result = timeout(remaining, command.output()).await;
     let curl_output = match curl_result {
         Ok(Ok(output)) => output,
         Ok(Err(error)) => {
             remove_curl_files(&headers_path, &body_path).await;
-            bail!("curl failed to spawn: {error}");
+            return Err(CurlRunError::Spawn(format!(
+                "curl failed to spawn: {error}"
+            )));
         }
         Err(_) => {
             remove_curl_files(&headers_path, &body_path).await;
-            bail!("curl timed out");
+            return Err(CurlRunError::TimedOut(
+                "Request timed out while establishing the TCP connection.".to_string(),
+            ));
         }
     };
-
+    let verbose = String::from_utf8_lossy(&curl_output.stderr).to_string();
+    if !curl_output.status.success() && curl_output.status.code() == Some(28) {
+        let message = curl_timeout_message(&verbose, is_https);
+        remove_curl_files(&headers_path, &body_path).await;
+        return Err(CurlRunError::TimedOut(message));
+    }
     let capture = CurlCapture {
         stats: String::from_utf8_lossy(&curl_output.stdout)
             .trim()
             .to_string(),
-        verbose: String::from_utf8_lossy(&curl_output.stderr).to_string(),
+        verbose,
         raw_headers: fs::read_to_string(&headers_path).await.unwrap_or_default(),
         raw_body: read_capped(&body_path, BODY_LIMIT).await,
     };
@@ -1166,39 +1235,68 @@ async fn build_tls_info(
     port: u16,
     is_https: bool,
     verbose: &str,
+    deadline: MeasurementDeadline,
 ) -> Option<TlsInfo> {
     if !is_https {
         return None;
     }
     let mut tls = parse_tls_verbose(verbose, stats.ssl_verify_result)?;
     let server_name = opts.request.host.as_deref().unwrap_or(&opts.target);
-    enrich_tls(&mut tls, final_resolved_ip, port, server_name).await;
+    enrich_tls(&mut tls, final_resolved_ip, port, server_name, deadline).await;
     Some(tls)
 }
 
 async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     validate(opts)?;
+    let deadline = MeasurementDeadline::new(opts.timeout);
     let protocol = opts.protocol.to_uppercase();
     let is_https = protocol != "HTTP";
     let port = opts
         .port
         .unwrap_or(if protocol == "HTTP" { 80 } else { 443 });
-    let (resolved_ip, dns_ms) =
-        resolve_target(&opts.target, opts.resolver.as_deref(), opts.ip_version).await?;
+    let (resolved_ip, dns_ms) = match resolve_target(
+        &opts.target,
+        opts.resolver.as_deref(),
+        opts.ip_version,
+        opts.timeout,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(failed_result(
+                error.failure_source(),
+                error.public_message(),
+            ));
+        }
+    };
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return Ok(failed_result(
+            "target",
+            "Request timed out while establishing the TCP connection.".to_string(),
+        ));
+    }
     let url = build_url(opts, port);
-    let capture = execute_curl(opts, &url, port, &resolved_ip).await?;
+    let capture = match execute_curl(opts, &url, port, &resolved_ip, remaining, is_https).await {
+        Ok(capture) => capture,
+        Err(CurlRunError::TimedOut(message)) => return Ok(failed_result("target", message)),
+        Err(CurlRunError::Spawn(message)) => return Ok(failed_result("internal", message)),
+    };
     let stats = match parse_curl_stats(&capture) {
         Ok(stats) => stats,
-        Err(message) => return Ok(failed_result(message)),
+        Err(message) => return Ok(failed_result("target", message)),
     };
-
     let final_resolved_ip = if stats.remote_ip.is_empty() {
         resolved_ip
     } else {
         stats.remote_ip.clone()
     };
     if final_resolved_ip.parse().is_ok_and(is_ip_private) {
-        return Ok(failed_result("Private IP ranges are not allowed.".into()));
+        return Ok(failed_result(
+            "target",
+            "Private IP ranges are not allowed.".to_string(),
+        ));
     }
 
     let status_text = parse_status_text(&capture.raw_headers);
@@ -1220,6 +1318,7 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         port,
         is_https,
         &capture.verbose,
+        deadline,
     )
     .await;
     let timings = build_http_timings(&stats, dns_ms, is_https);
@@ -1231,9 +1330,9 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         raw_body.as_deref(),
         &opts.request.method,
     );
-
     Ok(ParsedHttp {
         status: HttpStatus::Finished,
+        failure_source: None,
         status_code: Some(stats.response_code),
         status_code_name: status_text,
         resolved_address: Some(final_resolved_ip),
@@ -1248,9 +1347,10 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     })
 }
 
-fn failed_result(message: String) -> ParsedHttp {
+fn failed_result(failure_source: &str, message: String) -> ParsedHttp {
     ParsedHttp {
         status: HttpStatus::Failed,
+        failure_source: Some(failure_source.to_string()),
         status_code: None,
         status_code_name: None,
         resolved_address: None,
@@ -1302,6 +1402,7 @@ pub async fn run_measurement(
         port: None,
         ip_version,
         in_progress_updates: false,
+        timeout: 10,
         request: HttpRequestOptions {
             method: method.to_string(),
             host: None,
@@ -1327,6 +1428,7 @@ mod validate_tests {
             port: None,
             ip_version: 4,
             in_progress_updates: false,
+            timeout: 10,
             request: HttpRequestOptions {
                 method: "HEAD".into(),
                 host: None,
@@ -1335,6 +1437,33 @@ mod validate_tests {
                 headers: HashMap::new(),
             },
         }
+    }
+
+    #[test]
+    fn curl_timeout_phase_messages_match_upstream() {
+        assert_eq!(
+            curl_timeout_message("", true),
+            "Request timed out while establishing the TCP connection."
+        );
+        assert_eq!(
+            curl_timeout_message("* Connected to example.com", true),
+            "Request timed out during the TLS handshake."
+        );
+        assert_eq!(
+            curl_timeout_message(
+                "* Connected to example.com\n* SSL connection using TLSv1.3",
+                true
+            ),
+            "Request timed out while waiting for the first response byte."
+        );
+        assert_eq!(
+            curl_timeout_message("* Connected to example.com\n< HTTP/1.1 200 OK", true),
+            "Request timed out while downloading the response."
+        );
+        assert_eq!(
+            curl_timeout_message("* Connected to example.com", false),
+            "Request timed out while waiting for the first response byte."
+        );
     }
 
     #[test]

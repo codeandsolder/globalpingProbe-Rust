@@ -484,11 +484,6 @@ fn validate(opts: &MtrOptions) -> Result<()> {
     if opts.packets == 0 || opts.packets > 16 {
         bail!("packets must be between 1 and 16");
     }
-    if let Ok(ip) = opts.target.parse()
-        && is_ip_private(ip)
-    {
-        bail!("Private IP ranges are not allowed");
-    }
     Ok(())
 }
 
@@ -1039,7 +1034,7 @@ x 3 1";
     }
 
     #[test]
-    fn validate_rejects_private_ip() {
+    fn validate_accepts_private_literal_for_structured_runtime_rejection() {
         let opts = MtrOptions {
             target: "10.0.0.1".into(),
             protocol: "ICMP".into(),
@@ -1049,7 +1044,7 @@ x 3 1";
             in_progress_updates: false,
             timeout: 10,
         };
-        assert!(validate(&opts).is_err());
+        assert!(validate(&opts).is_ok());
     }
 
     #[test]

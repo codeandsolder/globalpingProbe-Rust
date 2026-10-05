@@ -234,13 +234,12 @@ mod live {
 
     #[tokio::test]
     async fn live_private_ip_rejected() {
-        let result = run_measurement("10.0.0.1", "UDP", 4).await;
-        assert!(
-            result.is_err(),
-            "private IP should be rejected before spawning"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Private IP"), "err: {msg}");
+        let result = run_measurement("10.0.0.1", "UDP", 4)
+            .await
+            .expect("private IP should produce a structured failure");
+        assert_eq!(result.status, MtrStatus::Failed);
+        assert_eq!(result.failure_source.as_deref(), Some("target"));
+        assert_eq!(result.raw_output, "Private IP ranges are not allowed.");
     }
 
     #[tokio::test]

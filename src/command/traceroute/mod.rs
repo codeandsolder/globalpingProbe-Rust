@@ -58,11 +58,6 @@ fn validate(opts: &TracerouteOptions) -> Result<()> {
     if proto != "ICMP" && proto != "TCP" && proto != "UDP" {
         bail!("protocol must be ICMP, TCP, or UDP");
     }
-    if let Ok(ip) = opts.target.parse()
-        && is_ip_private(ip)
-    {
-        bail!("Private IP ranges are not allowed");
-    }
     Ok(())
 }
 
@@ -435,10 +430,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_private_ip() {
+    fn validate_accepts_private_literal_for_structured_runtime_rejection() {
         let mut opts = make_opts("ICMP", 4);
         opts.target = "192.168.1.1".into();
-        assert!(validate(&opts).is_err());
+        assert!(validate(&opts).is_ok());
     }
 
     #[test]

@@ -197,8 +197,15 @@ mod live {
             "protocol": "ICMP",
             "inProgressUpdates": false,
         });
-        let err = PingCommand.run(opts).await.unwrap_err();
-        assert!(err.to_string().contains("Private IP"), "got: {err}");
+        let result = PingCommand
+            .run(opts)
+            .await
+            .expect("private IP should be a result");
+        let parsed: globalping_probe::command::ping::parse::ParsedPing =
+            serde_json::from_value(result).unwrap();
+        assert_eq!(parsed.status, PingStatus::Failed);
+        assert_eq!(parsed.failure_source.as_deref(), Some("target"));
+        assert_eq!(parsed.raw_output, "Private IP ranges are not allowed.");
     }
     #[tokio::test]
     async fn live_tcp_cloudflare_https() {
