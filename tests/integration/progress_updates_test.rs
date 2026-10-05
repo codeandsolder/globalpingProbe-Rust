@@ -2,18 +2,17 @@
 /// Verifies that ping and traceroute emit partial results on the progress channel
 /// as they run, before the final result is returned.
 use globalping_probe::command::{
-    dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
+    ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
     traceroute::TracerouteCommand,
 };
 use serde_json::json;
-use tokio::sync::mpsc;
 
 // ── Ping in-progress ──────────────────────────────────────────────────────────
 
 /// Verify the progress channel path exists and is type-correct (compile check).
 #[test]
 fn progress_methods_are_constructible() {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = ProgressTx::channel();
     let ping_future = PingCommand.run_with_progress(json!({}), tx.clone());
     let dns_future = DnsCommand.run_with_progress(json!({}), tx.clone());
     let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx.clone());
@@ -31,7 +30,7 @@ fn progress_methods_are_constructible() {
 /// Verify producers can detect a dropped progress receiver without panicking.
 #[test]
 fn closed_progress_channel_send_returns_error() {
-    let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (tx, rx) = ProgressTx::channel();
     drop(rx);
     assert!(tx.send(json!({"status": "in-progress"})).is_err());
 }
@@ -40,13 +39,14 @@ fn closed_progress_channel_send_returns_error() {
 
 #[tokio::test]
 async fn progress_channel_delivers_values_in_order() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = ProgressTx::channel();
     for i in 0u32..5 {
         tx.send(json!({ "seq": i })).unwrap();
     }
     drop(tx);
     let mut seq = 0u32;
-    while let Some(v) = rx.recv().await {
+    while let Some(update) = rx.recv().await {
+        let v = update.resolve();
         assert_eq!(v["seq"].as_u64().unwrap(), seq as u64);
         seq += 1;
     }
@@ -55,20 +55,20 @@ async fn progress_channel_delivers_values_in_order() {
 
 #[tokio::test]
 async fn progress_channel_terminates_when_sender_dropped() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (tx, mut rx) = ProgressTx::channel();
     drop(tx);
     assert!(rx.recv().await.is_none());
 }
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_ping_shape() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = ProgressTx::channel();
     let partial = json!({
         "rawOutput": "PING 1.1.1.1 (1.1.1.1)\n64 bytes from 1.1.1.1: seq=1 ttl=58 time=10.1 ms\n",
     });
     tx.send(partial.clone()).unwrap();
     drop(tx);
-    let received = rx.recv().await.unwrap();
+    let received = rx.recv().await.unwrap().resolve();
     assert!(
         received["rawOutput"]
             .as_str()
@@ -78,13 +78,13 @@ async fn progress_channel_accepts_partial_ping_shape() {
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_traceroute_shape() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = ProgressTx::channel();
     let partial = json!({
         "rawOutput": "traceroute to 1.1.1.1 (1.1.1.1), 20 hops max\n 1  _gateway (192.168.1.1)  1.2 ms\n",
     });
     tx.send(partial).unwrap();
     drop(tx);
-    let received = rx.recv().await.unwrap();
+    let received = rx.recv().await.unwrap().resolve();
     assert!(
         received["rawOutput"]
             .as_str()
@@ -134,7 +134,7 @@ mod live {
     /// arrives on the channel before the measurement finishes.
     #[tokio::test]
     async fn live_ping_emits_progress_per_packet() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = ProgressTx::channel();
         let options = json!({
             "type": "ping",
             "target": "1.1.1.1",
@@ -148,7 +148,8 @@ mod live {
         let measure = tokio::spawn(async move { PingCommand.run_with_progress(options, tx).await });
 
         let mut partial_count = 0usize;
-        while let Some(partial) = rx.recv().await {
+        while let Some(update) = rx.recv().await {
+            let partial = update.resolve();
             partial_count += 1;
             assert!(
                 partial["rawOutput"]
@@ -172,7 +173,7 @@ mod live {
     /// Traceroute with inProgressUpdates=true — verify hop-by-hop progress.
     #[tokio::test]
     async fn live_traceroute_emits_progress_per_hop() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = ProgressTx::channel();
         let options = json!({
             "type": "traceroute",
             "target": "1.1.1.1",
@@ -186,7 +187,8 @@ mod live {
             tokio::spawn(async move { TracerouteCommand.run_with_progress(options, tx).await });
 
         let mut partial_count = 0usize;
-        while let Some(partial) = rx.recv().await {
+        while let Some(update) = rx.recv().await {
+            let partial = update.resolve();
             partial_count += 1;
             assert!(
                 partial["rawOutput"]
@@ -204,7 +206,7 @@ mod live {
 
     #[tokio::test]
     async fn live_dns_emits_progress() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = ProgressTx::channel();
         let options = json!({
             "type": "dns",
             "target": "example.com",
@@ -219,7 +221,8 @@ mod live {
         });
         let measure = tokio::spawn(async move { DnsCommand.run_with_progress(options, tx).await });
         let mut count = 0usize;
-        while let Some(partial) = rx.recv().await {
+        while let Some(update) = rx.recv().await {
+            let partial = update.resolve();
             count += 1;
             assert!(
                 partial["rawOutput"]
@@ -234,7 +237,7 @@ mod live {
 
     #[tokio::test]
     async fn live_mtr_emits_progress() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = ProgressTx::channel();
         let options = json!({
             "type": "mtr",
             "target": "1.1.1.1",
@@ -247,7 +250,8 @@ mod live {
         });
         let measure = tokio::spawn(async move { MtrCommand.run_with_progress(options, tx).await });
         let mut count = 0usize;
-        while let Some(partial) = rx.recv().await {
+        while let Some(update) = rx.recv().await {
+            let partial = update.resolve();
             count += 1;
             assert!(partial["rawOutput"].as_str().is_some());
         }
@@ -258,7 +262,7 @@ mod live {
 
     #[tokio::test]
     async fn live_http_get_emits_progress() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = ProgressTx::channel();
         let options = json!({
             "type": "http",
             "target": "example.com",
@@ -276,7 +280,8 @@ mod live {
         let measure = tokio::spawn(async move { HttpCommand.run_with_progress(options, tx).await });
         let mut count = 0usize;
         let mut saw_body = false;
-        while let Some(partial) = rx.recv().await {
+        while let Some(update) = rx.recv().await {
+            let partial = update.resolve();
             count += 1;
             saw_body |= partial["rawBody"]
                 .as_str()
@@ -292,7 +297,7 @@ mod live {
     /// Without inProgressUpdates, the channel should receive no events.
     #[tokio::test]
     async fn live_ping_no_progress_when_flag_false() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (tx, mut rx) = ProgressTx::channel();
         // Flag is false — default run path, tx is never used
         let options = json!({
             "type": "ping",

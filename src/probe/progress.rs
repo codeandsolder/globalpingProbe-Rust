@@ -3,13 +3,12 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
 
+use crate::command::{LazyProgress, ProgressUpdate};
 use crate::util::output_limit::limit_raw_output;
 use crate::util::progress_buffer::{BufferMode, ProgressBuffer};
 use rust_socketio::asynchronous::Client;
 
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
-
-pub type ProgressTransform = fn(Value) -> Value;
 
 /// Receives partial string fields from a command and forwards coalesced
 /// `probe:measurement:progress` events using the same modes as upstream.
@@ -18,7 +17,7 @@ pub struct ProgressEmitter {
     test_id: String,
     measurement_id: String,
     buffer: ProgressBuffer,
-    transform: Option<ProgressTransform>,
+    pending_lazy: Option<LazyProgress>,
 }
 
 impl ProgressEmitter {
@@ -27,14 +26,13 @@ impl ProgressEmitter {
         test_id: impl Into<String>,
         measurement_id: impl Into<String>,
         mode: BufferMode,
-        transform: Option<ProgressTransform>,
     ) -> Self {
         Self {
             client,
             test_id: test_id.into(),
             measurement_id: measurement_id.into(),
             buffer: ProgressBuffer::new(mode),
-            transform,
+            pending_lazy: None,
         }
     }
 
@@ -49,7 +47,17 @@ impl ProgressEmitter {
         }
     }
 
+    fn merge_update(&mut self, update: ProgressUpdate) {
+        match update {
+            ProgressUpdate::Value(value) => self.merge(value),
+            ProgressUpdate::Lazy(render) => self.pending_lazy = Some(render),
+        }
+    }
+
     async fn emit_buffer(&mut self) {
+        if let Some(render) = self.pending_lazy.take() {
+            self.merge(render());
+        }
         if self.buffer.is_empty() {
             return;
         }
@@ -63,9 +71,6 @@ impl ProgressEmitter {
                 .map(|(key, value)| (key, Value::String(value)))
                 .collect::<Map<_, _>>(),
         );
-        if let Some(transform) = self.transform {
-            partial = transform(partial);
-        }
         limit_raw_output(&mut partial);
         if let Err(error) = self
             .client
@@ -90,7 +95,7 @@ impl ProgressEmitter {
     /// Drain partial progress until the producer closes. The first update is sent
     /// immediately; later updates are coalesced for 500 ms. Pending progress is
     /// discarded when the producer closes because the final result supersedes it.
-    pub async fn forward(mut self, mut rx: mpsc::UnboundedReceiver<Value>) {
+    pub async fn forward(mut self, mut rx: mpsc::UnboundedReceiver<ProgressUpdate>) {
         let mut first = true;
         let mut deadline: Option<Instant> = None;
         loop {
@@ -98,7 +103,7 @@ impl ProgressEmitter {
                 tokio::select! {
                     message = rx.recv() => {
                         let Some(message) = message else { return; };
-                        self.merge(message);
+                        self.merge_update(message);
                     }
                     () = sleep_until(at) => {
                         self.emit_buffer().await;
@@ -109,7 +114,7 @@ impl ProgressEmitter {
                 let Some(message) = rx.recv().await else {
                     return;
                 };
-                self.merge(message);
+                self.merge_update(message);
                 if first {
                     first = false;
                     self.emit_buffer().await;

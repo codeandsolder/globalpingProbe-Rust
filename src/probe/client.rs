@@ -17,7 +17,7 @@ use crate::command::{
     ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
     traceroute::TracerouteCommand,
 };
-use crate::probe::progress::{ProgressEmitter, ProgressTransform};
+use crate::probe::progress::ProgressEmitter;
 use crate::probe::{
     adoption::{AdoptionServer, local_ips},
     dns_servers::get_dns_servers,
@@ -193,13 +193,6 @@ impl CommandKind {
         }
     }
 
-    fn progress_transform(&self) -> Option<ProgressTransform> {
-        match self {
-            Self::Mtr => Some(crate::command::mtr::format_progress),
-            Self::Ping | Self::Dns | Self::Traceroute | Self::Http => None,
-        }
-    }
-
     async fn run(&self, options: Value) -> Result<Value> {
         match self {
             Self::Ping => PingCommand.run(options).await,
@@ -275,15 +268,9 @@ pub async fn dispatch(
 
     let measurement_fut = async {
         if in_progress {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = ProgressTx::channel();
             let mode = cmd.progress_mode(&req.measurement);
-            let emitter = ProgressEmitter::new(
-                client.clone(),
-                tid.clone(),
-                mid.clone(),
-                mode,
-                cmd.progress_transform(),
-            );
+            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone(), mode);
             let emitter_task = tokio::spawn(emitter.forward(rx));
             let result = cmd.run_with_progress(req.measurement.clone(), tx).await;
             let _ = emitter_task.await;

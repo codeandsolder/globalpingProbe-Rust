@@ -1,6 +1,8 @@
 pub mod parse {
     use serde::Serialize;
     use std::collections::HashMap;
+
+    use super::normalize_ip_text;
     use std::fmt::Write as _;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -91,7 +93,7 @@ pub mod parse {
 
             match action {
                 "h" => {
-                    let addr = parts[2].to_string();
+                    let addr = normalize_ip_text(parts[2]);
                     // Mark duplicate if the same IP appeared at a lower hop index
                     let is_dup = builders[..idx].iter().any(|b| {
                         b.as_ref()
@@ -428,14 +430,20 @@ use super::ProgressTx;
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 use tokio::process::Command;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 
 use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
 use crate::util::private_ip::is_ip_private;
-use crate::util::resolve_target::{ResolveTargetError, resolve_command_target};
+use crate::util::resolve_target::{
+    ResolveTargetError, ResolvedTarget, resolve_command_target, reverse_lookup,
+};
 use crate::util::validate::is_safe_host;
-use parse::{MtrStatus, ParsedMtr, build_output, parse_raw};
+use parse::{MtrHop, MtrStatus, ParsedMtr, build_output, parse_raw};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -568,18 +576,173 @@ struct NativeMtrOutput {
     timed_out: bool,
 }
 
-pub fn format_progress(mut value: Value) -> Value {
-    if let Some(raw) = value.get("rawOutput").and_then(Value::as_str) {
-        let hops = parse_raw(raw, false);
-        value["rawOutput"] = Value::String(build_output(&hops));
+fn normalize_ip_text(raw: &str) -> String {
+    let address = raw.split_once('%').map_or(raw, |(address, _)| address);
+    address
+        .parse::<IpAddr>()
+        .map_or_else(|_| address.to_string(), |address| address.to_string())
+}
+
+#[derive(Debug, Clone, Default)]
+struct HopEnrichment {
+    hostname: Option<String>,
+    asn: Vec<u32>,
+}
+
+#[derive(Clone, Default)]
+struct EnrichmentCache {
+    entries: Arc<RwLock<HashMap<IpAddr, HopEnrichment>>>,
+}
+
+impl EnrichmentCache {
+    fn seed_hostname(&self, address: IpAddr, hostname: String) {
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.entry(address).or_default().hostname = Some(hostname);
     }
-    value
+
+    fn has_hostname(&self, address: IpAddr) -> bool {
+        self.entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+            .and_then(|entry| entry.hostname.as_ref())
+            .is_some()
+    }
+
+    fn update(&self, address: IpAddr, hostname: Option<String>, asn: Vec<u32>) {
+        let mut entries = self
+            .entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = entries.entry(address).or_default();
+        if hostname.is_some() {
+            entry.hostname = hostname;
+        }
+        if !asn.is_empty() {
+            entry.asn = asn;
+        }
+        drop(entries);
+    }
+
+    fn apply(&self, hops: &mut [MtrHop]) {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for hop in hops {
+            let Some(address) = hop
+                .resolved_address
+                .as_deref()
+                .and_then(|address| address.parse::<IpAddr>().ok())
+            else {
+                continue;
+            };
+            let Some(entry) = entries.get(&address) else {
+                continue;
+            };
+            if let Some(hostname) = &entry.hostname {
+                hop.resolved_hostname = Some(hostname.clone());
+            }
+            if !entry.asn.is_empty() {
+                hop.asn.clone_from(&entry.asn);
+            }
+        }
+    }
+}
+
+struct MtrEnrichment {
+    cache: EnrichmentCache,
+    seen: HashSet<IpAddr>,
+    tasks: JoinSet<()>,
+}
+
+impl MtrEnrichment {
+    fn new(target: &ResolvedTarget) -> Self {
+        let cache = EnrichmentCache::default();
+        if target.hostname != target.address.to_string() {
+            cache.seed_hostname(target.address, target.hostname.clone());
+        }
+        Self {
+            cache,
+            seen: HashSet::new(),
+            tasks: JoinSet::new(),
+        }
+    }
+
+    fn add(
+        &mut self,
+        address: IpAddr,
+        budget: Duration,
+        progress: Option<ProgressTx>,
+        raw: Arc<RwLock<String>>,
+    ) {
+        if is_ip_private(address) || !self.seen.insert(address) {
+            return;
+        }
+
+        let cache = self.cache.clone();
+        let ptr_seeded = cache.has_hostname(address);
+        self.tasks.spawn(async move {
+            let ptr = async {
+                if ptr_seeded {
+                    None
+                } else {
+                    reverse_lookup(address, budget.min(Duration::from_secs(3))).await
+                }
+            };
+            let (hostname, asn) = tokio::join!(ptr, lookup_asn(address, budget));
+            cache.update(address, hostname, asn);
+            if let Some(tx) = progress {
+                queue_mtr_progress(&tx, raw, cache);
+            }
+        });
+    }
+
+    async fn wait(&mut self) {
+        while self.tasks.join_next().await.is_some() {}
+    }
+
+    fn apply(&self, hops: &mut [MtrHop]) {
+        self.cache.apply(hops);
+    }
+}
+
+fn render_mtr_progress(raw: &str, cache: &EnrichmentCache) -> Value {
+    let mut hops = parse_raw(raw, false);
+    cache.apply(&mut hops);
+    json!({ "rawOutput": build_output(&hops) })
+}
+
+fn queue_mtr_progress(tx: &ProgressTx, raw: Arc<RwLock<String>>, cache: EnrichmentCache) {
+    tx.send_lazy(move || {
+        let raw = raw
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        render_mtr_progress(&raw, &cache)
+    })
+    .ok();
+}
+
+fn hop_address_from_raw_line(line: &str) -> Option<IpAddr> {
+    let mut parts = line.split_whitespace();
+    if parts.next()? != "h" {
+        return None;
+    }
+    let _index = parts.next()?;
+    normalize_ip_text(parts.next()?).parse().ok()
 }
 
 async fn run_native_mtr(
     args: &[String],
     process_timeout: Duration,
     progress: Option<&ProgressTx>,
+    enrichment: &mut MtrEnrichment,
+    deadline: &MeasurementDeadline,
 ) -> Result<NativeMtrOutput> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
@@ -603,13 +766,26 @@ async fn run_native_mtr(
         let _ = stderr.read_to_string(&mut text).await;
         text
     });
-    let mut raw_stdout = String::new();
+    let raw_stdout = Arc::new(RwLock::new(String::new()));
     let completed = timeout(process_timeout, async {
         while let Some(line) = stdout_lines.next_line().await? {
-            raw_stdout.push_str(&line);
-            raw_stdout.push('\n');
+            {
+                let mut raw = raw_stdout
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                raw.push_str(&line);
+                raw.push('\n');
+            }
+            if let Some(address) = hop_address_from_raw_line(&line) {
+                enrichment.add(
+                    address,
+                    deadline.remaining(),
+                    progress.cloned(),
+                    Arc::clone(&raw_stdout),
+                );
+            }
             if let Some(tx) = progress {
-                tx.send(json!({ "rawOutput": raw_stdout.clone() })).ok();
+                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.cache.clone());
             }
         }
         child.wait().await.map(|_| ())
@@ -622,8 +798,12 @@ async fn run_native_mtr(
     } else {
         completed??;
     }
+    let stdout = raw_stdout
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     Ok(NativeMtrOutput {
-        stdout: raw_stdout,
+        stdout,
         stderr: stderr_task.await.unwrap_or_default(),
         timed_out,
     })
@@ -640,12 +820,16 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     };
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
+    let mut enrichment = MtrEnrichment::new(&target);
     let native = run_native_mtr(
         &build_args(&resolved_options),
         deadline.process_timeout(),
         progress.as_ref(),
+        &mut enrichment,
+        &deadline,
     )
     .await?;
+    enrichment.wait().await;
 
     if native.stdout.trim().is_empty() {
         return Ok(ParsedMtr {
@@ -663,14 +847,7 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     }
 
     let mut hops = parse_raw(&native.stdout, true);
-    let addresses: Vec<Option<String>> = hops
-        .iter()
-        .map(|hop| hop.resolved_address.clone())
-        .collect();
-    let asns = lookup_asns(&addresses).await;
-    for (hop, asn_nums) in hops.iter_mut().zip(asns) {
-        hop.asn = asn_nums;
-    }
+    enrichment.apply(&mut hops);
     let target_address = target.address.to_string();
     let target_responded = hops.last().is_some_and(|hop| {
         hop.resolved_address.as_deref() == Some(target_address.as_str())
@@ -678,6 +855,11 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     });
     let has_drop = hops.iter().any(|hop| hop.stats.drop > 0);
     let mut raw_output = build_output(&hops);
+    if let Some(first_hop) = hops.first_mut()
+        && first_hop.resolved_address.is_some()
+    {
+        first_hop.resolved_hostname = Some("_gateway".to_string());
+    }
     let mut status = MtrStatus::Finished;
     let mut failure_source = None;
     if native.timed_out {
@@ -705,75 +887,69 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     })
 }
 
-// ── ASN lookup ────────────────────────────────────────────────────────────────
-
-/// Query ASN for every hop address in parallel. Returns empty vec on failure.
-async fn lookup_asns(addresses: &[Option<String>]) -> Vec<Vec<u32>> {
-    let futs: Vec<_> = addresses
-        .iter()
-        .map(|addr| {
-            let addr = addr.clone();
-            async move {
-                match addr {
-                    None => vec![],
-                    Some(a) => lookup_asn(&a).await,
-                }
+fn cymru_query_name(address: IpAddr) -> String {
+    let address = match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address @ IpAddr::V4(_) => address,
+    };
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            format!(
+                "{}.{}.{}.{}.origin.asn.cymru.com",
+                octets[3], octets[2], octets[1], octets[0]
+            )
+        }
+        IpAddr::V6(address) => {
+            let mut labels = Vec::with_capacity(32);
+            for byte in address.octets().iter().rev() {
+                labels.push(format!("{:x}", byte & 0x0f));
+                labels.push(format!("{:x}", byte >> 4));
             }
-        })
-        .collect();
-
-    futures::future::join_all(futs).await
+            format!("{}.origin6.asn.cymru.com", labels.join("."))
+        }
+    }
 }
 
-async fn lookup_asn(addr: &str) -> Vec<u32> {
-    // Only look up public IPv4 for now (cymru.com only supports IPv4 reversals cleanly)
-    let ip: std::net::IpAddr = match addr.parse() {
-        Ok(ip) => ip,
-        Err(_) => return vec![],
-    };
-    if is_ip_private(ip) {
-        return vec![];
+fn parse_cymru_asns(stdout: &str) -> Vec<u32> {
+    for line in stdout.lines() {
+        let line = line.trim().trim_matches('"');
+        let Some(asn_part) = line.split('|').next() else {
+            continue;
+        };
+        let asns = asn_part
+            .split_whitespace()
+            .filter_map(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .collect::<Vec<_>>();
+        if !asns.is_empty() {
+            return asns;
+        }
     }
-    let std::net::IpAddr::V4(v4) = ip else {
-        return vec![];
-    };
+    Vec::new()
+}
 
-    let octets = v4.octets();
-    let reversed = format!(
-        "{}.{}.{}.{}.origin.asn.cymru.com",
-        octets[3], octets[2], octets[1], octets[0]
-    );
-
-    // Spawn `dig +short <reversed> TXT` with a short timeout
+async fn lookup_asn(address: IpAddr, budget: Duration) -> Vec<u32> {
+    if budget.is_zero() || is_ip_private(address) {
+        return Vec::new();
+    }
+    let query = cymru_query_name(address);
     let Ok(output) = timeout(
-        Duration::from_secs(3),
+        budget.min(Duration::from_secs(3)),
         Command::new("dig")
-            .args(["+short", &reversed, "TXT"])
+            .args(["+short", &query, "TXT", "+tries=1"])
             .output(),
     )
     .await
     else {
-        return vec![];
+        return Vec::new();
     };
-
-    let Ok(output) = output else { return vec![] };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // TXT record: "15169 | 8.8.8.0/24 | US | arin | 2014-03-14"
-    // May be quoted: "\"15169 | ...\""
-    for line in stdout.lines() {
-        let line = line.trim().trim_matches('"');
-        if let Some(asn_part) = line.split('|').next() {
-            let nums: Vec<u32> = asn_part
-                .split_whitespace()
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            if !nums.is_empty() {
-                return nums;
-            }
-        }
-    }
-    vec![]
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    parse_cymru_asns(&String::from_utf8_lossy(&output.stdout))
 }
 
 // ── Public helper for integration tests ───────────────────────────────────────
@@ -1013,6 +1189,43 @@ x 3 1";
             "first trailing star shown; subsequent ones removed; output:\n{}",
             out
         );
+    }
+
+    #[test]
+    fn normalize_ip_text_strips_scope_and_canonicalizes() {
+        assert_eq!(normalize_ip_text("2001:0db8::1%eth0"), "2001:db8::1");
+        assert_eq!(normalize_ip_text("1.2.3.4"), "1.2.3.4");
+    }
+
+    #[test]
+    fn cymru_query_names_cover_ipv4_and_ipv6() {
+        let v4 = "1.2.3.4".parse().expect("valid IPv4");
+        assert_eq!(cymru_query_name(v4), "4.3.2.1.origin.asn.cymru.com");
+
+        let v6 = "2001:4860:4860::8888".parse().expect("valid IPv6");
+        let query = cymru_query_name(v6);
+        assert!(query.ends_with(".origin6.asn.cymru.com"));
+        assert!(query.starts_with("8.8.8.8."));
+    }
+
+    #[test]
+    fn parses_multiple_cymru_asns() {
+        assert_eq!(
+            parse_cymru_asns("\"13335 209242 | 1.1.1.0/24 | AU | apnic | 2011-08-11\"\n"),
+            vec![13335, 209242]
+        );
+    }
+
+    #[test]
+    fn progress_render_applies_completed_enrichment() {
+        let cache = EnrichmentCache::default();
+        let address = "1.1.1.1".parse().expect("valid address");
+        cache.update(address, Some("one.one.one.one".into()), vec![13335]);
+        let raw = "h 0 192.168.1.1\nx 0 0\np 0 1000 0\nh 1 1.1.1.1\nx 1 0\np 1 2000 0\n";
+        let rendered = render_mtr_progress(raw, &cache);
+        let output = rendered["rawOutput"].as_str().expect("raw output");
+        assert!(output.contains("AS13335"));
+        assert!(output.contains("one.one.one.one (1.1.1.1)"));
     }
 
     #[test]
