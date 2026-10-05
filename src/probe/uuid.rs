@@ -7,6 +7,7 @@ pub const UUID_PATH: &str = "/.globalping-probe-uuid";
 
 /// Resolve the actual UUID file path: use `/.globalping-probe-uuid` if writable (root),
 /// otherwise fall back to `$HOME/.globalping-probe-uuid`.
+#[must_use]
 pub fn resolve_uuid_path() -> String {
     // Try the canonical path first (works when running as root)
     if std::fs::OpenOptions::new()

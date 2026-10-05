@@ -1,4 +1,3 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,14 +6,14 @@ use crate::util::private_ip::is_ip_private;
 
 // ── Shared types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsStatus {
     Finished,
     Failed,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct DnsAnswer {
     pub name: String,
     #[serde(rename = "type")]
@@ -24,7 +23,7 @@ pub struct DnsAnswer {
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct DnsTimings {
     pub total: u32,
 }
@@ -62,33 +61,51 @@ pub struct TraceResult {
 
 // ── Regex patterns ────────────────────────────────────────────────────────────
 
-static SECTION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(;; )(\S+)( SECTION:)").unwrap());
-static QUERY_TIME_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"Query\s+time:\s+(\d+)").unwrap());
-static RESOLVER_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"SERVER:.*?\((.*?)\)").unwrap());
-static STATUS_CODE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"status:\s*([A-Z]+)").unwrap());
+static SECTION_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(;; )(\S+)( SECTION:)").unwrap());
+static QUERY_TIME_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"Query\s+time:\s+(\d+)").unwrap());
+static RESOLVER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"SERVER:.*?\((.*?)\)").unwrap());
+static STATUS_CODE_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"status:\s*([A-Z]+)").unwrap());
 // Trace: ";; Received N bytes from IP#53(name) in N ms"
-static TRACE_RECEIVED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"from\s+\S+\(([^)]+)\)\s+in\s+(\d+)\s+ms").unwrap()
-});
+static TRACE_RECEIVED_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"from\s+\S+\(([^)]+)\)\s+in\s+(\d+)\s+ms").unwrap());
 // Match an IPv4 or IPv6 address in a SERVER line
-static IP_IN_SERVER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"SERVER:\s*([^\s#]+)").unwrap()
-});
+static IP_IN_SERVER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"SERVER:\s*([^\s#]+)").unwrap());
 
 // ── Status code map ───────────────────────────────────────────────────────────
 
-static STATUS_MAP: Lazy<HashMap<&'static str, u16>> = Lazy::new(|| {
-    [
-        ("noerror", 0), ("formerr", 1), ("servfail", 2), ("nxdomain", 3),
-        ("notimp", 4), ("refused", 5), ("yxdomain", 6), ("yxrrset", 7),
-        ("nxrrset", 8), ("notauth", 9), ("notzone", 10), ("dsotypeni", 11),
-        ("badvers", 16), ("badsig", 16), ("badkey", 17), ("badtime", 18),
-        ("badmode", 19), ("badname", 20), ("badalg", 21), ("badtrunc", 22),
-        ("badcookie", 23),
-    ]
-    .into_iter()
-    .collect()
-});
+static STATUS_MAP: std::sync::LazyLock<HashMap<&'static str, u16>> =
+    std::sync::LazyLock::new(|| {
+        [
+            ("noerror", 0),
+            ("formerr", 1),
+            ("servfail", 2),
+            ("nxdomain", 3),
+            ("notimp", 4),
+            ("refused", 5),
+            ("yxdomain", 6),
+            ("yxrrset", 7),
+            ("nxrrset", 8),
+            ("notauth", 9),
+            ("notzone", 10),
+            ("dsotypeni", 11),
+            ("badvers", 16),
+            ("badsig", 16),
+            ("badkey", 17),
+            ("badtime", 18),
+            ("badmode", 19),
+            ("badname", 20),
+            ("badalg", 21),
+            ("badtrunc", 22),
+            ("badcookie", 23),
+        ]
+        .into_iter()
+        .collect()
+    });
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -107,7 +124,11 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
         raw_output: output.to_string(),
     };
 
-    if lines.len() < 6 || lines.first().map_or(false, |l| l.starts_with(";; Got bad packet:")) {
+    if lines.len() < 6
+        || lines
+            .first()
+            .is_some_and(|l| l.starts_with(";; Got bad packet:"))
+    {
         return failed(&rewritten);
     }
 
@@ -130,7 +151,11 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
         }
         if let Some(caps) = RESOLVER_RE.captures(line) {
             let ip = &caps[1];
-            resolver = Some(if ip == "x.x.x.x" { "private".into() } else { ip.to_string() });
+            resolver = Some(if ip == "x.x.x.x" {
+                "private".into()
+            } else {
+                ip.to_string()
+            });
         }
 
         section_changed = false;
@@ -150,10 +175,11 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
         if section.is_empty() || section_changed {
             continue;
         }
-        if section == "answer" && !line.starts_with(';') {
-            if let Some(answer) = parse_answer_line(line) {
-                answers.push(answer);
-            }
+        if section == "answer"
+            && !line.starts_with(';')
+            && let Some(answer) = parse_answer_line(line)
+        {
+            answers.push(answer);
         }
     }
 
@@ -169,6 +195,7 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
 }
 
 /// Parse `dig +trace` output.
+#[must_use]
 pub fn parse_trace(raw: &str) -> TraceResult {
     let lines: Vec<&str> = raw.split('\n').collect();
 
@@ -178,7 +205,11 @@ pub fn parse_trace(raw: &str) -> TraceResult {
         raw_output: raw.to_string(),
     };
 
-    if lines.len() < 3 || lines.first().map_or(false, |l| l.starts_with(";; Got bad packet:")) {
+    if lines.len() < 3
+        || lines
+            .first()
+            .is_some_and(|l| l.starts_with(";; Got bad packet:"))
+    {
         return failed();
     }
 
@@ -205,10 +236,10 @@ fn rewrite_classic(raw: &str) -> String {
             // Extract the IP before '#'
             if let Some(caps) = IP_IN_SERVER_RE.captures(line) {
                 let ip_str = &caps[1];
-                if let Ok(ip) = ip_str.parse() {
-                    if is_ip_private(ip) {
-                        return line.replace(ip_str, "x.x.x.x");
-                    }
+                if let Ok(ip) = ip_str.parse()
+                    && is_ip_private(ip)
+                {
+                    return line.replace(ip_str, "x.x.x.x");
                 }
             }
             line.to_string()
@@ -246,7 +277,7 @@ fn parse_trace_hops(lines: &[&str]) -> Vec<TraceHop> {
         if !answers.is_empty() || resolver.is_some() {
             hops.push(TraceHop {
                 answers: std::mem::take(answers),
-                timings: std::mem::replace(timings, DnsTimings::default()),
+                timings: std::mem::take(timings),
                 resolver: resolver.take(),
             });
         }

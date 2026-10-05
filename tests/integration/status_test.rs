@@ -1,7 +1,7 @@
 // ── StatusManager unit tests (no process spawning) ────────────────────────────
 
-use globalping_probe::status::status_manager::{ProbeStatus, StatusManager};
 use globalping_probe::status::icmp_tcp_test::is_vpn;
+use globalping_probe::status::status_manager::{ProbeStatus, StatusManager};
 
 // ── VPN detection logic ───────────────────────────────────────────────────────
 
@@ -47,7 +47,10 @@ fn null_diffs_never_trigger_vpn() {
 fn exactly_60_does_not_count_as_over_60() {
     // threshold is >= 60, so exactly 60.0 DOES count
     let diffs = vec![Some(60.0), Some(60.0)];
-    assert!(is_vpn(&diffs, None), "two diffs exactly at 60ms should trigger VPN");
+    assert!(
+        is_vpn(&diffs, None),
+        "two diffs exactly at 60ms should trigger VPN"
+    );
 }
 
 // ── StatusManager state transitions ──────────────────────────────────────────
@@ -161,8 +164,14 @@ fn probe_status_display() {
     assert_eq!(ProbeStatus::Initializing.to_string(), "initializing");
     assert_eq!(ProbeStatus::Ready.to_string(), "ready");
     assert_eq!(ProbeStatus::PingTestFailed.to_string(), "ping-test-failed");
-    assert_eq!(ProbeStatus::IcmpTcpTestFailed.to_string(), "icmp-tcp-test-failed");
-    assert_eq!(ProbeStatus::TooManyDisconnects.to_string(), "too-many-disconnects");
+    assert_eq!(
+        ProbeStatus::IcmpTcpTestFailed.to_string(),
+        "icmp-tcp-test-failed"
+    );
+    assert_eq!(
+        ProbeStatus::TooManyDisconnects.to_string(),
+        "too-many-disconnects"
+    );
     assert_eq!(ProbeStatus::Sigterm.to_string(), "sigterm");
 }
 
@@ -171,18 +180,24 @@ fn probe_status_display() {
 #[cfg(target_os = "linux")]
 mod live {
     use globalping_probe::command::ping::run_measurement;
-    use globalping_probe::status::ping_test::PingTest;
     use globalping_probe::status::icmp_tcp_test::IcmpTcpTest;
+    use globalping_probe::status::ping_test::PingTest;
     use globalping_probe::status::status_manager::{ProbeStatus, StatusManager};
     use globalping_probe::util::tcp_ping::tcp_ping;
 
     #[tokio::test]
     async fn live_tcp_ping_cloudflare_443() {
         let stats = tcp_ping("1.1.1.1", 443, 3, 5_000, 200).await;
-        assert!(stats.rcv > 0, "should have at least one successful TCP connect");
+        assert!(
+            stats.rcv > 0,
+            "should have at least one successful TCP connect"
+        );
         assert!(stats.avg.is_some(), "avg should be set");
         let avg = stats.avg.unwrap();
-        assert!(avg > 0.0 && avg < 500.0, "avg RTT should be reasonable: {avg}ms");
+        assert!(
+            avg > 0.0 && avg < 500.0,
+            "avg RTT should be reasonable: {avg}ms"
+        );
         println!(
             "TCP ping 1.1.1.1:443: min={:.2?}ms avg={:.2?}ms max={:.2?}ms loss={:.1}%",
             stats.min, stats.avg, stats.max, stats.loss
@@ -218,13 +233,20 @@ mod live {
         println!("IcmpTcpTest: vpn={vpn} diffs_v4={diffs_v4:?}");
         // We don't assert VPN is false (network could have any topology)
         // Just verify diffs were measured (None means timeout, which is also fine)
-        assert!(!diffs_v4.is_empty(), "should have measured at least one diff");
+        assert!(
+            !diffs_v4.is_empty(),
+            "should have measured at least one diff"
+        );
     }
 
     #[tokio::test]
     async fn live_status_manager_becomes_ready() {
         let mut m = StatusManager::with_api_host("1.1.1.1");
-        assert_eq!(m.get_status(), ProbeStatus::Initializing, "should start Initializing");
+        assert_eq!(
+            m.get_status(),
+            ProbeStatus::Initializing,
+            "should start Initializing"
+        );
 
         let (ipv4, ipv6) = m.run_ping_test().await;
         println!("Ping test: ipv4={ipv4} ipv6={ipv6}");
@@ -232,15 +254,24 @@ mod live {
         assert!(ipv4, "IPv4 ping should succeed from WSL to 1.1.1.1");
 
         // Status is STILL Initializing until BOTH tests have run (mirrors Node.js behaviour)
-        assert_eq!(m.get_status(), ProbeStatus::Initializing,
-            "still Initializing until ICMP/TCP test also completes");
+        assert_eq!(
+            m.get_status(),
+            ProbeStatus::Initializing,
+            "still Initializing until ICMP/TCP test also completes"
+        );
 
         let vpn = m.run_icmp_tcp_test().await;
-        println!("ICMP/TCP test: vpn_detected={vpn} status={}", m.get_status());
+        println!(
+            "ICMP/TCP test: vpn_detected={vpn} status={}",
+            m.get_status()
+        );
 
         // Now both tests are done — status must have left Initializing
-        assert_ne!(m.get_status(), ProbeStatus::Initializing,
-            "status should leave Initializing after both tests complete");
+        assert_ne!(
+            m.get_status(),
+            ProbeStatus::Initializing,
+            "status should leave Initializing after both tests complete"
+        );
 
         // If VPN not detected and ping passed, we should be Ready
         if !vpn {

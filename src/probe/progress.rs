@@ -1,9 +1,9 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use rust_socketio::asynchronous::Client;
 use crate::util::output_limit::limit_raw_output;
+use rust_socketio::asynchronous::Client;
 
 /// Receives partial measurement results from a command and forwards them to
 /// the API as `probe:measurement:progress` socket.io events.
@@ -14,7 +14,11 @@ pub struct ProgressEmitter {
 }
 
 impl ProgressEmitter {
-    pub fn new(client: Client, test_id: impl Into<String>, measurement_id: impl Into<String>) -> Self {
+    pub fn new(
+        client: Client,
+        test_id: impl Into<String>,
+        measurement_id: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             test_id: test_id.into(),
@@ -28,11 +32,18 @@ impl ProgressEmitter {
     pub async fn forward(self, mut rx: mpsc::UnboundedReceiver<Value>) {
         while let Some(mut partial) = rx.recv().await {
             limit_raw_output(&mut partial);
-            if let Err(e) = self.client.emit("probe:measurement:progress", json!({
-                "testId":        self.test_id,
-                "measurementId": self.measurement_id,
-                "result":        partial,
-            })).await {
+            if let Err(e) = self
+                .client
+                .emit(
+                    "probe:measurement:progress",
+                    json!({
+                        "testId":        self.test_id,
+                        "measurementId": self.measurement_id,
+                        "result":        partial,
+                    }),
+                )
+                .await
+            {
                 warn!("Failed to emit progress for {}: {e}", self.measurement_id);
             }
         }
@@ -70,7 +81,10 @@ mod tests {
         tx.send(json!({"x": 1})).unwrap();
         drop(tx);
         assert!(rx.recv().await.is_some());
-        assert!(rx.recv().await.is_none(), "channel should close after sender drop");
+        assert!(
+            rx.recv().await.is_none(),
+            "channel should close after sender drop"
+        );
     }
 
     #[test]

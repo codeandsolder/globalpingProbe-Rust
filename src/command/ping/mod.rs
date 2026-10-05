@@ -1,15 +1,15 @@
 pub mod parse;
 
-use anyhow::{bail, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
+use super::{MeasurementCommand, ProgressTx};
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
-use super::{MeasurementCommand, ProgressTx};
-use parse::{parse, ParsedPing, PingStatus};
+use parse::{ParsedPing, PingStatus, parse};
 
 // ── Options (deserialised from the socket.io job payload) ───────────────────
 
@@ -29,10 +29,18 @@ pub struct PingOptions {
     pub in_progress_updates: bool,
 }
 
-fn default_packets() -> u8 { 3 }
-fn default_protocol() -> String { "ICMP".into() }
-fn default_port() -> u16 { 80 }
-fn default_ip_version() -> u8 { 4 }
+const fn default_packets() -> u8 {
+    3
+}
+fn default_protocol() -> String {
+    "ICMP".into()
+}
+const fn default_port() -> u16 {
+    80
+}
+const fn default_ip_version() -> u8 {
+    4
+}
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
@@ -50,10 +58,10 @@ fn validate(opts: &PingOptions) -> Result<()> {
         bail!("ipVersion must be 4 or 6");
     }
     // Reject private IP targets before spawning anything
-    if let Ok(ip) = opts.target.parse() {
-        if is_ip_private(ip) {
-            bail!("Private IP ranges are not allowed.");
-        }
+    if let Ok(ip) = opts.target.parse()
+        && is_ip_private(ip)
+    {
+        bail!("Private IP ranges are not allowed.");
     }
     Ok(())
 }
@@ -61,13 +69,17 @@ fn validate(opts: &PingOptions) -> Result<()> {
 // ── Arg builder ──────────────────────────────────────────────────────────────
 
 /// Builds the argument list for the system `ping` binary (Linux format).
+#[must_use]
 pub fn build_args(opts: &PingOptions) -> Vec<String> {
     vec![
-        format!("-{}", opts.ip_version),       // -4 or -6
-        "-O".into(),                            // report unanswered packets
-        "-c".into(), opts.packets.to_string(),  // packet count
-        "-i".into(), "0.5".into(),              // 0.5s interval
-        "-w".into(), "10".into(),               // 10s overall deadline
+        format!("-{}", opts.ip_version), // -4 or -6
+        "-O".into(),                     // report unanswered packets
+        "-c".into(),
+        opts.packets.to_string(), // packet count
+        "-i".into(),
+        "0.5".into(), // 0.5s interval
+        "-w".into(),
+        "10".into(), // 10s overall deadline
         opts.target.clone(),
     ]
 }
@@ -94,9 +106,8 @@ impl MeasurementCommand for PingCommand {
 }
 
 // Regex that matches a ping packet reply line: "64 bytes from … time=X ms"
-static PACKET_LINE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-    regex::Regex::new(r"bytes from .* time=").unwrap()
-});
+static PACKET_LINE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"bytes from .* time=").unwrap());
 
 async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<ParsedPing> {
     let args = build_args(opts);
@@ -107,7 +118,10 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
         .stderr(std::process::Stdio::null())
         .spawn()?;
 
-    let stdout = child.stdout.take().expect("stdout was piped");
+    let stdout = child
+        .stdout
+        .take()
+        .context("child stdout pipe was unavailable")?;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
 
     let mut raw_output = String::new();
@@ -122,31 +136,32 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
         if resolved_address.is_none() {
             let partial = parse(&raw_output);
             if let Some(addr) = &partial.resolved_address {
-                if let Ok(ip) = addr.parse() {
-                    if is_ip_private(ip) {
-                        is_private = true;
-                        child.kill().await.ok();
-                        break;
-                    }
+                if let Ok(ip) = addr.parse()
+                    && is_ip_private(ip)
+                {
+                    is_private = true;
+                    child.kill().await.ok();
+                    break;
                 }
                 resolved_address = Some(addr.clone());
             }
         }
 
         // Emit in-progress partial after each packet reply line
-        if let Some(tx) = &progress {
-            if PACKET_LINE.is_match(&line) {
-                let partial = parse(&raw_output);
-                if !partial.timings.is_empty() {
-                    tx.send(json!({
-                        "status":            "in-progress",
-                        "rawOutput":         raw_output,
-                        "resolvedAddress":   partial.resolved_address,
-                        "resolvedHostname":  partial.resolved_hostname,
-                        "timings":           partial.timings,
-                        "stats":             partial.stats,
-                    })).ok();
-                }
+        if let Some(tx) = &progress
+            && PACKET_LINE.is_match(&line)
+        {
+            let partial = parse(&raw_output);
+            if !partial.timings.is_empty() {
+                tx.send(json!({
+                    "status":            "in-progress",
+                    "rawOutput":         raw_output,
+                    "resolvedAddress":   partial.resolved_address,
+                    "resolvedHostname":  partial.resolved_hostname,
+                    "timings":           partial.timings,
+                    "stats":             partial.stats,
+                }))
+                .ok();
             }
         }
     }
@@ -170,7 +185,11 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
 
 // ── Public helper for integration tests / status manager ─────────────────────
 
-pub async fn run_measurement(target: &str, ip_version: u8, packets: u8) -> Result<parse::ParsedPing> {
+pub async fn run_measurement(
+    target: &str,
+    ip_version: u8,
+    packets: u8,
+) -> Result<parse::ParsedPing> {
     let opts = PingOptions {
         target: target.to_string(),
         packets,

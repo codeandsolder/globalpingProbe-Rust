@@ -1,7 +1,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 use tokio::net::TcpStream;
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 
 #[derive(Debug, Clone)]
 pub struct TcpPingProbe {
@@ -27,8 +27,15 @@ pub async fn tcp_ping_single(addr: &str, port: u16, timeout_ms: u64) -> TcpPingP
         Err(_) => return TcpPingProbe { rtt_ms: None },
     };
     let start = Instant::now();
-    match timeout(Duration::from_millis(timeout_ms), TcpStream::connect(sock_addr)).await {
-        Ok(Ok(_)) => TcpPingProbe { rtt_ms: Some(start.elapsed().as_secs_f64() * 1000.0) },
+    match timeout(
+        Duration::from_millis(timeout_ms),
+        TcpStream::connect(sock_addr),
+    )
+    .await
+    {
+        Ok(Ok(_)) => TcpPingProbe {
+            rtt_ms: Some(start.elapsed().as_secs_f64() * 1000.0),
+        },
         _ => TcpPingProbe { rtt_ms: None },
     }
 }
@@ -54,20 +61,42 @@ pub async fn tcp_ping(
 pub fn compute_tcp_stats(probes: &[TcpPingProbe], total: u8) -> TcpPingStats {
     let rtts: Vec<f64> = probes.iter().filter_map(|p| p.rtt_ms).collect();
     let rcv = rtts.len() as u32;
-    let drop = total as u32 - rcv;
-    let loss = if total > 0 { (drop as f64 / total as f64) * 100.0 } else { 0.0 };
+    let drop = u32::from(total) - rcv;
+    let loss = if total > 0 {
+        (f64::from(drop) / f64::from(total)) * 100.0
+    } else {
+        0.0
+    };
 
     if rtts.is_empty() {
-        return TcpPingStats { min: None, avg: None, max: None, mdev: None, total: total as u32, rcv, drop, loss };
+        return TcpPingStats {
+            min: None,
+            avg: None,
+            max: None,
+            mdev: None,
+            total: u32::from(total),
+            rcv,
+            drop,
+            loss,
+        };
     }
 
-    let min = rtts.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = rtts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min = rtts.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = rtts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let avg = rtts.iter().sum::<f64>() / rtts.len() as f64;
     let tsum2: f64 = rtts.iter().map(|r| r * r).sum();
-    let mdev = ((tsum2 / rtts.len() as f64) - avg * avg).max(0.0).sqrt();
+    let mdev = avg.mul_add(-avg, tsum2 / rtts.len() as f64).max(0.0).sqrt();
 
-    TcpPingStats { min: Some(min), avg: Some(avg), max: Some(max), mdev: Some(mdev), total: total as u32, rcv, drop, loss }
+    TcpPingStats {
+        min: Some(min),
+        avg: Some(avg),
+        max: Some(max),
+        mdev: Some(mdev),
+        total: u32::from(total),
+        rcv,
+        drop,
+        loss,
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -107,7 +136,9 @@ mod tests {
         let probes = vec![
             TcpPingProbe { rtt_ms: Some(50.0) },
             TcpPingProbe { rtt_ms: None },
-            TcpPingProbe { rtt_ms: Some(100.0) },
+            TcpPingProbe {
+                rtt_ms: Some(100.0),
+            },
         ];
         let s = compute_tcp_stats(&probes, 3);
         assert_eq!(s.rcv, 2);
@@ -120,6 +151,9 @@ mod tests {
     fn stats_mdev_zero_when_identical_rtts() {
         let probes = vec![TcpPingProbe { rtt_ms: Some(10.0) }; 3];
         let s = compute_tcp_stats(&probes, 3);
-        assert!(s.mdev.unwrap() < 0.001, "mdev should be ~0 for identical RTTs");
+        assert!(
+            s.mdev.unwrap() < 0.001,
+            "mdev should be ~0 for identical RTTs"
+        );
     }
 }

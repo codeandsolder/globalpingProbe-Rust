@@ -1,13 +1,13 @@
 // ICMP vs TCP RTT comparison for VPN/proxy detection — mirrors src/status-manager/icmp-tcp-test.ts
-use tracing::warn;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
+use tracing::warn;
 
 use crate::command::ping::parse::parse as parse_ping;
 use crate::util::tcp_ping::tcp_ping;
 
 const VPN_DIFF_HIGH: f64 = 100.0; // ms — one hit is enough
-const VPN_DIFF_MED: f64 = 60.0;   // ms — needs 2 hits, or 1 + is_proxy
+const VPN_DIFF_MED: f64 = 60.0; // ms — needs 2 hits, or 1 + is_proxy
 
 const TCP_PORT: u16 = 443;
 const ICMP_PACKETS: u8 = 3;
@@ -24,8 +24,14 @@ pub struct IcmpTcpTest {
 }
 
 impl IcmpTcpTest {
-    pub fn new() -> Self {
-        Self { failed: false, is_proxy: None, diffs_v4: Vec::new(), diffs_v6: Vec::new() }
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            failed: false,
+            is_proxy: None,
+            diffs_v4: Vec::new(),
+            diffs_v6: Vec::new(),
+        }
     }
 
     /// Called when the API sends the `isProxy` flag via socket.
@@ -36,16 +42,13 @@ impl IcmpTcpTest {
         self.failed
     }
 
-    pub fn set_is_proxy(&mut self, is_proxy: bool) {
+    pub const fn set_is_proxy(&mut self, is_proxy: bool) {
         self.is_proxy = Some(is_proxy);
     }
 
     /// Measure ICMP vs TCP diffs for all `targets` and return true if VPN detected.
     pub async fn run_once(&mut self, targets: &[&str]) -> bool {
-        let (diffs_v4, diffs_v6) = tokio::join!(
-            measure_all(targets, 4),
-            measure_all(targets, 6),
-        );
+        let (diffs_v4, diffs_v6) = tokio::join!(measure_all(targets, 4), measure_all(targets, 6),);
         self.diffs_v4 = diffs_v4;
         self.diffs_v6 = diffs_v6;
         self.failed = self.is_vpn_detected();
@@ -55,29 +58,52 @@ impl IcmpTcpTest {
         self.failed
     }
 
+    #[must_use]
     pub fn is_vpn_detected(&self) -> bool {
         is_vpn(&self.diffs_v4, self.is_proxy) || is_vpn(&self.diffs_v6, self.is_proxy)
     }
 
-    pub fn diffs_v4(&self) -> &[Option<f64>] { &self.diffs_v4 }
-    pub fn diffs_v6(&self) -> &[Option<f64>] { &self.diffs_v6 }
+    #[must_use]
+    pub fn diffs_v4(&self) -> &[Option<f64>] {
+        &self.diffs_v4
+    }
+    #[must_use]
+    pub fn diffs_v6(&self) -> &[Option<f64>] {
+        &self.diffs_v6
+    }
+}
+
+impl Default for IcmpTcpTest {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Returns true if the diffs indicate a VPN/proxy setup.
 /// null diffs (error cases) are treated as pass (conservative).
+#[must_use]
 pub fn is_vpn(diffs: &[Option<f64>], is_proxy: Option<bool>) -> bool {
     let numeric: Vec<f64> = diffs.iter().filter_map(|d| *d).collect();
     let over_high = numeric.iter().filter(|&&d| d >= VPN_DIFF_HIGH).count();
     let over_med = numeric.iter().filter(|&&d| d >= VPN_DIFF_MED).count();
 
-    if over_high >= 1 { return true; }
-    if over_med >= 2 { return true; }
-    if over_med >= 1 && is_proxy == Some(true) { return true; }
+    if over_high >= 1 {
+        return true;
+    }
+    if over_med >= 2 {
+        return true;
+    }
+    if over_med >= 1 && is_proxy == Some(true) {
+        return true;
+    }
     false
 }
 
 async fn measure_all(targets: &[&str], ip_version: u8) -> Vec<Option<f64>> {
-    let futs: Vec<_> = targets.iter().map(|t| measure_diff(t, ip_version)).collect();
+    let futs: Vec<_> = targets
+        .iter()
+        .map(|t| measure_diff(t, ip_version))
+        .collect();
     futures::future::join_all(futs).await
 }
 
@@ -90,15 +116,24 @@ async fn measure_diff(target: &str, ip_version: u8) -> Option<f64> {
         Command::new("ping")
             .args([
                 flag.as_str(),
-                "-c", &ICMP_PACKETS.to_string(),
-                "-i", "0.5",
-                "-w", "10",
+                "-c",
+                &ICMP_PACKETS.to_string(),
+                "-i",
+                "0.5",
+                "-w",
+                "10",
                 target,
             ])
             .output(),
     );
 
-    let tcp_fut = tcp_ping(target, TCP_PORT, TCP_PACKETS, TCP_TIMEOUT_MS, TCP_INTERVAL_MS);
+    let tcp_fut = tcp_ping(
+        target,
+        TCP_PORT,
+        TCP_PACKETS,
+        TCP_TIMEOUT_MS,
+        TCP_INTERVAL_MS,
+    );
 
     let (icmp_result, tcp_stats) = tokio::join!(icmp_fut, tcp_fut);
 

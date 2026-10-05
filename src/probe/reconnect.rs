@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 /// What the client should do after a disconnect or connect error.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectOutcome {
     /// SIGTERM / CTRL-C — stop the loop entirely.
     CleanShutdown,
@@ -18,6 +18,7 @@ pub enum ConnectOutcome {
 }
 
 /// Parse the socket.io connect-error message and return the reconnect policy.
+#[must_use]
 pub fn classify_error(msg: &str) -> ConnectOutcome {
     let lower = msg.to_lowercase();
     if lower.contains("invalid probe version") || lower.contains("invalid version") {
@@ -36,14 +37,17 @@ pub fn classify_error(msg: &str) -> ConnectOutcome {
 }
 
 /// How long to wait before the next connection attempt.
-pub fn reconnect_delay(outcome: &ConnectOutcome, backoff: &mut ExponentialBackoff) -> Option<Duration> {
+pub fn reconnect_delay(
+    outcome: &ConnectOutcome,
+    backoff: &mut ExponentialBackoff,
+) -> Option<Duration> {
     match outcome {
-        ConnectOutcome::CleanShutdown       => None,
-        ConnectOutcome::InvalidVersion      => None,
-        ConnectOutcome::IpLimitOrVpn        => Some(Duration::from_secs(60 * 60)),
-        ConnectOutcome::MetadataError       => Some(Duration::from_secs(60)),
-        ConnectOutcome::ServerTerminating   => Some(Duration::ZERO),
-        ConnectOutcome::Transient           => Some(backoff.next()),
+        ConnectOutcome::CleanShutdown => None,
+        ConnectOutcome::InvalidVersion => None,
+        ConnectOutcome::IpLimitOrVpn => Some(Duration::from_hours(1)),
+        ConnectOutcome::MetadataError => Some(Duration::from_secs(60)),
+        ConnectOutcome::ServerTerminating => Some(Duration::ZERO),
+        ConnectOutcome::Transient => Some(backoff.next()),
     }
 }
 
@@ -57,8 +61,13 @@ pub struct ExponentialBackoff {
 }
 
 impl ExponentialBackoff {
-    pub fn new(min: Duration, max: Duration) -> Self {
-        Self { current: min, min, max }
+    #[must_use]
+    pub const fn new(min: Duration, max: Duration) -> Self {
+        Self {
+            current: min,
+            min,
+            max,
+        }
     }
 
     /// Return the current delay and double it for next time.
@@ -68,7 +77,7 @@ impl ExponentialBackoff {
         d
     }
 
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.current = self.min;
     }
 }
@@ -95,31 +104,55 @@ mod tests {
 
     #[test]
     fn classifies_geoip() {
-        assert_eq!(classify_error("geoip lookup failed"), ConnectOutcome::IpLimitOrVpn);
+        assert_eq!(
+            classify_error("geoip lookup failed"),
+            ConnectOutcome::IpLimitOrVpn
+        );
     }
 
     #[test]
     fn classifies_metadata() {
-        assert_eq!(classify_error("invalid metadata"), ConnectOutcome::MetadataError);
-        assert_eq!(classify_error("metadata error"), ConnectOutcome::MetadataError);
+        assert_eq!(
+            classify_error("invalid metadata"),
+            ConnectOutcome::MetadataError
+        );
+        assert_eq!(
+            classify_error("metadata error"),
+            ConnectOutcome::MetadataError
+        );
     }
 
     #[test]
     fn classifies_invalid_version() {
-        assert_eq!(classify_error("invalid probe version (0.1.0)"), ConnectOutcome::InvalidVersion);
-        assert_eq!(classify_error("invalid version"), ConnectOutcome::InvalidVersion);
+        assert_eq!(
+            classify_error("invalid probe version (0.1.0)"),
+            ConnectOutcome::InvalidVersion
+        );
+        assert_eq!(
+            classify_error("invalid version"),
+            ConnectOutcome::InvalidVersion
+        );
     }
 
     #[test]
     fn classifies_server_terminating() {
-        assert_eq!(classify_error("server-terminating"), ConnectOutcome::ServerTerminating);
-        assert_eq!(classify_error("server terminating"), ConnectOutcome::ServerTerminating);
+        assert_eq!(
+            classify_error("server-terminating"),
+            ConnectOutcome::ServerTerminating
+        );
+        assert_eq!(
+            classify_error("server terminating"),
+            ConnectOutcome::ServerTerminating
+        );
     }
 
     #[test]
     fn classifies_unknown_as_transient() {
         assert_eq!(classify_error(""), ConnectOutcome::Transient);
-        assert_eq!(classify_error("connection reset by peer"), ConnectOutcome::Transient);
+        assert_eq!(
+            classify_error("connection reset by peer"),
+            ConnectOutcome::Transient
+        );
         assert_eq!(classify_error("timeout"), ConnectOutcome::Transient);
     }
 
@@ -128,39 +161,63 @@ mod tests {
     #[test]
     fn clean_shutdown_returns_none() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(reconnect_delay(&ConnectOutcome::CleanShutdown, &mut bo), None);
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::CleanShutdown, &mut bo),
+            None
+        );
     }
 
     #[test]
     fn invalid_version_returns_none() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(reconnect_delay(&ConnectOutcome::InvalidVersion, &mut bo), None);
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::InvalidVersion, &mut bo),
+            None
+        );
     }
 
     #[test]
     fn ip_limit_returns_one_hour() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(reconnect_delay(&ConnectOutcome::IpLimitOrVpn, &mut bo), Some(Duration::from_secs(3600)));
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::IpLimitOrVpn, &mut bo),
+            Some(Duration::from_secs(3600))
+        );
     }
 
     #[test]
     fn metadata_error_returns_one_minute() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(reconnect_delay(&ConnectOutcome::MetadataError, &mut bo), Some(Duration::from_secs(60)));
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::MetadataError, &mut bo),
+            Some(Duration::from_secs(60))
+        );
     }
 
     #[test]
     fn server_terminating_returns_zero() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(reconnect_delay(&ConnectOutcome::ServerTerminating, &mut bo), Some(Duration::ZERO));
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::ServerTerminating, &mut bo),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
     fn transient_uses_backoff() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(reconnect_delay(&ConnectOutcome::Transient, &mut bo), Some(Duration::from_secs(1)));
-        assert_eq!(reconnect_delay(&ConnectOutcome::Transient, &mut bo), Some(Duration::from_secs(2)));
-        assert_eq!(reconnect_delay(&ConnectOutcome::Transient, &mut bo), Some(Duration::from_secs(4)));
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::Transient, &mut bo),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::Transient, &mut bo),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            reconnect_delay(&ConnectOutcome::Transient, &mut bo),
+            Some(Duration::from_secs(4))
+        );
     }
 
     // ── ExponentialBackoff ────────────────────────────────────────────────────
@@ -186,7 +243,9 @@ mod tests {
     #[test]
     fn backoff_resets_to_min() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        bo.next(); bo.next(); bo.next(); // advance a few times
+        bo.next();
+        bo.next();
+        bo.next(); // advance a few times
         bo.reset();
         assert_eq!(bo.next(), Duration::from_secs(1));
     }

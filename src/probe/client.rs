@@ -1,33 +1,35 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use futures_util::FutureExt;
 use serde::Deserialize;
-use serde_json::{json, Value};
-use tokio::sync::{watch, Mutex, Notify};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, Notify, watch};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use rust_socketio::{
-    asynchronous::{Client, ClientBuilder},
     Payload, TransportType,
+    asynchronous::{Client, ClientBuilder},
 };
 
 use crate::command::{
-    dns::DnsCommand, http::HttpCommand, mtr::MtrCommand,
-    ping::PingCommand, traceroute::TracerouteCommand, MeasurementCommand,
+    MeasurementCommand, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
+    traceroute::TracerouteCommand,
 };
 use crate::probe::progress::ProgressEmitter;
-use crate::util::output_limit::limit_raw_output;
 use crate::probe::{
     dns_servers::get_dns_servers,
     limiter::MeasurementLimiter,
-    reconnect::{classify_error, reconnect_delay, ConnectOutcome, ExponentialBackoff},
+    reconnect::{ConnectOutcome, ExponentialBackoff, classify_error, reconnect_delay},
     stats::MeasurementStats,
     sysinfo::{disk_info_mb, total_memory_bytes},
 };
-use crate::status::{icmp_tcp_test::IcmpTcpTest, ping_test::PingTest, status_manager::StatusManager};
-use crate::util::logs_transport::{run_logs_loop, API_LOG_BUFFER};
+use crate::status::{
+    icmp_tcp_test::IcmpTcpTest, ping_test::PingTest, status_manager::StatusManager,
+};
+use crate::util::logs_transport::{API_LOG_BUFFER, run_logs_loop};
+use crate::util::output_limit::limit_raw_output;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NODE_VERSION: &str = "v22.22.3";
@@ -66,6 +68,7 @@ impl Default for ClientConfig {
 // ── URL ───────────────────────────────────────────────────────────────────────
 
 /// Build the WebSocket handshake URL with probe metadata as query params.
+#[must_use]
 pub fn connection_url(cfg: &ClientConfig) -> String {
     let mem = total_memory_bytes();
     let (total_disk, avail_disk) = disk_info_mb();
@@ -103,7 +106,10 @@ struct OutcomeSignal {
 
 impl OutcomeSignal {
     fn new() -> Self {
-        Self { value: Arc::new(Mutex::new(None)), notify: Arc::new(Notify::new()) }
+        Self {
+            value: Arc::new(Mutex::new(None)),
+            notify: Arc::new(Notify::new()),
+        }
     }
 
     /// Record the outcome and wake the waiter (only the first call has effect).
@@ -131,16 +137,17 @@ impl OutcomeSignal {
 /// Map a measurement type string to its command object.
 fn make_command(mtype: &str) -> Option<Box<dyn MeasurementCommand>> {
     match mtype {
-        "ping"       => Some(Box::new(PingCommand)),
-        "dns"        => Some(Box::new(DnsCommand)),
+        "ping" => Some(Box::new(PingCommand)),
+        "dns" => Some(Box::new(DnsCommand)),
         "traceroute" => Some(Box::new(TracerouteCommand)),
-        "mtr"        => Some(Box::new(MtrCommand)),
-        "http"       => Some(Box::new(HttpCommand)),
-        _            => None,
+        "mtr" => Some(Box::new(MtrCommand)),
+        "http" => Some(Box::new(HttpCommand)),
+        _ => None,
     }
 }
 
 /// Run one measurement job and emit the result back to the API.
+///
 /// `limiter` guards the concurrency cap; the acquired slot is held for the
 /// entire duration of the measurement and released automatically when this
 /// function returns.
@@ -155,16 +162,15 @@ pub async fn dispatch(
     let tid = req.test_id.clone();
 
     // Concurrency guard — reject if already at capacity.
-    let _slot = match limiter.try_acquire() {
-        Some(s) => s,
-        None => {
-            warn!(
-                "Measurement {mid} rejected — already running {} of {} max.",
-                limiter.in_flight(),
-                limiter.capacity()
-            );
-            return;
-        }
+    let _slot = if let Some(s) = limiter.try_acquire() {
+        s
+    } else {
+        warn!(
+            "Measurement {mid} rejected — already running {} of {} max.",
+            limiter.in_flight(),
+            limiter.capacity()
+        );
+        return;
     };
 
     {
@@ -181,21 +187,33 @@ pub async fn dispatch(
         return;
     }
 
-    let mtype = req.measurement.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let mtype = req
+        .measurement
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
-    let cmd = match make_command(mtype) {
-        Some(c) => c,
-        None    => {
-            let result_json = json!({ "status": "failed", "rawOutput": format!("Unknown measurement type: {mtype}") });
-            client.emit("probe:measurement:result", json!({
-                "testId": tid, "measurementId": mid, "result": result_json,
-            })).await.ok();
-            return;
-        }
+    let cmd = if let Some(c) = make_command(mtype) {
+        c
+    } else {
+        let result_json = json!({ "status": "failed", "rawOutput": format!("Unknown measurement type: {mtype}") });
+        client
+            .emit(
+                "probe:measurement:result",
+                json!({
+                    "testId": tid, "measurementId": mid, "result": result_json,
+                }),
+            )
+            .await
+            .ok();
+        return;
     };
 
-    let in_progress = req.measurement
-        .get("inProgressUpdates").and_then(|v| v.as_bool()).unwrap_or(false);
+    let in_progress = req
+        .measurement
+        .get("inProgressUpdates")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
 
     debug!("{mtype} request {mid} received.");
     stats.record_start();
@@ -211,18 +229,21 @@ pub async fn dispatch(
         }
     };
 
-    let run_result: Result<Value> = match tokio::time::timeout(MEASUREMENT_TIMEOUT, measurement_fut).await {
-        Ok(r)  => r,
-        Err(_) => {
-            warn!("Measurement {mid} timed out after {}s.", MEASUREMENT_TIMEOUT.as_secs());
+    let run_result: Result<Value> =
+        if let Ok(r) = tokio::time::timeout(MEASUREMENT_TIMEOUT, measurement_fut).await {
+            r
+        } else {
+            warn!(
+                "Measurement {mid} timed out after {}s.",
+                MEASUREMENT_TIMEOUT.as_secs()
+            );
             Ok(json!({ "status": "failed", "rawOutput": "Measurement timed out." }))
-        }
-    };
+        };
 
     stats.record_finish();
 
     let mut result_json = match run_result {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(e) => {
             error!(target: "test-error-handler", "Failed to run the measurement: {e}");
             json!({ "status": "failed", "rawOutput": e.to_string() })
@@ -231,11 +252,17 @@ pub async fn dispatch(
 
     limit_raw_output(&mut result_json);
 
-    if let Err(e) = client.emit("probe:measurement:result", json!({
-        "testId": tid,
-        "measurementId": mid,
-        "result": result_json,
-    })).await {
+    if let Err(e) = client
+        .emit(
+            "probe:measurement:result",
+            json!({
+                "testId": tid,
+                "measurementId": mid,
+                "result": result_json,
+            }),
+        )
+        .await
+    {
         warn!("Failed to send result for {mid}: {e}");
     }
 }
@@ -260,10 +287,16 @@ pub async fn run_stats_loop(stats: Arc<MeasurementStats>, client: Client) {
     loop {
         tokio::time::sleep(STATS_INTERVAL).await;
         let (started, finished) = stats.take();
-        client.emit("probe:stats:report", json!({
-            "measurementsStarted":  started,
-            "measurementsFinished": finished,
-        })).await.ok();
+        client
+            .emit(
+                "probe:stats:report",
+                json!({
+                    "measurementsStarted":  started,
+                    "measurementsFinished": finished,
+                }),
+            )
+            .await
+            .ok();
     }
 }
 
@@ -276,7 +309,7 @@ pub async fn run_status_loop(
     client: Client,
     ping_target: String,
 ) {
-    const INTERVAL: Duration = Duration::from_secs(10 * 60);
+    const INTERVAL: Duration = Duration::from_mins(10);
     const ICMP_TARGETS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
 
     loop {
@@ -285,8 +318,14 @@ pub async fn run_status_loop(
             let mut mgr = status.lock().await;
             mgr.ping_test_failed = Some(!ipv4 && !ipv6);
         }
-        client.emit("probe:isIPv4Supported:update", json!(ipv4)).await.ok();
-        client.emit("probe:isIPv6Supported:update", json!(ipv6)).await.ok();
+        client
+            .emit("probe:isIPv4Supported:update", json!(ipv4))
+            .await
+            .ok();
+        client
+            .emit("probe:isIPv6Supported:update", json!(ipv6))
+            .await
+            .ok();
 
         let vpn = IcmpTcpTest::new().run_once(ICMP_TARGETS).await;
         {
@@ -300,7 +339,10 @@ pub async fn run_status_loop(
         }
 
         // Refresh DNS servers in case resolvers changed since last connect.
-        client.emit("probe:dns:update", json!(get_dns_servers())).await.ok();
+        client
+            .emit("probe:dns:update", json!(get_dns_servers()))
+            .await
+            .ok();
 
         tokio::time::sleep(INTERVAL).await;
     }
@@ -319,17 +361,17 @@ async fn connect_once(
 ) -> (ConnectOutcome, bool) {
     let url = connection_url(cfg);
 
-    let limiter        = MeasurementLimiter::new();
-    let limiter_drain  = limiter.clone(); // kept in connect_once for graceful drain
-    let stats          = MeasurementStats::new();
-    let signal   = OutcomeSignal::new();
-    let s_error  = signal.clone();
-    let s_disco  = signal.clone();
+    let limiter = MeasurementLimiter::new();
+    let limiter_drain = limiter.clone(); // kept in connect_once for graceful drain
+    let stats = MeasurementStats::new();
+    let signal = OutcomeSignal::new();
+    let s_error = signal.clone();
+    let s_disco = signal.clone();
     let s_conn_signal = signal.clone();
-    let s_proxy  = Arc::clone(&status);
-    let s_conn   = Arc::clone(&status);
-    let s_meas   = Arc::clone(&status);
-    let s_stats  = Arc::clone(&stats);
+    let s_proxy = Arc::clone(&status);
+    let s_conn = Arc::clone(&status);
+    let s_meas = Arc::clone(&status);
+    let s_stats = Arc::clone(&stats);
     let s_disco_status = Arc::clone(&status);
     // Tracks whether we've already had one successful connect event.
     // rust-socketio 0.5 reconnects internally on transport close without firing
@@ -463,7 +505,7 @@ async fn connect_once(
             let status = Arc::clone(&s_proxy);
             async move {
                 if let Some(v) = extract_first_value(&payload) {
-                    let is_proxy = v.get("isProxy").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_proxy = v.get("isProxy").and_then(serde_json::Value::as_bool).unwrap_or(false);
                     let mut mgr = status.lock().await;
                     mgr.on_proxy_status(is_proxy);
                     let st = mgr.get_status().to_string();
@@ -475,9 +517,9 @@ async fn connect_once(
 
         .on("api:logs-transport:set", |payload: Payload, _| async move {
             if let Some(v) = extract_first_value(&payload) {
-                let is_active     = v.get("isActive").and_then(|v| v.as_bool());
-                let send_interval = v.get("sendInterval").and_then(|v| v.as_u64());
-                let max_buffer    = v.get("maxBufferSize").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let is_active     = v.get("isActive").and_then(serde_json::Value::as_bool);
+                let send_interval = v.get("sendInterval").and_then(serde_json::Value::as_u64);
+                let max_buffer    = v.get("maxBufferSize").and_then(serde_json::Value::as_u64).map(|n| n as usize);
                 API_LOG_BUFFER.update(is_active, send_interval, max_buffer);
             }
         }.boxed())
@@ -487,10 +529,7 @@ async fn connect_once(
             let limiter = limiter.clone();
             let stats   = Arc::clone(&s_stats);
             async move {
-                let data = match extract_first_value(&payload) {
-                    Some(v) => v,
-                    None => { warn!("Empty measurement payload"); return; }
-                };
+                let data = if let Some(v) = extract_first_value(&payload) { v } else { warn!("Empty measurement payload"); return; };
                 match serde_json::from_value::<MeasurementRequest>(data) {
                     Ok(req)  => { tokio::spawn(dispatch(req, client, status, limiter, stats)); }
                     Err(e)   => warn!("Bad measurement request: {e}"),
@@ -514,10 +553,7 @@ async fn connect_once(
         socket.clone(),
         cfg.ping_target.clone(),
     ));
-    let stats_handle = tokio::spawn(run_stats_loop(
-        Arc::clone(&stats),
-        socket.clone(),
-    ));
+    let stats_handle = tokio::spawn(run_stats_loop(Arc::clone(&stats), socket.clone()));
     let logs_handle = tokio::spawn(run_logs_loop(socket.clone()));
 
     // Wait for: clean shutdown signal  OR  disconnect/error outcome from handlers.
@@ -534,13 +570,18 @@ async fn connect_once(
 
     if matches!(outcome, ConnectOutcome::CleanShutdown) {
         status.lock().await.set_sigterm();
-        socket.emit("probe:status:update", json!("sigterm")).await.ok();
+        socket
+            .emit("probe:status:update", json!("sigterm"))
+            .await
+            .ok();
 
         let in_flight = limiter_drain.in_flight();
-        if in_flight > 0 {
-            if tokio::time::timeout(DRAIN_TIMEOUT, limiter_drain.wait_idle()).await.is_err() {
-                warn!("SIGTERM timeout. Force closing.");
-            }
+        if in_flight > 0
+            && tokio::time::timeout(DRAIN_TIMEOUT, limiter_drain.wait_idle())
+                .await
+                .is_err()
+        {
+            warn!("SIGTERM timeout. Force closing.");
         }
     }
     socket.disconnect().await.ok();
@@ -563,16 +604,22 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     // One signal handler for the entire lifetime of the process.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        wait_for_signal().await;
-        shutdown_tx.send(true).ok();
+        if let Err(error) = wait_for_signal().await {
+            error!(%error, "Failed to install process signal handler.");
+            return;
+        }
+        let _ = shutdown_tx.send(true);
     });
 
     let mut backoff = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
 
     loop {
-        if *shutdown_rx.borrow() { break; }
+        if *shutdown_rx.borrow() {
+            break;
+        }
 
-        let (outcome, was_connected) = connect_once(&cfg, Arc::clone(&status), shutdown_rx.clone()).await;
+        let (outcome, was_connected) =
+            connect_once(&cfg, Arc::clone(&status), shutdown_rx.clone()).await;
 
         match reconnect_delay(&outcome, &mut backoff) {
             None => {
@@ -590,15 +637,21 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
                     backoff.reset();
                 }
                 match &outcome {
-                    ConnectOutcome::IpLimitOrVpn    => error!(target: "api:error", "Retrying in 1 hour. Probe temporarily disconnected."),
-                    ConnectOutcome::MetadataError   => error!(target: "api:error", "Retrying in 1 minute. Probe temporarily disconnected."),
-                    ConnectOutcome::ServerTerminating => debug!(target: "api:error", "The server is terminating. Connecting to another one."),
+                    ConnectOutcome::IpLimitOrVpn => {
+                        error!(target: "api:error", "Retrying in 1 hour. Probe temporarily disconnected.");
+                    }
+                    ConnectOutcome::MetadataError => {
+                        error!(target: "api:error", "Retrying in 1 minute. Probe temporarily disconnected.");
+                    }
+                    ConnectOutcome::ServerTerminating => {
+                        debug!(target: "api:error", "The server is terminating. Connecting to another one.");
+                    }
                     _ => {}
                 }
                 if !delay.is_zero() {
                     tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        _ = async {
+                        () = tokio::time::sleep(delay) => {}
+                        () = async {
                             let mut rx = shutdown_rx.clone();
                             let _ = rx.changed().await;
                         } => break,
@@ -612,23 +665,28 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_signal() {
+async fn wait_for_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = signal(SignalKind::terminate())?;
         tokio::select! {
             _ = sigterm.recv()          => { info!("SIGTERM received."); }
-            _ = tokio::signal::ctrl_c() => { info!("CTRL-C received."); }
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                info!("CTRL-C received.");
+            }
         }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await.ok();
+    tokio::signal::ctrl_c().await?;
+
+    Ok(())
 }
 
 // ── Error parsing ─────────────────────────────────────────────────────────────
 
-/// Extract (inner_message, ip_address) from a socket.io connect-error payload.
+/// Extract (`inner_message`, `ip_address`) from a socket.io connect-error payload.
 ///
 /// rust-socketio wraps connect errors as:
 ///   `{ "message": "Received an ConnectError frame: {\"message\":\"ip limit\",\"data\":{...}}" }`
@@ -637,23 +695,29 @@ async fn wait_for_signal() {
 /// logs match the Node.js format exactly.
 fn parse_connect_error(payload: &Payload) -> (String, Option<String>) {
     let outer_msg = extract_first_value(payload)
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
         .or_else(|| extract_first_string(payload))
         .unwrap_or_default();
 
     // Try to find an embedded JSON object inside the outer message.
-    if let Some(json_start) = outer_msg.find('{') {
-        if let Ok(inner) = serde_json::from_str::<Value>(&outer_msg[json_start..]) {
-            let inner_msg = inner.get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or(&outer_msg)
-                .to_string();
-            let ip = inner.get("data")
-                .and_then(|d| d.get("ipAddress"))
-                .and_then(|ip| ip.as_str())
-                .map(str::to_string);
-            return (inner_msg, ip);
-        }
+    if let Some(json_start) = outer_msg.find('{')
+        && let Ok(inner) = serde_json::from_str::<Value>(&outer_msg[json_start..])
+    {
+        let inner_msg = inner
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or(&outer_msg)
+            .to_string();
+        let ip = inner
+            .get("data")
+            .and_then(|d| d.get("ipAddress"))
+            .and_then(|ip| ip.as_str())
+            .map(str::to_string);
+        return (inner_msg, ip);
     }
 
     (outer_msg, None)
@@ -797,11 +861,17 @@ mod tests {
         for ty in &["ping", "dns", "traceroute", "mtr", "http"] {
             let v = json!({ "type": ty });
             let mtype = v["type"].as_str().unwrap_or("");
-            assert!(matches!(mtype, "ping"|"dns"|"traceroute"|"mtr"|"http"), "{ty}");
+            assert!(
+                matches!(mtype, "ping" | "dns" | "traceroute" | "mtr" | "http"),
+                "{ty}"
+            );
         }
         let v = json!({ "type": "unknown" });
         let mtype = v["type"].as_str().unwrap_or("");
-        assert!(!matches!(mtype, "ping"|"dns"|"traceroute"|"mtr"|"http"));
+        assert!(!matches!(
+            mtype,
+            "ping" | "dns" | "traceroute" | "mtr" | "http"
+        ));
     }
 
     // ── Error message parsing via reconnect ───────────────────────────────────
@@ -810,7 +880,10 @@ mod tests {
     fn error_message_json_envelope_is_parsed() {
         // The API sends: {"message":"ip limit","data":{"ipAddress":"..."}}
         let envelope = json!({"message": "ip limit", "data": {"ipAddress": "1.2.3.4"}});
-        let raw = envelope.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let raw = envelope
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
         assert_eq!(classify_error(raw), ConnectOutcome::IpLimitOrVpn);
     }
 }

@@ -1,12 +1,16 @@
 /// Total system RAM in bytes, read from /proc/meminfo on Linux.
+#[must_use]
 pub fn total_memory_bytes() -> u64 {
     parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
 
+#[must_use]
 pub fn parse_meminfo_total(content: &str) -> u64 {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb: u64 = rest.split_whitespace().next()
+            let kb: u64 = rest
+                .split_whitespace()
+                .next()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
             return kb * 1024;
@@ -15,8 +19,9 @@ pub fn parse_meminfo_total(content: &str) -> u64 {
     0
 }
 
-/// Disk usage of "/" in (total_mb, available_mb).
+/// Disk usage of "/" in (`total_mb`, `available_mb`).
 /// Returns (0, 0) if unavailable.
+#[must_use]
 pub fn disk_info_mb() -> (u64, u64) {
     parse_df_output(&run_df())
 }
@@ -30,6 +35,7 @@ fn run_df() -> String {
 }
 
 /// Parse `df -BM --output=size,avail /` output.
+#[must_use]
 pub fn parse_df_output(output: &str) -> (u64, u64) {
     let mut lines = output.lines().skip(1); // skip header
     if let Some(line) = lines.next() {

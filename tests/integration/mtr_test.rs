@@ -1,4 +1,4 @@
-use globalping_probe::command::mtr::parse::{build_output, parse_raw, MtrStatus};
+use globalping_probe::command::mtr::parse::{build_output, parse_raw};
 
 // ── Fixture-based parser tests ────────────────────────────────────────────────
 
@@ -42,7 +42,10 @@ fn hostnames_populated() {
     let hops = parse_raw(RAW_3HOP, true);
     assert_eq!(hops[0].resolved_hostname.as_deref(), Some("router.home"));
     assert_eq!(hops[1].resolved_hostname.as_deref(), Some("isp.net"));
-    assert_eq!(hops[2].resolved_hostname.as_deref(), Some("one.one.one.one"));
+    assert_eq!(
+        hops[2].resolved_hostname.as_deref(),
+        Some("one.one.one.one")
+    );
 }
 
 #[test]
@@ -105,8 +108,14 @@ fn output_has_header_and_gateway() {
     assert!(out.contains("Host"), "header should contain Host");
     assert!(out.contains("Loss%"));
     assert!(out.contains("_gateway"), "first hop should be _gateway");
-    assert!(!out.contains("router.home"), "real first-hop hostname must not appear");
-    assert!(out.contains("one.one.one.one"), "last hop hostname should appear");
+    assert!(
+        !out.contains("router.home"),
+        "real first-hop hostname must not appear"
+    );
+    assert!(
+        out.contains("one.one.one.one"),
+        "last hop hostname should appear"
+    );
 }
 
 #[test]
@@ -124,8 +133,15 @@ x 3 0
 x 3 1";
     let hops = parse_raw(raw, true);
     let out = build_output(&hops);
-    let waiting_count = out.lines().filter(|l| l.contains("waiting for reply")).count();
-    assert_eq!(waiting_count, 1, "first trailing star shown; remaining removed; output:\n{}", out);
+    let waiting_count = out
+        .lines()
+        .filter(|l| l.contains("waiting for reply"))
+        .count();
+    assert_eq!(
+        waiting_count, 1,
+        "first trailing star shown; remaining removed; output:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -141,7 +157,10 @@ x 2 0
 p 2 8000 0";
     let hops = parse_raw(raw, true);
     let out = build_output(&hops);
-    assert!(out.contains("waiting for reply"), "middle star hop should appear");
+    assert!(
+        out.contains("waiting for reply"),
+        "middle star hop should appear"
+    );
     assert!(out.contains("1.1.1.1"), "last hop should appear");
 }
 
@@ -149,7 +168,7 @@ p 2 8000 0";
 
 #[cfg(target_os = "linux")]
 mod live {
-    use globalping_probe::command::mtr::{run_measurement, parse::MtrStatus};
+    use globalping_probe::command::mtr::{parse::MtrStatus, run_measurement};
 
     #[tokio::test]
     async fn live_udp_ipv4_cloudflare() {
@@ -160,20 +179,33 @@ mod live {
         assert_eq!(r.status, MtrStatus::Finished, "raw:\n{}", r.raw_output);
         assert!(!r.hops.is_empty(), "should have at least one hop");
         // UDP mode: last responding hop may not be exactly 1.1.1.1 (intermediate router replies)
-        assert!(r.resolved_address.is_some(), "should have resolved at least one hop address");
+        assert!(
+            r.resolved_address.is_some(),
+            "should have resolved at least one hop address"
+        );
 
-        let total_rtts: usize = r.hops.iter().map(|h| h.timings.iter().filter(|t| t.rtt.is_some()).count()).sum();
+        let total_rtts: usize = r
+            .hops
+            .iter()
+            .map(|h| h.timings.iter().filter(|t| t.rtt.is_some()).count())
+            .sum();
         assert!(total_rtts > 0, "should have at least one measured RTT");
 
         println!(
             "MTR UDP 1.1.1.1: {} hops, {} RTTs, resolved_hostname={:?}",
-            r.hops.len(), total_rtts, r.resolved_hostname
+            r.hops.len(),
+            total_rtts,
+            r.resolved_hostname
         );
         for (i, hop) in r.hops.iter().enumerate() {
             println!(
                 "  hop {:>2}: addr={:?} host={:?} asn={:?} avg={:.1}ms loss={:.1}%",
-                i + 1, hop.resolved_address, hop.resolved_hostname, hop.asn,
-                hop.stats.avg, hop.stats.loss
+                i + 1,
+                hop.resolved_address,
+                hop.resolved_hostname,
+                hop.asn,
+                hop.stats.avg,
+                hop.stats.loss
             );
         }
         println!("\nrawOutput:\n{}", r.raw_output);
@@ -187,7 +219,9 @@ mod live {
 
         if r.status == MtrStatus::Failed
             && (r.raw_output.to_lowercase().contains("privilege")
-                || r.raw_output.to_lowercase().contains("operation not permitted"))
+                || r.raw_output
+                    .to_lowercase()
+                    .contains("operation not permitted"))
         {
             println!("ICMP mtr requires elevated privileges — skipping");
             return;
@@ -201,7 +235,10 @@ mod live {
     #[tokio::test]
     async fn live_private_ip_rejected() {
         let result = run_measurement("10.0.0.1", "UDP", 4).await;
-        assert!(result.is_err(), "private IP should be rejected before spawning");
+        assert!(
+            result.is_err(),
+            "private IP should be rejected before spawning"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("Private IP"), "err: {msg}");
     }
@@ -215,7 +252,10 @@ mod live {
         assert_eq!(r.status, MtrStatus::Finished, "raw:\n{}", r.raw_output);
 
         // At least one hop beyond the gateway should have an ASN
-        let public_hops: Vec<_> = r.hops.iter().skip(1)
+        let public_hops: Vec<_> = r
+            .hops
+            .iter()
+            .skip(1)
             .filter(|h| h.resolved_address.is_some())
             .collect();
         let has_asn = public_hops.iter().any(|h| !h.asn.is_empty());
@@ -223,7 +263,9 @@ mod live {
         if has_asn {
             println!("ASN lookup successful on at least one hop");
         } else {
-            println!("ASN lookup returned no results (dig may be unavailable or timeout) — not failing");
+            println!(
+                "ASN lookup returned no results (dig may be unavailable or timeout) — not failing"
+            );
         }
     }
 }

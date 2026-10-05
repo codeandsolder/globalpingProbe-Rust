@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Maximum size of the `rawOutput` field in any measurement result or
 /// in-progress event sent to the API.  Matches the Node.js probe's
@@ -10,6 +10,7 @@ const TRUNCATION_MARKER: &str = "\n[...truncated]";
 /// Truncate `s` to at most `max_bytes` bytes, preserving valid UTF-8.
 /// Appends `[...truncated]` on a new line if any bytes were removed.
 /// Returns the original string unchanged if it fits within the limit.
+#[must_use]
 pub fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_owned();
@@ -26,11 +27,11 @@ pub fn truncate_output(s: &str, max_bytes: usize) -> String {
 /// a JSON measurement result or progress event in-place.
 /// No-ops if the field is absent, null, or within the limit.
 pub fn limit_raw_output(result: &mut Value) {
-    if let Some(raw) = result.get("rawOutput").and_then(|v| v.as_str()) {
-        if raw.len() > MAX_RAW_OUTPUT_BYTES {
-            let truncated = truncate_output(raw, MAX_RAW_OUTPUT_BYTES);
-            result["rawOutput"] = json!(truncated);
-        }
+    if let Some(raw) = result.get("rawOutput").and_then(|v| v.as_str())
+        && raw.len() > MAX_RAW_OUTPUT_BYTES
+    {
+        let truncated = truncate_output(raw, MAX_RAW_OUTPUT_BYTES);
+        result["rawOutput"] = json!(truncated);
     }
 }
 
@@ -70,7 +71,9 @@ mod tests {
         let s = "a".repeat(1000);
         let out = truncate_output(&s, 50);
         // Prefix (before marker) must be ≤ 50 bytes
-        let prefix = out.trim_end_matches("[...truncated]").trim_end_matches('\n');
+        let prefix = out
+            .trim_end_matches("[...truncated]")
+            .trim_end_matches('\n');
         assert!(prefix.len() <= 50);
     }
 
@@ -87,7 +90,10 @@ mod tests {
     fn no_marker_when_within_limit() {
         for limit in [5, 50, 500] {
             let s = "a".repeat(limit);
-            assert!(!truncate_output(&s, limit).contains("[...truncated]"), "limit={limit}");
+            assert!(
+                !truncate_output(&s, limit).contains("[...truncated]"),
+                "limit={limit}"
+            );
         }
     }
 
@@ -109,7 +115,10 @@ mod tests {
         // limit=2 would catch the 'a' and first byte of 'é', but
         // truncate_output must not produce invalid UTF-8.
         let out = truncate_output(s, 2);
-        assert!(std::str::from_utf8(out.as_bytes()).is_ok(), "must be valid UTF-8");
+        assert!(
+            std::str::from_utf8(out.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
     }
 
     #[test]
@@ -140,8 +149,14 @@ mod tests {
         assert!(raw.contains("[...truncated]"), "marker must be present");
         // The retained prefix must fit within the limit.
         let prefix_len = raw.find("\n[...truncated]").unwrap_or(raw.len());
-        assert!(prefix_len <= MAX_RAW_OUTPUT_BYTES, "prefix must be within limit");
-        assert!(raw.len() < big.len(), "overall output must be shorter than the 2× input");
+        assert!(
+            prefix_len <= MAX_RAW_OUTPUT_BYTES,
+            "prefix must be within limit"
+        );
+        assert!(
+            raw.len() < big.len(),
+            "overall output must be shorter than the 2× input"
+        );
     }
 
     #[test]

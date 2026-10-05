@@ -11,7 +11,7 @@
 # ── Stage 1: dependency cache ─────────────────────────────────────────────────
 # Pre-build all crate dependencies so that rebuilds triggered by source-only
 # changes don't re-download/re-compile the entire dependency tree.
-FROM rust:slim-bookworm AS deps
+FROM rust:1.99.0-slim-bookworm AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \

@@ -14,7 +14,7 @@ use tokio::sync::mpsc::UnboundedSender;
 pub type ProgressTx = UnboundedSender<Value>;
 
 /// Every measurement command implements this trait.
-/// Mirrors CommandInterface<T> in the Node.js probe.
+/// Mirrors `CommandInterface`<T> in the Node.js probe.
 #[async_trait::async_trait]
 pub trait MeasurementCommand: Send + Sync {
     /// Run to completion and return the final result.

@@ -1,4 +1,4 @@
-FROM rust:latest
+FROM rust:1.99.0-slim-bookworm
 
 RUN apt-get update -y && apt-get install --no-install-recommends -y \
         iputils-ping dnsutils traceroute mtr-tiny curl \

@@ -1,4 +1,4 @@
-use globalping_probe::command::dns::parse::{parse_classic, parse_trace, DnsStatus};
+use globalping_probe::command::dns::parse::{DnsStatus, parse_classic, parse_trace};
 
 // ── Fixture-based parser tests ────────────────────────────────────────────────
 
@@ -153,12 +153,16 @@ mod live {
         assert_eq!(r.status, DnsStatus::Finished, "rawOutput: {}", r.raw_output);
         assert_eq!(r.status_code_name.as_deref(), Some("NOERROR"));
         assert!(!r.answers.is_empty(), "should have A answers");
-        assert!(r.answers.iter().all(|a| a.record_type == "A"), "all answers should be A");
+        assert!(
+            r.answers.iter().all(|a| a.record_type == "A"),
+            "all answers should be A"
+        );
         // one.one.one.one always resolves to 1.1.1.1 or 1.0.0.1
         let addrs: Vec<_> = r.answers.iter().map(|a| a.value.as_str()).collect();
         assert!(
             addrs.contains(&"1.1.1.1") || addrs.contains(&"1.0.0.1"),
-            "expected Cloudflare IP, got: {:?}", addrs
+            "expected Cloudflare IP, got: {:?}",
+            addrs
         );
         assert_eq!(r.resolver.as_deref(), Some("8.8.8.8"));
         assert!(r.timings.total < 5000);
@@ -199,9 +203,13 @@ mod live {
 
     #[tokio::test]
     async fn live_nxdomain() {
-        let r = query_classic("this-domain-definitely-does-not-exist-xyzabc123.com", "A", Some("8.8.8.8"))
-            .await
-            .expect("dig failed");
+        let r = query_classic(
+            "this-domain-definitely-does-not-exist-xyzabc123.com",
+            "A",
+            Some("8.8.8.8"),
+        )
+        .await
+        .expect("dig failed");
 
         // dig returns exit 0 for NXDOMAIN, just with status NXDOMAIN in the header
         assert_eq!(r.status_code_name.as_deref(), Some("NXDOMAIN"));
@@ -216,14 +224,30 @@ mod live {
             .await
             .expect("dig +trace failed");
 
-        assert_eq!(r.status, DnsStatus::Finished, "status failed. raw:\n{}", r.raw_output);
-        assert!(!r.hops.is_empty(), "trace should produce at least one hop. raw:\n{}", r.raw_output);
+        assert_eq!(
+            r.status,
+            DnsStatus::Finished,
+            "status failed. raw:\n{}",
+            r.raw_output
+        );
+        assert!(
+            !r.hops.is_empty(),
+            "trace should produce at least one hop. raw:\n{}",
+            r.raw_output
+        );
         // First hop must have root NS records
         let first = &r.hops[0];
-        assert!(!first.answers.is_empty(),
-            "first hop has no answers ({} hops total). raw:\n{}", r.hops.len(), r.raw_output);
-        assert!(first.answers.iter().any(|a| a.record_type == "NS"),
-            "first hop should have NS records, got: {:?}", first.answers);
+        assert!(
+            !first.answers.is_empty(),
+            "first hop has no answers ({} hops total). raw:\n{}",
+            r.hops.len(),
+            r.raw_output
+        );
+        assert!(
+            first.answers.iter().any(|a| a.record_type == "NS"),
+            "first hop should have NS records, got: {:?}",
+            first.answers
+        );
         println!("Trace one.one.one.one: {} hops", r.hops.len());
         for (i, hop) in r.hops.iter().enumerate() {
             println!(

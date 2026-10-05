@@ -14,6 +14,7 @@ pub struct ProgressBuffer {
 }
 
 impl ProgressBuffer {
+    #[must_use]
     pub fn new(mode: BufferMode) -> Self {
         Self {
             buffer: HashMap::new(),
@@ -38,25 +39,22 @@ impl ProgressBuffer {
     }
 
     pub fn take_progress(&mut self) -> HashMap<String, String> {
-        match self.mode {
-            BufferMode::Diff => {
-                let mut diff = HashMap::new();
-                for (field, value) in &self.buffer {
-                    let offset = self.offset.get(field).copied().unwrap_or(0);
-                    diff.insert(field.clone(), value[offset..].to_string());
-                    self.offset.insert(field.clone(), value.len());
-                }
-                diff
+        if matches!(self.mode, BufferMode::Diff) {
+            let mut diff = HashMap::new();
+            for (field, value) in &self.buffer {
+                let offset = self.offset.get(field).copied().unwrap_or(0);
+                diff.insert(field.clone(), value[offset..].to_string());
+                self.offset.insert(field.clone(), value.len());
             }
-            _ => {
-                let out = self.buffer.clone();
-                self.buffer.clear();
-                out
-            }
+            diff
+        } else {
+            let out = self.buffer.clone();
+            self.buffer.clear();
+            out
         }
     }
 
-    pub fn is_first_progress(&mut self) -> bool {
+    pub const fn is_first_progress(&mut self) -> bool {
         let f = self.is_first;
         self.is_first = false;
         f

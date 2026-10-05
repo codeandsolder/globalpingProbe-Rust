@@ -1,6 +1,6 @@
 // Integration tests for PingCommand and ping parser
 
-use globalping_probe::command::ping::parse::{parse, PingStatus};
+use globalping_probe::command::ping::parse::{PingStatus, parse};
 
 // ── Parser integration tests (fixture strings, no real process) ──────────────
 
@@ -18,7 +18,10 @@ rtt min/avg/max/mdev = 7.948/8.018/8.120/0.073 ms\n";
     let r = parse(raw);
     assert_eq!(r.status, PingStatus::Finished);
     assert_eq!(r.resolved_address.as_deref(), Some("172.217.20.206"));
-    assert_eq!(r.resolved_hostname.as_deref(), Some("lhr25s33-in-f14.1e100.net"));
+    assert_eq!(
+        r.resolved_hostname.as_deref(),
+        Some("lhr25s33-in-f14.1e100.net")
+    );
     assert_eq!(r.timings.len(), 3);
     assert_eq!(r.stats.min, Some(7.948));
     assert_eq!(r.stats.avg, Some(8.018));
@@ -42,8 +45,14 @@ rtt min/avg/max/mdev = 1.072/1.224/1.466/0.172 ms\n";
 
     let r = parse(raw);
     assert_eq!(r.status, PingStatus::Finished);
-    assert_eq!(r.resolved_address.as_deref(), Some("2a00:1450:4026:808::200e"));
-    assert_eq!(r.resolved_hostname.as_deref(), Some("hem08s10-in-x0e.1e100.net"));
+    assert_eq!(
+        r.resolved_address.as_deref(),
+        Some("2a00:1450:4026:808::200e")
+    );
+    assert_eq!(
+        r.resolved_hostname.as_deref(),
+        Some("hem08s10-in-x0e.1e100.net")
+    );
     assert_eq!(r.timings.len(), 3);
     assert_eq!(r.stats.min, Some(1.072));
 }
@@ -94,9 +103,9 @@ fn empty_and_no_header_return_failed() {
 
 #[cfg(target_os = "linux")]
 mod live {
-    use globalping_probe::command::ping::parse::PingStatus;
-    use globalping_probe::command::ping::PingCommand;
     use globalping_probe::command::MeasurementCommand;
+    use globalping_probe::command::ping::PingCommand;
+    use globalping_probe::command::ping::parse::PingStatus;
 
     async fn run_ping(target: &str, ip_version: u8) -> serde_json::Value {
         let opts = serde_json::json!({
@@ -115,9 +124,16 @@ mod live {
         let parsed: globalping_probe::command::ping::parse::ParsedPing =
             serde_json::from_value(result).unwrap();
 
-        assert_eq!(parsed.status, PingStatus::Finished, "status should be finished");
+        assert_eq!(
+            parsed.status,
+            PingStatus::Finished,
+            "status should be finished"
+        );
         assert_eq!(parsed.resolved_address.as_deref(), Some("1.1.1.1"));
-        assert!(!parsed.timings.is_empty(), "should have at least one timing");
+        assert!(
+            !parsed.timings.is_empty(),
+            "should have at least one timing"
+        );
         assert!(parsed.timings[0].rtt > 0.0, "RTT should be positive");
         assert!(parsed.timings[0].ttl > 0, "TTL should be positive");
         assert_eq!(parsed.stats.total, Some(3));
@@ -148,8 +164,14 @@ mod live {
             return;
         }
 
-        assert_eq!(parsed.resolved_address.as_deref(), Some("2606:4700:4700::1111"));
-        assert!(!parsed.timings.is_empty(), "should have at least one timing");
+        assert_eq!(
+            parsed.resolved_address.as_deref(),
+            Some("2606:4700:4700::1111")
+        );
+        assert!(
+            !parsed.timings.is_empty(),
+            "should have at least one timing"
+        );
         assert!(parsed.timings[0].rtt > 0.0, "RTT should be positive");
         assert_eq!(parsed.stats.total, Some(3));
         assert!(parsed.stats.min.is_some());

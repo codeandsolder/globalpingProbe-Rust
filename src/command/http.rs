@@ -5,7 +5,7 @@ pub mod parse {
     const HEADERS_SIZE_LIMIT: usize = 10_000;
     const TRUNCATION_MARK: &str = "...[truncated]";
 
-    #[derive(Debug, Clone, PartialEq, Serialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "lowercase")]
     pub enum HttpStatus {
         Finished,
@@ -81,6 +81,7 @@ pub mod parse {
 
     /// Parse the `-D` dump-header file content into (name, value) pairs.
     /// Skips the first line (HTTP status line) and empty lines.
+    #[must_use]
     pub fn parse_header_file(raw: &str) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         for (i, line) in raw.lines().enumerate() {
@@ -99,6 +100,7 @@ pub mod parse {
 
     /// Extract HTTP status text from the dump-header first line.
     /// e.g. "HTTP/1.1 200 OK" → Some("OK")
+    #[must_use]
     pub fn parse_status_text(raw: &str) -> Option<String> {
         let first = raw.lines().next()?.trim_end_matches('\r');
         let parts: Vec<&str> = first.splitn(3, ' ').collect();
@@ -116,22 +118,37 @@ pub mod parse {
         pub headers: Vec<(String, String)>,
     }
 
-    fn pair_size(k: &str, v: &str) -> usize {
+    const fn pair_size(k: &str, v: &str) -> usize {
         k.len() + v.len() + 3 // ": " + "\n"
     }
     fn pair_min_size(k: &str, v: &str) -> usize {
         k.len() + v.len().min(TRUNCATION_MARK.len()) + 3
     }
 
+    #[must_use]
     pub fn truncate_headers(pairs: Vec<(String, String)>) -> TruncateResult {
         if pairs.is_empty() {
-            return TruncateResult { truncated: false, headers: pairs };
+            return TruncateResult {
+                truncated: false,
+                headers: pairs,
+            };
         }
-        let size: usize = pairs.iter().map(|(k, v)| pair_size(k, v)).sum::<usize>().saturating_sub(1);
-        let min_size: usize = pairs.iter().map(|(k, v)| pair_min_size(k, v)).sum::<usize>().saturating_sub(1);
+        let size: usize = pairs
+            .iter()
+            .map(|(k, v)| pair_size(k, v))
+            .sum::<usize>()
+            .saturating_sub(1);
+        let min_size: usize = pairs
+            .iter()
+            .map(|(k, v)| pair_min_size(k, v))
+            .sum::<usize>()
+            .saturating_sub(1);
 
         if size <= HEADERS_SIZE_LIMIT {
-            return TruncateResult { truncated: false, headers: pairs };
+            return TruncateResult {
+                truncated: false,
+                headers: pairs,
+            };
         }
 
         let mut kept = pairs;
@@ -140,7 +157,8 @@ pub mod parse {
 
         // Drop headers phase: remove largest (by min size) until we can fit with truncation
         if current_min > HEADERS_SIZE_LIMIT {
-            let mut indexed: Vec<(usize, usize)> = kept.iter()
+            let mut indexed: Vec<(usize, usize)> = kept
+                .iter()
                 .enumerate()
                 .map(|(i, (k, v))| (i, pair_min_size(k, v)))
                 .collect();
@@ -148,20 +166,27 @@ pub mod parse {
 
             let mut dropped = std::collections::HashSet::new();
             for (i, min) in &indexed {
-                if current_min <= HEADERS_SIZE_LIMIT { break; }
+                if current_min <= HEADERS_SIZE_LIMIT {
+                    break;
+                }
                 let (k, v) = &kept[*i];
                 current_size -= pair_size(k, v);
                 current_min -= min;
                 dropped.insert(*i);
             }
-            kept = kept.into_iter().enumerate()
+            kept = kept
+                .into_iter()
+                .enumerate()
                 .filter(|(i, _)| !dropped.contains(i))
                 .map(|(_, p)| p)
                 .collect();
         }
 
         if current_size <= HEADERS_SIZE_LIMIT {
-            return TruncateResult { truncated: true, headers: kept };
+            return TruncateResult {
+                truncated: true,
+                headers: kept,
+            };
         }
 
         // Shrink values phase: find uniform cap L
@@ -174,11 +199,15 @@ pub mod parse {
 
         for n in 1..=sorted_lengths.len() {
             let len = sorted_lengths[n - 1];
-            let next_len = if n < sorted_lengths.len() { sorted_lengths[n] } else { 0 };
+            let next_len = if n < sorted_lengths.len() {
+                sorted_lengths[n]
+            } else {
+                0
+            };
             let reduction = n * (len - next_len);
             if total.saturating_sub(reduction) <= value_budget {
                 let diff = total.saturating_sub(value_budget);
-                cap = len.saturating_sub((diff + n - 1) / n); // ceiling division keeps total ≤ budget
+                cap = len.saturating_sub(diff.div_ceil(n)); // ceiling division keeps total ≤ budget
                 break;
             }
             total = total.saturating_sub(reduction);
@@ -186,19 +215,27 @@ pub mod parse {
 
         cap = cap.max(TRUNCATION_MARK.len());
 
-        let headers = kept.into_iter().map(|(k, v)| {
-            if v.len() > cap {
-                let truncated_v = format!("{}{}", &v[..cap - TRUNCATION_MARK.len()], TRUNCATION_MARK);
-                (k, truncated_v)
-            } else {
-                (k, v)
-            }
-        }).collect();
+        let headers = kept
+            .into_iter()
+            .map(|(k, v)| {
+                if v.len() > cap {
+                    let truncated_v =
+                        format!("{}{}", &v[..cap - TRUNCATION_MARK.len()], TRUNCATION_MARK);
+                    (k, truncated_v)
+                } else {
+                    (k, v)
+                }
+            })
+            .collect();
 
-        TruncateResult { truncated: true, headers }
+        TruncateResult {
+            truncated: true,
+            headers,
+        }
     }
 
     /// Collapse header pairs into the deduplicated map (lowercased keys, single or Vec values)
+    #[must_use]
     pub fn dedup_headers(pairs: &[(String, String)]) -> HashMap<String, serde_json::Value> {
         let mut map: HashMap<String, serde_json::Value> = HashMap::new();
         for (k, v) in pairs {
@@ -209,7 +246,8 @@ pub mod parse {
                 }
                 Some(existing @ serde_json::Value::String(_)) => {
                     let prev = existing.clone();
-                    *existing = serde_json::Value::Array(vec![prev, serde_json::Value::String(v.clone())]);
+                    *existing =
+                        serde_json::Value::Array(vec![prev, serde_json::Value::String(v.clone())]);
                 }
                 _ => {
                     map.insert(lk, serde_json::Value::String(v.clone()));
@@ -223,6 +261,7 @@ pub mod parse {
 
     /// Parse curl -v stderr output for TLS connection details.
     /// Returns None if no TLS info found (plain HTTP).
+    #[must_use]
     pub fn parse_tls_verbose(verbose: &str, ssl_verify_result: u32) -> Option<TlsInfo> {
         let mut protocol: Option<String> = None;
         let mut cipher_name: Option<String> = None;
@@ -309,13 +348,18 @@ pub mod parse {
     fn parse_curl_date(s: &str) -> Option<String> {
         // Format: "Mon DD HH:MM:SS YYYY GMT"
         let parts: Vec<&str> = s.split_whitespace().collect();
-        if parts.len() < 4 { return None; }
+        if parts.len() < 4 {
+            return None;
+        }
         // Use chrono to parse
         let date_str = format!("{} {} {} {}", parts[0], parts[1], parts[2], parts[3]);
         let formats = ["%b %e %H:%M:%S %Y", "%b %d %H:%M:%S %Y"];
         for fmt in &formats {
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&date_str, fmt) {
-                return Some(dt.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+                return Some(
+                    dt.and_utc()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                );
             }
         }
         None
@@ -323,6 +367,7 @@ pub mod parse {
 
     // ── rawOutput builder ─────────────────────────────────────────────────────
 
+    #[must_use]
     pub fn build_raw_output(
         http_version: Option<&str>,
         status_code: Option<u16>,
@@ -336,7 +381,7 @@ pub mod parse {
 
         let base = format!("HTTP/{version} {code}\n{headers}");
 
-        if method == "HEAD" || raw_body.map_or(true, |b| b.is_empty()) {
+        if method == "HEAD" || raw_body.is_none_or(str::is_empty) {
             Some(base)
         } else {
             Some(format!("{base}\n\n{}", raw_body.unwrap_or("")))
@@ -371,7 +416,10 @@ pub mod parse {
         fn parse_status_text_ok() {
             assert_eq!(parse_status_text("HTTP/1.1 200 OK\r\n"), Some("OK".into()));
             assert_eq!(parse_status_text("HTTP/2 200 \r\n"), Some("".into()));
-            assert_eq!(parse_status_text("HTTP/1.1 404 Not Found"), Some("Not Found".into()));
+            assert_eq!(
+                parse_status_text("HTTP/1.1 404 Not Found"),
+                Some("Not Found".into())
+            );
         }
 
         #[test]
@@ -381,7 +429,10 @@ pub mod parse {
                 ("X-Foo".into(), "bar".into()),
             ];
             let map = dedup_headers(&pairs);
-            assert_eq!(map["content-type"], serde_json::Value::String("text/html".into()));
+            assert_eq!(
+                map["content-type"],
+                serde_json::Value::String("text/html".into())
+            );
         }
 
         #[test]
@@ -412,9 +463,20 @@ pub mod parse {
             let res = truncate_headers(pairs);
             assert!(res.truncated);
             let val = &res.headers[0].1;
-            assert!(val.ends_with(TRUNCATION_MARK), "value should end with truncation mark: {}", &val[val.len().saturating_sub(20)..]);
-            let raw_size = res.headers.iter().map(|(k, v)| k.len() + v.len() + 2).sum::<usize>();
-            assert!(raw_size <= HEADERS_SIZE_LIMIT + 10, "output size should be within limit");
+            assert!(
+                val.ends_with(TRUNCATION_MARK),
+                "value should end with truncation mark: {}",
+                &val[val.len().saturating_sub(20)..]
+            );
+            let raw_size = res
+                .headers
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 2)
+                .sum::<usize>();
+            assert!(
+                raw_size <= HEADERS_SIZE_LIMIT + 10,
+                "output size should be within limit"
+            );
         }
 
         #[test]
@@ -425,11 +487,16 @@ pub mod parse {
                 .collect();
             let res = truncate_headers(pairs);
             assert!(res.truncated);
-            let total: usize = res.headers.iter()
+            let total: usize = res
+                .headers
+                .iter()
                 .map(|(k, v)| k.len() + v.len() + 3)
                 .sum::<usize>()
                 .saturating_sub(1);
-            assert!(total <= HEADERS_SIZE_LIMIT, "total after truncation: {total}");
+            assert!(
+                total <= HEADERS_SIZE_LIMIT,
+                "total after truncation: {total}"
+            );
         }
 
         #[test]
@@ -448,7 +515,10 @@ pub mod parse {
             assert_eq!(tls.protocol.as_deref(), Some("TLSv1.3"));
             assert_eq!(tls.cipher_name.as_deref(), Some("TLS_AES_256_GCM_SHA384"));
             assert_eq!(tls.subject.cn.as_deref(), Some("cloudflare.com"));
-            assert_eq!(tls.issuer.cn.as_deref(), Some("DigiCert TLS RSA SHA256 2020 CA1"));
+            assert_eq!(
+                tls.issuer.cn.as_deref(),
+                Some("DigiCert TLS RSA SHA256 2020 CA1")
+            );
             assert_eq!(tls.issuer.o.as_deref(), Some("DigiCert Inc"));
             assert_eq!(tls.issuer.c.as_deref(), Some("US"));
             assert!(tls.created_at.is_some());
@@ -463,7 +533,13 @@ pub mod parse {
 
         #[test]
         fn build_raw_output_head_no_body() {
-            let out = build_raw_output(Some("1.1"), Some(200), Some("Content-Type: text/html"), None, "HEAD");
+            let out = build_raw_output(
+                Some("1.1"),
+                Some(200),
+                Some("Content-Type: text/html"),
+                None,
+                "HEAD",
+            );
             assert!(out.is_some());
             let s = out.unwrap();
             assert!(s.starts_with("HTTP/1.1 200"));
@@ -472,7 +548,13 @@ pub mod parse {
 
         #[test]
         fn build_raw_output_get_with_body() {
-            let out = build_raw_output(Some("1.1"), Some(200), Some("Content-Type: text/html"), Some("<html>"), "GET");
+            let out = build_raw_output(
+                Some("1.1"),
+                Some(200),
+                Some("Content-Type: text/html"),
+                Some("<html>"),
+                "GET",
+            );
             let s = out.unwrap();
             assert!(s.contains("\n\n<html>"));
         }
@@ -481,20 +563,20 @@ pub mod parse {
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::fs;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{Duration, Instant, timeout};
 
 use super::MeasurementCommand;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::{is_safe_host, is_safe_url_component};
 use parse::{
-    build_raw_output, dedup_headers, parse_header_file, parse_status_text,
-    parse_tls_verbose, truncate_headers, HttpStatus, HttpTimings, ParsedHttp, TlsInfo,
+    HttpStatus, HttpTimings, ParsedHttp, TlsInfo, build_raw_output, dedup_headers,
+    parse_header_file, parse_status_text, parse_tls_verbose, truncate_headers,
 };
 
 // ── Options ───────────────────────────────────────────────────────────────────
@@ -528,10 +610,18 @@ pub struct HttpOptions {
     pub request: HttpRequestOptions,
 }
 
-fn default_method() -> String { "HEAD".into() }
-fn default_path() -> String { "/".into() }
-fn default_protocol() -> String { "HTTPS".into() }
-fn default_ip_version() -> u8 { 4 }
+fn default_method() -> String {
+    "HEAD".into()
+}
+fn default_path() -> String {
+    "/".into()
+}
+fn default_protocol() -> String {
+    "HTTPS".into()
+}
+const fn default_ip_version() -> u8 {
+    4
+}
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -558,19 +648,19 @@ fn validate(opts: &HttpOptions) -> Result<()> {
         if !is_safe_host(resolver) {
             bail!("Invalid resolver.");
         }
-        if let Ok(ip) = resolver.parse() {
-            if is_ip_private(ip) {
-                bail!("Private IP ranges are not allowed.");
-            }
+        if let Ok(ip) = resolver.parse()
+            && is_ip_private(ip)
+        {
+            bail!("Private IP ranges are not allowed.");
         }
     }
     // The Host-header / SNI override is NOT used for DNS resolution but IS used as
     // the TLS servername during cert enrichment. It must be a clean hostname so it
     // can never carry shell syntax or break the request.
-    if let Some(host) = &opts.request.host {
-        if !is_safe_host(host) {
-            bail!("Invalid host header.");
-        }
+    if let Some(host) = &opts.request.host
+        && !is_safe_host(host)
+    {
+        bail!("Invalid host header.");
     }
     // Path and query are concatenated into the curl URL — forbid control chars and
     // whitespace (request-smuggling / CRLF injection).
@@ -587,18 +677,18 @@ fn validate(opts: &HttpOptions) -> Result<()> {
         }
     }
     // Private IP check if target is already an IP
-    if let Ok(ip) = opts.target.parse() {
-        if is_ip_private(ip) {
-            bail!("Private IP ranges are not allowed");
-        }
+    if let Ok(ip) = opts.target.parse()
+        && is_ip_private(ip)
+    {
+        bail!("Private IP ranges are not allowed");
     }
     Ok(())
 }
 
 // ── DNS pre-resolution ────────────────────────────────────────────────────────
 
-/// If `target` is a hostname, resolve it using dig and return (ip, dns_ms).
-/// If it's already an IP address, return (target, 0) with dns_ms = None.
+/// If `target` is a hostname, resolve it using dig and return (ip, `dns_ms`).
+/// If it's already an IP address, return (target, 0) with `dns_ms` = None.
 async fn resolve_target(
     target: &str,
     resolver: Option<&str>,
@@ -631,16 +721,16 @@ async fn resolve_target(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let ip = stdout
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with(';') && l.parse::<std::net::IpAddr>().is_ok())
-        .map(|l| l.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| anyhow::anyhow!("DNS resolution returned no results for {target}"))?;
 
     // Check if resolved IP is private
-    if let Ok(parsed_ip) = ip.parse() {
-        if is_ip_private(parsed_ip) {
-            bail!("Private IP ranges are not allowed");
-        }
+    if let Ok(parsed_ip) = ip.parse()
+        && is_ip_private(parsed_ip)
+    {
+        bail!("Private IP ranges are not allowed");
     }
 
     Ok((ip, Some(dns_ms)))
@@ -663,7 +753,7 @@ fn build_url(opts: &HttpOptions, port: u16) -> String {
     } else {
         format!("?{}", opts.request.query.trim_start_matches('?'))
     };
-    format!("{}://{}:{}{}{}", scheme, host, port, path, query)
+    format!("{scheme}://{host}:{port}{path}{query}")
 }
 
 // ── curl arg builder ──────────────────────────────────────────────────────────
@@ -711,16 +801,25 @@ fn build_curl_args(
         "-k".into(),           // don't abort on TLS errors (but still report ssl_verify_result)
         "-v".into(),           // verbose → TLS info on stderr
         "--compressed".into(), // accept gzip/brotli
-        "--max-time".into(), "10".into(),
-        "-X".into(), method,
+        "--max-time".into(),
+        "10".into(),
+        "-X".into(),
+        method,
         format!("-{}", opts.ip_version),
-        "-D".into(), headers_path.into(), // dump response headers to file
-        "-o".into(), body_path.into(),    // write body to file
-        "--write-out".into(), CURL_WRITE_FMT.into(),
-        "-H".into(), format!("Host: {host_header}"),
-        "-H".into(), "User-Agent: globalping probe (https://github.com/jsdelivr/globalping)".into(),
-        "-H".into(), "Connection: close".into(),
-        "-H".into(), "Accept-Encoding: gzip, deflate, br".into(),
+        "-D".into(),
+        headers_path.into(), // dump response headers to file
+        "-o".into(),
+        body_path.into(), // write body to file
+        "--write-out".into(),
+        CURL_WRITE_FMT.into(),
+        "-H".into(),
+        format!("Host: {host_header}"),
+        "-H".into(),
+        "User-Agent: globalping probe (https://github.com/jsdelivr/globalping)".into(),
+        "-H".into(),
+        "Connection: close".into(),
+        "-H".into(),
+        "Accept-Encoding: gzip, deflate, br".into(),
     ];
 
     // Extra request headers
@@ -731,13 +830,17 @@ fn build_curl_args(
 
     // Protocol flag
     match proto.as_str() {
-        "HTTP2" => { args.push("--http2".into()); }
-        "HTTP" => { args.push("--http1.1".into()); }
+        "HTTP2" => {
+            args.push("--http2".into());
+        }
+        "HTTP" => {
+            args.push("--http1.1".into());
+        }
         _ => {} // HTTPS uses curl default (HTTP/1.1 or HTTP/2 via ALPN)
     }
 
     // Force connection to pre-resolved IP (bypasses curl's DNS)
-    if !opts.target.parse::<std::net::IpAddr>().is_ok() {
+    if opts.target.parse::<std::net::IpAddr>().is_err() {
         args.push("--resolve".into());
         let resolve_ip = if resolved_ip.contains(':') {
             // IPv6: curl needs brackets in --resolve
@@ -760,7 +863,12 @@ fn build_curl_args(
 ///
 /// Using an explicit argv is what makes the TLS enrichment injection-proof:
 /// there is no shell to interpret metacharacters in the servername/host.
-async fn run_capturing(cmd: &str, args: &[String], stdin_data: &[u8], dur: Duration) -> Option<Vec<u8>> {
+async fn run_capturing(
+    cmd: &str,
+    args: &[String],
+    stdin_data: &[u8],
+    dur: Duration,
+) -> Option<Vec<u8>> {
     use tokio::io::AsyncWriteExt;
     let mut child = Command::new(cmd)
         .args(args)
@@ -791,7 +899,9 @@ fn extract_pem(s: &str) -> Option<String> {
 /// large body within the window; this caps the memory we commit to it.
 async fn read_capped(path: &str, cap: usize) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
-    let Ok(file) = fs::File::open(path).await else { return Vec::new() };
+    let Ok(file) = fs::File::open(path).await else {
+        return Vec::new();
+    };
     let mut buf = Vec::new();
     let _ = file.take(cap as u64 + 1).read_to_end(&mut buf).await;
     buf
@@ -807,16 +917,13 @@ async fn read_capped(path: &str, cap: usize) -> Vec<u8> {
 /// (RCE) vector because the Host-header override flows in here unvalidated-for-DNS.
 async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
     let connect_addr = if ip.contains(':') {
-        format!("[{}]:{}", ip, port)
+        format!("[{ip}]:{port}")
     } else {
-        format!("{}:{}", ip, port)
+        format!("{ip}:{port}")
     };
 
     // Build s_client args as discrete argv entries (no shell, no interpolation).
-    let mut sc_args: Vec<String> = vec![
-        "s_client".into(),
-        "-connect".into(), connect_addr,
-    ];
+    let mut sc_args: Vec<String> = vec!["s_client".into(), "-connect".into(), connect_addr];
     // No SNI when the target is already an IP address.
     if servername.parse::<std::net::IpAddr>().is_ok() {
         sc_args.push("-noservername".into());
@@ -829,7 +936,9 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
     // stdout. Feed it a single newline (like `echo |`) so it finishes the
     // handshake and exits instead of waiting for application data.
     let Some(sc_stdout) = run_capturing("openssl", &sc_args, b"\n", Duration::from_secs(10)).await
-    else { return };
+    else {
+        return;
+    };
     let full_text = String::from_utf8_lossy(&sc_stdout);
 
     // Verify result, printed by s_client itself.
@@ -842,14 +951,27 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
 
     // Extract the PEM block in-process (no `sed`, no temp file) and pipe it to
     // `openssl x509` over stdin (no `-in <path>`).
-    let Some(pem) = extract_pem(&full_text) else { return };
+    let Some(pem) = extract_pem(&full_text) else {
+        return;
+    };
     let x509_args: Vec<String> = vec![
-        "x509".into(), "-noout".into(),
-        "-fingerprint".into(), "-sha256".into(),
-        "-serial".into(), "-text".into(),
+        "x509".into(),
+        "-noout".into(),
+        "-fingerprint".into(),
+        "-sha256".into(),
+        "-serial".into(),
+        "-text".into(),
     ];
-    let Some(x509_stdout) = run_capturing("openssl", &x509_args, pem.as_bytes(), Duration::from_secs(4)).await
-    else { return };
+    let Some(x509_stdout) = run_capturing(
+        "openssl",
+        &x509_args,
+        pem.as_bytes(),
+        Duration::from_secs(4),
+    )
+    .await
+    else {
+        return;
+    };
     let text = String::from_utf8_lossy(&x509_stdout);
 
     let mut next_is_san = false;
@@ -857,7 +979,8 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
         let t = line.trim();
 
         // OpenSSL 3.x outputs "sha256 Fingerprint=", 1.x outputs "SHA256 Fingerprint="
-        if let Some(fp) = t.strip_prefix("sha256 Fingerprint=")
+        if let Some(fp) = t
+            .strip_prefix("sha256 Fingerprint=")
             .or_else(|| t.strip_prefix("SHA256 Fingerprint="))
         {
             tls.fingerprint256 = Some(fp.trim().to_string());
@@ -865,7 +988,8 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
         // "serial=AABB..." → "AA:BB:..."
         else if let Some(hex) = t.strip_prefix("serial=") {
             let hex = hex.trim().to_uppercase();
-            let fmt: Vec<String> = hex.chars()
+            let fmt: Vec<String> = hex
+                .chars()
                 .collect::<Vec<_>>()
                 .chunks(2)
                 .map(|c| c.iter().collect())
@@ -884,17 +1008,16 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
         }
         // "Public-Key: (256 bit)"
         else if let Some(rest) = t.strip_prefix("Public-Key: (") {
-            if let Some(bits_str) = rest.strip_suffix(" bit)") {
-                if let Ok(bits) = bits_str.parse::<u32>() {
-                    tls.key_bits = Some(bits);
-                }
+            if let Some(bits_str) = rest.strip_suffix(" bit)")
+                && let Ok(bits) = bits_str.parse::<u32>()
+            {
+                tls.key_bits = Some(bits);
             }
         }
         // "X509v3 Subject Alternative Name:" → next non-empty line has the SANs
         else if t.starts_with("X509v3 Subject Alternative Name") {
             next_is_san = true;
-        }
-        else if next_is_san && !t.is_empty() {
+        } else if next_is_san && !t.is_empty() {
             tls.subject.alt = Some(t.to_string());
             next_is_san = false;
         }
@@ -913,7 +1036,8 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     let port = opts.port.unwrap_or(if proto == "HTTP" { 80 } else { 443 });
 
     // Pre-resolve target hostname; check for private IPs
-    let (resolved_ip, dns_ms) = resolve_target(&opts.target, opts.resolver.as_deref(), opts.ip_version).await?;
+    let (resolved_ip, dns_ms) =
+        resolve_target(&opts.target, opts.resolver.as_deref(), opts.ip_version).await?;
 
     let url = build_url(opts, port);
 
@@ -955,25 +1079,28 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     let _ = fs::remove_file(&body_path).await;
 
     // If curl stats are missing/malformed, it's a hard failure
-    let stats: CurlStats = match serde_json::from_str(&stats_str) {
-        Ok(s) => s,
-        Err(_) => {
-            // Extract error message from curl stderr
-            let err_msg = verbose
-                .lines()
-                .find(|l| l.contains("curl:") || l.contains("error") || l.starts_with("* "))
-                .map(|l| l.trim_start_matches("* ").trim().to_string())
-                .unwrap_or_else(|| "HTTP request failed".to_string());
-            return Ok(failed_result(err_msg));
-        }
+    let stats: CurlStats = if let Ok(s) = serde_json::from_str(&stats_str) {
+        s
+    } else {
+        // Extract error message from curl stderr
+        let err_msg = verbose
+            .lines()
+            .find(|l| l.contains("curl:") || l.contains("error") || l.starts_with("* "))
+            .map_or_else(
+                || "HTTP request failed".to_string(),
+                |l| l.trim_start_matches("* ").trim().to_string(),
+            );
+        return Ok(failed_result(err_msg));
     };
 
     if stats.response_code == 0 {
-        let err = verbose.lines()
-            .filter(|l| l.starts_with("* ") || l.contains("error"))
-            .last()
-            .map(|l| l.trim_start_matches("* ").trim().to_string())
-            .unwrap_or_else(|| "HTTP request failed".to_string());
+        let err = verbose
+            .lines()
+            .rfind(|l| l.starts_with("* ") || l.contains("error"))
+            .map_or_else(
+                || "HTTP request failed".to_string(),
+                |l| l.trim_start_matches("* ").trim().to_string(),
+            );
         return Ok(failed_result(err));
     }
 
@@ -985,10 +1112,10 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     };
 
     // Post-resolution private IP check
-    if let Ok(ip) = final_resolved_ip.parse() {
-        if is_ip_private(ip) {
-            return Ok(failed_result("Private IP ranges are not allowed.".into()));
-        }
+    if let Ok(ip) = final_resolved_ip.parse()
+        && is_ip_private(ip)
+    {
+        return Ok(failed_result("Private IP ranges are not allowed.".into()));
     }
 
     // Parse headers file
@@ -996,7 +1123,8 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     let status_text = parse_status_text(&raw_headers_file);
     let truncate_res = truncate_headers(header_pairs_raw);
     let headers_map = dedup_headers(&truncate_res.headers);
-    let raw_headers_str = truncate_res.headers
+    let raw_headers_str = truncate_res
+        .headers
         .iter()
         .map(|(k, v)| format!("{k}: {v}"))
         .collect::<Vec<_>>()
@@ -1029,8 +1157,7 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
 
     // Enrich TLS with fields curl -v doesn't expose (fingerprint256, serial, etc.)
     if let Some(ref mut t) = tls {
-        let sni = opts.request.host.as_deref()
-            .unwrap_or(&opts.target);
+        let sni = opts.request.host.as_deref().unwrap_or(&opts.target);
         enrich_tls(t, &final_resolved_ip, port, sni).await;
     }
 
@@ -1045,7 +1172,11 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
     } else {
         None
     };
-    let app_connect = if is_https { stats.time_appconnect } else { stats.time_connect };
+    let app_connect = if is_https {
+        stats.time_appconnect
+    } else {
+        stats.time_connect
+    };
     let t_first = ((stats.time_starttransfer - app_connect) * 1000.0).round() as u64;
     let t_download = ((stats.time_total - stats.time_starttransfer) * 1000.0).round() as u64;
     // Total = our DNS time + curl total
@@ -1060,7 +1191,11 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         download: Some(t_download),
     };
 
-    let raw_body_opt = if raw_body.is_empty() { None } else { Some(raw_body.clone()) };
+    let raw_body_opt = if raw_body.is_empty() {
+        None
+    } else {
+        Some(raw_body.clone())
+    };
     let raw_output = build_raw_output(
         http_version.as_deref(),
         Some(stats.response_code),
@@ -1076,7 +1211,11 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         resolved_address: Some(final_resolved_ip),
         http_version,
         headers: headers_map,
-        raw_headers: if raw_headers_str.is_empty() { None } else { Some(raw_headers_str) },
+        raw_headers: if raw_headers_str.is_empty() {
+            None
+        } else {
+            Some(raw_headers_str)
+        },
         raw_body: raw_body_opt,
         truncated,
         tls,
@@ -1216,7 +1355,9 @@ mod validate_tests {
     #[test]
     fn rejects_control_chars_in_headers() {
         let mut o = opts();
-        o.request.headers.insert("X-Foo".into(), "bar\r\nEvil: 1".into());
+        o.request
+            .headers
+            .insert("X-Foo".into(), "bar\r\nEvil: 1".into());
         assert!(validate(&o).is_err());
     }
 

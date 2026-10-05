@@ -1,4 +1,4 @@
-use globalping_probe::command::traceroute::parse::{parse, TracerouteStatus};
+use globalping_probe::command::traceroute::parse::{TracerouteStatus, parse};
 
 // ── Fixture-based parser tests ────────────────────────────────────────────────
 
@@ -20,8 +20,14 @@ fn full_success_parses_address_and_hops() {
 #[test]
 fn gateway_hostname_rewritten_in_raw_output() {
     let r = parse(SUCCESS_ICMP);
-    assert!(r.raw_output.contains("_gateway"), "expected _gateway in rawOutput");
-    assert!(!r.raw_output.contains("router.home"), "real gateway hostname must be hidden");
+    assert!(
+        r.raw_output.contains("_gateway"),
+        "expected _gateway in rawOutput"
+    );
+    assert!(
+        !r.raw_output.contains("router.home"),
+        "real gateway hostname must be hidden"
+    );
     assert_eq!(r.hops[0].resolved_hostname.as_deref(), Some("_gateway"));
     assert_eq!(r.hops[0].resolved_address.as_deref(), Some("192.168.1.1"));
 }
@@ -59,7 +65,10 @@ fn empty_input_fails() {
 
 #[test]
 fn no_header_fails() {
-    assert_eq!(parse("garbage\n 1  * * *\n").status, TracerouteStatus::Failed);
+    assert_eq!(
+        parse("garbage\n 1  * * *\n").status,
+        TracerouteStatus::Failed
+    );
 }
 
 #[test]
@@ -83,7 +92,10 @@ traceroute to 2606:4700:4700::1111 (2606:4700:4700::1111), 20 hops max, 80 byte 
     let r = parse(raw);
     assert_eq!(r.resolved_address.as_deref(), Some("2606:4700:4700::1111"));
     assert_eq!(r.hops.len(), 2);
-    assert_eq!(r.hops[1].resolved_address.as_deref(), Some("2606:4700:4700::1111"));
+    assert_eq!(
+        r.hops[1].resolved_address.as_deref(),
+        Some("2606:4700:4700::1111")
+    );
 }
 
 #[test]
@@ -102,7 +114,7 @@ traceroute to 8.8.8.8 (8.8.8.8), 20 hops max, 60 byte packets
 
 #[cfg(target_os = "linux")]
 mod live {
-    use globalping_probe::command::traceroute::{run_trace, parse::TracerouteStatus};
+    use globalping_probe::command::traceroute::{parse::TracerouteStatus, run_trace};
 
     #[tokio::test]
     async fn live_icmp_ipv4_cloudflare() {
@@ -111,19 +123,26 @@ mod live {
             .expect("traceroute command failed to spawn");
 
         // ICMP traceroute requires NET_RAW (root or cap). Skip gracefully when not privileged.
-        if r.status == TracerouteStatus::Failed
-            && r.raw_output.to_lowercase().contains("privilege")
+        if r.status == TracerouteStatus::Failed && r.raw_output.to_lowercase().contains("privilege")
         {
             println!("ICMP traceroute requires elevated privileges — skipping assertions");
             return;
         }
 
-        assert_eq!(r.status, TracerouteStatus::Finished, "raw:\n{}", r.raw_output);
+        assert_eq!(
+            r.status,
+            TracerouteStatus::Finished,
+            "raw:\n{}",
+            r.raw_output
+        );
         assert_eq!(r.resolved_address.as_deref(), Some("1.1.1.1"));
         assert!(!r.hops.is_empty(), "should have at least one hop");
 
         let total_timings: usize = r.hops.iter().map(|h| h.timings.len()).sum();
-        assert!(total_timings > 0, "should have at least one RTT measurement");
+        assert!(
+            total_timings > 0,
+            "should have at least one RTT measurement"
+        );
 
         println!(
             "ICMP trace 1.1.1.1: {} hops, {} RTT measurements",
@@ -131,10 +150,17 @@ mod live {
             total_timings
         );
         for (i, hop) in r.hops.iter().enumerate() {
-            let rtts: Vec<String> = hop.timings.iter().map(|t| format!("{:.1}ms", t.rtt)).collect();
+            let rtts: Vec<String> = hop
+                .timings
+                .iter()
+                .map(|t| format!("{:.1}ms", t.rtt))
+                .collect();
             println!(
                 "  hop {:2}: addr={:?} host={:?} rtts=[{}]",
-                i + 1, hop.resolved_address, hop.resolved_hostname, rtts.join(", ")
+                i + 1,
+                hop.resolved_address,
+                hop.resolved_hostname,
+                rtts.join(", ")
             );
         }
     }
@@ -145,7 +171,12 @@ mod live {
             .await
             .expect("traceroute failed");
 
-        assert_eq!(r.status, TracerouteStatus::Finished, "raw:\n{}", r.raw_output);
+        assert_eq!(
+            r.status,
+            TracerouteStatus::Finished,
+            "raw:\n{}",
+            r.raw_output
+        );
         assert!(!r.hops.is_empty());
         println!("UDP trace 8.8.8.8: {} hops", r.hops.len());
     }
@@ -167,7 +198,11 @@ mod live {
         // rawOutput must have _gateway for the first hop, not the real hostname.
         if r.hops.len() > 0 && r.hops[0].resolved_address.is_some() {
             assert!(
-                r.raw_output.lines().nth(1).unwrap_or("").contains("_gateway"),
+                r.raw_output
+                    .lines()
+                    .nth(1)
+                    .unwrap_or("")
+                    .contains("_gateway"),
                 "first hop line should contain _gateway, got: {}",
                 r.raw_output.lines().nth(1).unwrap_or("")
             );

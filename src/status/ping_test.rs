@@ -1,7 +1,7 @@
 // Periodic ICMP ping health check — mirrors src/status-manager/ping-test.ts
-use tracing::warn;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
+use tracing::warn;
 
 use crate::command::ping::parse::parse as parse_ping;
 
@@ -20,12 +20,13 @@ enum TrialOutcome {
 }
 
 impl PingTest {
-    pub fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self { failed: false }
     }
 
     /// Run ICMP ping trials against `target` for both IPv4 and IPv6.
-    /// Returns (ipv4_supported, ipv6_supported).
+    /// Returns (`ipv4_supported`, `ipv6_supported`).
     /// Sets `self.failed = true` when BOTH versions fail.
     pub async fn run_once(&mut self, target: &str) -> (bool, bool) {
         let (ipv4_ok, ipv6_ok) = tokio::join!(
@@ -40,8 +41,14 @@ impl PingTest {
     }
 }
 
+impl Default for PingTest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Run all TRIALS for one IP version; log per-trial failures and summary.
-/// Returns true if ≥ REQUIRED_PASSES have zero loss.
+/// Returns true if ≥ `REQUIRED_PASSES` have zero loss.
 async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
     let mut passes = 0usize;
     let mut failures: Vec<TrialOutcome> = Vec::new();
@@ -54,7 +61,11 @@ async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
     }
 
     let passed = passes >= REQUIRED_PASSES;
-    let pass_text = if passed { format!(". IPv{ip_version} tests pass") } else { String::new() };
+    let pass_text = if passed {
+        format!(". IPv{ip_version} tests pass")
+    } else {
+        String::new()
+    };
 
     for outcome in &failures {
         if let TrialOutcome::Fail { loss, raw } = outcome {
@@ -87,7 +98,16 @@ async fn ping_once(target: &str, ip_version: u8) -> TrialOutcome {
     let result = timeout(
         Duration::from_secs(PING_TIMEOUT_SECS),
         Command::new("ping")
-            .args([flag.as_str(), "-c", &PACKETS.to_string(), "-i", "1", "-w", "10", target])
+            .args([
+                flag.as_str(),
+                "-c",
+                &PACKETS.to_string(),
+                "-i",
+                "1",
+                "-w",
+                "10",
+                target,
+            ])
             .output(),
     )
     .await;
@@ -105,8 +125,14 @@ async fn ping_once(target: &str, ip_version: u8) -> TrialOutcome {
                 }
             }
         }
-        Ok(Err(e)) => TrialOutcome::Fail { loss: None, raw: e.to_string() },
-        Err(_)     => TrialOutcome::Fail { loss: None, raw: String::new() },
+        Ok(Err(e)) => TrialOutcome::Fail {
+            loss: None,
+            raw: e.to_string(),
+        },
+        Err(_) => TrialOutcome::Fail {
+            loss: None,
+            raw: String::new(),
+        },
     }
 }
 

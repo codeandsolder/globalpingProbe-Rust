@@ -1,10 +1,9 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TracerouteStatus {
     Finished,
@@ -37,14 +36,13 @@ pub struct ParsedTraceroute {
 // ── Regexes ───────────────────────────────────────────────────────────────────
 
 // Matches: hostname (IP)  — IPv4 or IPv6, with optional scope IDs
-static HOST_RE: Lazy<Regex> = Lazy::new(|| {
+static HOST_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"(\S+?)(?:%\w+)?(\s+)\(((?:\d+\.){3}\d+|[\da-fA-F:]+)(?:%\w+)?\)").unwrap()
 });
 
 // Matches: "8.123 ms" or "1 ms" (probe RTT)
-static RTT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(\d+(?:\.\d+)?)\s+ms").unwrap()
-});
+static RTT_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(\d+(?:\.\d+)?)\s+ms").unwrap());
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -71,7 +69,8 @@ pub fn parse(raw_output: &str) -> ParsedTraceroute {
     let resolved_address = header_caps.get(3).map(|m| m.as_str().to_string());
 
     // Rewrite first hop: hide real gateway hostname for privacy.
-    let mut output_lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let mut output_lines: Vec<String> =
+        lines.iter().map(std::string::ToString::to_string).collect();
     if output_lines.len() > 1 {
         output_lines[1] = HOST_RE
             .replace(&output_lines[1], |caps: &regex::Captures| {
@@ -152,8 +151,14 @@ traceroute to 1.1.1.1 (1.1.1.1), 20 hops max, 60 byte packets
     fn gateway_first_hop_preserved_as_gateway() {
         let r = parse(GATEWAY_HOSTNAME_OUTPUT);
         // The real hostname is replaced with _gateway in rawOutput.
-        assert!(r.raw_output.contains("_gateway"), "expected _gateway in rawOutput");
-        assert!(!r.raw_output.contains("router.home"), "real hostname should be hidden");
+        assert!(
+            r.raw_output.contains("_gateway"),
+            "expected _gateway in rawOutput"
+        );
+        assert!(
+            !r.raw_output.contains("router.home"),
+            "real hostname should be hidden"
+        );
         // The hop itself also has _gateway as hostname.
         assert_eq!(r.hops[0].resolved_hostname.as_deref(), Some("_gateway"));
         assert_eq!(r.hops[0].resolved_address.as_deref(), Some("192.168.1.1"));
@@ -191,7 +196,10 @@ traceroute to 1.1.1.1 (1.1.1.1), 20 hops max, 60 byte packets
 
     #[test]
     fn no_header_returns_failed() {
-        assert_eq!(parse("some garbage\n 1  * * *\n").status, TracerouteStatus::Failed);
+        assert_eq!(
+            parse("some garbage\n 1  * * *\n").status,
+            TracerouteStatus::Failed
+        );
     }
 
     #[test]
@@ -205,7 +213,10 @@ traceroute to 2606:4700:4700::1111 (2606:4700:4700::1111), 20 hops max, 80 byte 
         assert_eq!(r.status, TracerouteStatus::Finished);
         assert_eq!(r.resolved_address.as_deref(), Some("2606:4700:4700::1111"));
         assert_eq!(r.hops.len(), 2);
-        assert_eq!(r.hops[1].resolved_address.as_deref(), Some("2606:4700:4700::1111"));
+        assert_eq!(
+            r.hops[1].resolved_address.as_deref(),
+            Some("2606:4700:4700::1111")
+        );
     }
 
     #[test]

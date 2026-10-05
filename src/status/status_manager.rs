@@ -4,7 +4,7 @@ use super::ping_test::PingTest;
 
 const DEFAULT_ICMP_TCP_TARGETS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeStatus {
     Initializing,
     Ready,
@@ -39,10 +39,12 @@ pub struct StatusManager {
 }
 
 impl StatusManager {
+    #[must_use]
     pub fn new() -> Self {
         Self::with_api_host("api.globalping.io")
     }
 
+    #[must_use]
     pub fn with_api_host(host: &str) -> Self {
         Self {
             ping_test_failed: None,
@@ -56,9 +58,10 @@ impl StatusManager {
         }
     }
 
-    /// Derive the current probe status. Mirrors StatusManager.getStatus() in TypeScript.
+    /// Derive the current probe status. Mirrors `StatusManager.getStatus()` in TypeScript.
     /// Priority (highest → lowest): sigterm → initializing → ping-test-failed →
     /// icmp-tcp-test-failed → too-many-disconnects → ready.
+    #[must_use]
     pub fn get_status(&self) -> ProbeStatus {
         if self.sigterm {
             return ProbeStatus::Sigterm;
@@ -79,7 +82,7 @@ impl StatusManager {
     }
 
     /// Run the ping health check and record results.
-    /// Returns (ipv4_supported, ipv6_supported).
+    /// Returns (`ipv4_supported`, `ipv6_supported`).
     pub async fn run_ping_test(&mut self) -> (bool, bool) {
         let host = self.api_host.clone();
         let (ipv4, ipv6) = self.ping_test.run_once(&host).await;
@@ -112,20 +115,28 @@ impl StatusManager {
     }
 
     /// Re-evaluate disconnect status after TTL may have expired entries.
-    /// Mirrors Node.js TTLCache dispose callback resetting the flag to false.
+    /// Mirrors Node.js `TTLCache` dispose callback resetting the flag to false.
     pub fn recheck_disconnect_status(&mut self) {
         let too_many = self.disconnect_tracker.count() >= 3;
         self.too_many_disconnects = too_many;
     }
 
-    pub fn set_sigterm(&mut self) {
+    pub const fn set_sigterm(&mut self) {
         self.sigterm = true;
     }
 
+    #[must_use]
     pub fn ipv4_supported(&self) -> Option<bool> {
         // If ping test hasn't run, unknown
-        self.ping_test_failed.map(|f| !f || self.ping_test.failed)
+        self.ping_test_failed
+            .map(|f| !f || self.ping_test.failed)
             .or(None)
+    }
+}
+
+impl Default for StatusManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -135,7 +146,9 @@ impl StatusManager {
 mod tests {
     use super::*;
 
-    fn mgr() -> StatusManager { StatusManager::new() }
+    fn mgr() -> StatusManager {
+        StatusManager::new()
+    }
 
     #[test]
     fn initial_status_is_initializing() {
@@ -243,8 +256,14 @@ mod tests {
         assert_eq!(ProbeStatus::Ready.to_string(), "ready");
         assert_eq!(ProbeStatus::Initializing.to_string(), "initializing");
         assert_eq!(ProbeStatus::PingTestFailed.to_string(), "ping-test-failed");
-        assert_eq!(ProbeStatus::IcmpTcpTestFailed.to_string(), "icmp-tcp-test-failed");
-        assert_eq!(ProbeStatus::TooManyDisconnects.to_string(), "too-many-disconnects");
+        assert_eq!(
+            ProbeStatus::IcmpTcpTestFailed.to_string(),
+            "icmp-tcp-test-failed"
+        );
+        assert_eq!(
+            ProbeStatus::TooManyDisconnects.to_string(),
+            "too-many-disconnects"
+        );
         assert_eq!(ProbeStatus::Sigterm.to_string(), "sigterm");
     }
 }

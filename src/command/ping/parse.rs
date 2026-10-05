@@ -1,10 +1,9 @@
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 // ── Output types ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PingStatus {
     Finished,
@@ -42,40 +41,36 @@ pub struct ParsedPing {
 // ── Regex patterns (compiled once) ──────────────────────────────────────────
 
 // Matches: PING <host> (<addr>)   or   PING <host>(<ipv6-host> (<addr>))
-static HEADER_RE: Lazy<Regex> = Lazy::new(|| {
+static HEADER_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"^PING\s([^()\s]*?)\s?\((?:[^()\s]+\s?\()?([^()\s]+?)\)").unwrap()
 });
 
 // Matches:  64 bytes from <host> [(<ip>)]: [icmp_]seq=N ttl=T time=X ms
-static PACKET_RE: Lazy<Regex> = Lazy::new(|| {
+static PACKET_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
     Regex::new(r"^\d+ bytes from (.*?)(?:\s\([^)]*\))?: (?:icmp_)?seq=\d+ ttl=(\d+) time=(\d*(?:\.\d+)?) ms").unwrap()
 });
 
 // Captures the hostname from the first reply line: "from <host> (" or "from <host>: "
-static HOSTNAME_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"from\s(.*?)(?:\s\(|:\s)").unwrap()
-});
+static HOSTNAME_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"from\s(.*?)(?:\s\(|:\s)").unwrap());
 
-static STATS_HEADER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^---\s.*\sstatistics ---").unwrap()
-});
+static STATS_HEADER_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^---\s.*\sstatistics ---").unwrap());
 
 // rtt min/avg/max/mdev = X/Y/Z/W ms   or   round-trip min/avg/max = X/Y/Z ms
-static RTT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^(?:round-trip|rtt)\s.*\s=\s(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)").unwrap()
+static RTT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"^(?:round-trip|rtt)\s.*\s=\s(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)")
+        .unwrap()
 });
 
-static TRANSMITTED_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b(\d+)\spackets\stransmitted").unwrap()
-});
+static TRANSMITTED_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\b(\d+)\spackets\stransmitted").unwrap());
 
-static RCV_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b(\d+)\s(?:received|packets received)").unwrap()
-});
+static RCV_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\b(\d+)\s(?:received|packets received)").unwrap());
 
-static LOSS_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\b(\d*(?:\.\d+)?)%\spacket\sloss").unwrap()
-});
+static LOSS_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\b(\d*(?:\.\d+)?)%\spacket\sloss").unwrap());
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -165,13 +160,13 @@ fn parse_summary(lines: &[&str]) -> PingStats {
         };
     }
 
-    if let Some(&rtt_line) = lines.get(1) {
-        if let Some(caps) = RTT_RE.captures(rtt_line) {
-            stats.min = caps.get(1).and_then(|m| m.as_str().parse().ok());
-            // Order in the string: min/avg/max/mdev — we capture min(1), avg(2), max(3)
-            stats.avg = caps.get(2).and_then(|m| m.as_str().parse().ok());
-            stats.max = caps.get(3).and_then(|m| m.as_str().parse().ok());
-        }
+    if let Some(&rtt_line) = lines.get(1)
+        && let Some(caps) = RTT_RE.captures(rtt_line)
+    {
+        stats.min = caps.get(1).and_then(|m| m.as_str().parse().ok());
+        // Order in the string: min/avg/max/mdev — we capture min(1), avg(2), max(3)
+        stats.avg = caps.get(2).and_then(|m| m.as_str().parse().ok());
+        stats.max = caps.get(3).and_then(|m| m.as_str().parse().ok());
     }
 
     stats
@@ -236,7 +231,10 @@ From eth2-1109-fsn-lf-e03.productsup.int (10.254.254.17) icmp_seq=1 Destination 
         let r = parse(SUCCESS);
         assert_eq!(r.status, PingStatus::Finished);
         assert_eq!(r.resolved_address.as_deref(), Some("172.217.20.206"));
-        assert_eq!(r.resolved_hostname.as_deref(), Some("lhr25s33-in-f14.1e100.net"));
+        assert_eq!(
+            r.resolved_hostname.as_deref(),
+            Some("lhr25s33-in-f14.1e100.net")
+        );
         assert_eq!(r.timings.len(), 3);
         assert_eq!(r.timings[0], PingTiming { rtt: 7.99, ttl: 37 });
         assert_eq!(r.timings[1], PingTiming { rtt: 8.12, ttl: 37 });
@@ -265,8 +263,14 @@ From eth2-1109-fsn-lf-e03.productsup.int (10.254.254.17) icmp_seq=1 Destination 
     fn parses_ipv6_header() {
         let r = parse(IPV6);
         assert_eq!(r.status, PingStatus::Finished);
-        assert_eq!(r.resolved_address.as_deref(), Some("2a00:1450:4026:808::200e"));
-        assert_eq!(r.resolved_hostname.as_deref(), Some("hem08s10-in-x0e.1e100.net"));
+        assert_eq!(
+            r.resolved_address.as_deref(),
+            Some("2a00:1450:4026:808::200e")
+        );
+        assert_eq!(
+            r.resolved_hostname.as_deref(),
+            Some("hem08s10-in-x0e.1e100.net")
+        );
         assert_eq!(r.timings.len(), 3);
         assert_eq!(r.timings[0].rtt, 1.47);
         assert_eq!(r.stats.min, Some(1.072));
