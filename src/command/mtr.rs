@@ -568,6 +568,14 @@ struct NativeMtrOutput {
     timed_out: bool,
 }
 
+pub fn format_progress(mut value: Value) -> Value {
+    if let Some(raw) = value.get("rawOutput").and_then(Value::as_str) {
+        let hops = parse_raw(raw, false);
+        value["rawOutput"] = Value::String(build_output(&hops));
+    }
+    value
+}
+
 async fn run_native_mtr(
     args: &[String],
     process_timeout: Duration,
@@ -601,8 +609,7 @@ async fn run_native_mtr(
             raw_stdout.push_str(&line);
             raw_stdout.push('\n');
             if let Some(tx) = progress {
-                let hops = parse_raw(&raw_stdout, false);
-                tx.send(json!({ "rawOutput": build_output(&hops) })).ok();
+                tx.send(json!({ "rawOutput": raw_stdout.clone() })).ok();
             }
         }
         child.wait().await.map(|_| ())

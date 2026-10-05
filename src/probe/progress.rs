@@ -9,6 +9,8 @@ use rust_socketio::asynchronous::Client;
 
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
+pub type ProgressTransform = fn(Value) -> Value;
+
 /// Receives partial string fields from a command and forwards coalesced
 /// `probe:measurement:progress` events using the same modes as upstream.
 pub struct ProgressEmitter {
@@ -16,6 +18,7 @@ pub struct ProgressEmitter {
     test_id: String,
     measurement_id: String,
     buffer: ProgressBuffer,
+    transform: Option<ProgressTransform>,
 }
 
 impl ProgressEmitter {
@@ -24,12 +27,14 @@ impl ProgressEmitter {
         test_id: impl Into<String>,
         measurement_id: impl Into<String>,
         mode: BufferMode,
+        transform: Option<ProgressTransform>,
     ) -> Self {
         Self {
             client,
             test_id: test_id.into(),
             measurement_id: measurement_id.into(),
             buffer: ProgressBuffer::new(mode),
+            transform,
         }
     }
 
@@ -58,6 +63,9 @@ impl ProgressEmitter {
                 .map(|(key, value)| (key, Value::String(value)))
                 .collect::<Map<_, _>>(),
         );
+        if let Some(transform) = self.transform {
+            partial = transform(partial);
+        }
         limit_raw_output(&mut partial);
         if let Err(error) = self
             .client
