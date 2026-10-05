@@ -12,7 +12,7 @@ use wasmtime::{Config, Engine, StoreLimits, StoreLimitsBuilder};
 use super::update::VerifiedBehavior;
 
 pub const MAX_GUEST_MEMORY_BYTES: usize = 32 * 1024 * 1024;
-pub const MAX_GUEST_TABLE_ELEMENTS: u32 = 10_000;
+pub const MAX_GUEST_TABLE_ELEMENTS: usize = 10_000;
 pub const MAX_GUEST_INSTANCES: usize = 16;
 pub const MAX_GUEST_TABLES: usize = 16;
 pub const JOB_FUEL: u64 = 50_000_000;
@@ -48,7 +48,6 @@ impl BehaviorRuntime {
         let mut config = Config::new();
         config
             .wasm_component_model(true)
-            .async_support(true)
             .consume_fuel(true)
             .epoch_interruption(true);
         let engine = Engine::new(&config).map_err(RuntimeError::Engine)?;
@@ -99,5 +98,6 @@ pub struct CompiledBehavior {
 wasmtime::component::bindgen!({
     path: "wit",
     world: "probe-behavior",
-    async: true,
+    imports: { default: async },
+    exports: { default: async },
 });

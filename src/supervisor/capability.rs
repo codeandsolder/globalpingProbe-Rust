@@ -429,8 +429,8 @@ mod tests {
     #[test]
     fn expired_capability_cannot_be_reused() {
         let now = Instant::now();
-        let mut lease = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, ping_scope(1), now);
-        let late = now + Duration::from_secs(4);
+        let mut lease = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, ping_scope(5), now);
+        let late = now + Duration::from_secs(8);
         assert_eq!(lease.authorize_start(late), Err(PolicyError::Expired));
     }
 }
