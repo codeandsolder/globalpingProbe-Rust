@@ -7,4 +7,6 @@ pub mod parsers;
 pub mod probe;
 #[cfg(feature = "native")]
 pub mod status;
+#[cfg(feature = "native")]
+pub mod supervisor;
 pub mod util;

@@ -1,0 +1,75 @@
+package codeandsolder:globalping-behavior@0.1.0;
+
+interface host {
+    record capability-token {
+        hi: u64,
+        lo: u64,
+    }
+
+    enum measurement-kind {
+        ping,
+        dns,
+        traceroute,
+        mtr,
+        http,
+    }
+
+    enum host-error-code {
+        invalid-token,
+        expired-token,
+        wrong-measurement-kind,
+        quota-exceeded,
+        invalid-request,
+        policy-denied,
+        timeout,
+        native-failure,
+    }
+
+    record host-error {
+        code: host-error-code,
+        message: string,
+    }
+
+    record execution-start {
+        kind: measurement-kind,
+        raw-byte-limit: u32,
+        deadline-ms: u32,
+    }
+
+    variant execution-event {
+        stdout(list<u8>),
+        stderr(list<u8>),
+        observed-address(string),
+        exited(s32),
+        timed-out,
+    }
+
+    start: func(token: capability-token) -> result<execution-start, host-error>;
+    poll: func(token: capability-token) -> result<option<execution-event>, host-error>;
+    reverse-lookup: func(token: capability-token, address: string) -> result<option<string>, host-error>;
+    lookup-asn: func(token: capability-token, address: string) -> result<list<u32>, host-error>;
+    emit-progress: func(token: capability-token, result-json: string, overwrite: bool) -> result<_, host-error>;
+}
+
+interface guest {
+    use host.{capability-token, measurement-kind};
+
+    record job {
+        token: capability-token,
+        kind: measurement-kind,
+        measurement-json: string,
+    }
+
+    variant behavior-error {
+        invalid-job(string),
+        internal(string),
+    }
+
+    handle: func(job: job) -> result<string, behavior-error>;
+    self-test: func() -> result<_, string>;
+}
+
+world probe-behavior {
+    import host;
+    export guest;
+}
