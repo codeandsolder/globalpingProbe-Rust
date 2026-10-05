@@ -220,7 +220,7 @@ pub mod parse {
             .map(|(k, v)| {
                 if v.len() > cap {
                     let truncated_v =
-                        format!("{}{}", &v[..cap - TRUNCATION_MARK.len()], TRUNCATION_MARK);
+                        format!("{}{TRUNCATION_MARK}", &v[..cap - TRUNCATION_MARK.len()]);
                     (k, truncated_v)
                 } else {
                     (k, v)
@@ -847,7 +847,7 @@ fn build_curl_args(
         } else {
             resolved_ip.to_string()
         };
-        args.push(format!("{}:{}:{}", opts.target, port, connection_ip));
+        args.push(format!("{}:{port}:{connection_ip}", opts.target));
     }
 
     args.push(url.to_string());

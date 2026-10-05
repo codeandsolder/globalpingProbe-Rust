@@ -73,8 +73,8 @@ pub fn connection_url(cfg: &ClientConfig) -> String {
     let mem = total_memory_bytes();
     let (total_disk, avail_disk) = disk_info_mb();
     let mut url = format!(
-        "{}?version={}&nodeVersion={}&totalMemory={}&totalDiskSize={}&availableDiskSpace={}&uuid={}",
-        cfg.api_host, VERSION, NODE_VERSION, mem, total_disk, avail_disk, cfg.uuid,
+        "{}?version={VERSION}&nodeVersion={NODE_VERSION}&totalMemory={mem}&totalDiskSize={total_disk}&availableDiskSpace={avail_disk}&uuid={}",
+        cfg.api_host, cfg.uuid,
     );
     if let Some(token) = &cfg.adoption_token {
         url.push_str("&adoptionToken=");

@@ -20,7 +20,7 @@ pub fn truncate_output(s: &str, max_bytes: usize) -> String {
     while cut > 0 && !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}{}", &s[..cut], TRUNCATION_MARKER)
+    format!("{}{TRUNCATION_MARKER}", &s[..cut])
 }
 
 /// Apply `truncate_output(MAX_RAW_OUTPUT_BYTES)` to the `rawOutput` field of

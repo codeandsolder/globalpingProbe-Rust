@@ -104,10 +104,9 @@ pub fn parse(raw_output: &str) -> ParsedPing {
     // Hostname comes from the first reply line, not the header
     let resolved_hostname = lines
         .get(1)
-        .and_then(|l| HOSTNAME_RE.as_ref().and_then(|re| re.captures(l)))
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_default();
+        .and_then(|line| HOSTNAME_RE.as_ref().and_then(|re| re.captures(line)))
+        .and_then(|captures| captures.get(1))
+        .map_or_else(String::new, |matched| matched.as_str().to_string());
 
     let timings: Vec<PingTiming> = lines
         .iter()
@@ -118,9 +117,7 @@ pub fn parse(raw_output: &str) -> ParsedPing {
     let stats_idx = lines
         .iter()
         .position(|l| STATS_HEADER_RE.as_ref().is_some_and(|re| re.is_match(l)));
-    let stats = stats_idx
-        .map(|i| parse_summary(&lines[i + 1..]))
-        .unwrap_or_default();
+    let stats = stats_idx.map_or_else(PingStats::default, |i| parse_summary(&lines[i + 1..]));
 
     ParsedPing {
         status: PingStatus::Finished,

@@ -30,8 +30,10 @@ fn run_df() -> String {
     std::process::Command::new("df")
         .args(["-BM", "--output=size,avail", "/"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        .map_or_else(
+            |_| String::new(),
+            |output| String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
 }
 
 /// Parse `df -BM --output=size,avail /` output.
