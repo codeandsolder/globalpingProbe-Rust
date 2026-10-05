@@ -132,7 +132,7 @@ fn three_disconnects_trigger_status() {
 }
 
 #[test]
-fn on_proxy_true_with_medium_diff_triggers_icmp_tcp_failed() {
+fn on_proxy_true_with_medium_diff_requires_confirmation() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(false);
     m.icmp_tcp_test_failed = Some(false);
@@ -140,8 +140,10 @@ fn on_proxy_true_with_medium_diff_triggers_icmp_tcp_failed() {
     m.icmp_tcp_test.diffs_v6 = vec![];
     assert_eq!(m.get_status(), ProbeStatus::Ready);
 
-    m.on_proxy_status(true);
-    assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+    assert!(m.on_proxy_status(true));
+    // Upstream keeps the prior status until a confirmation round completes.
+    assert_eq!(m.icmp_tcp_test_failed, Some(false));
+    assert_eq!(m.get_status(), ProbeStatus::Ready);
 }
 
 #[test]
@@ -153,7 +155,7 @@ fn on_proxy_false_clears_vpn_when_only_medium_diff() {
     m.icmp_tcp_test.diffs_v4 = vec![Some(65.0)];
     m.icmp_tcp_test.diffs_v6 = vec![];
 
-    m.on_proxy_status(false);
+    assert!(!m.on_proxy_status(false));
     // With is_proxy=false, one diff>=60 is not enough → cleared
     assert_eq!(m.icmp_tcp_test_failed, Some(false));
     assert_eq!(m.get_status(), ProbeStatus::Ready);
@@ -260,20 +262,17 @@ mod live {
             "still Initializing until ICMP/TCP test also completes"
         );
 
-        let vpn = m.run_icmp_tcp_test().await;
+        // The official probe waits for isProxy before finalizing this test.
+        assert_eq!(m.run_icmp_tcp_test().await, None);
+        assert_eq!(m.get_status(), ProbeStatus::Initializing);
+
+        // Simulate the API isProxy value, then run the confirmed measurement.
+        assert!(!m.on_proxy_status(false));
+        let vpn = m.run_icmp_tcp_test().await.expect("isProxy is now known");
         println!(
             "ICMP/TCP test: vpn_detected={vpn} status={}",
             m.get_status()
         );
-
-        // Now both tests are done — status must have left Initializing
-        assert_ne!(
-            m.get_status(),
-            ProbeStatus::Initializing,
-            "status should leave Initializing after both tests complete"
-        );
-
-        // If VPN not detected and ping passed, we should be Ready
         if !vpn {
             assert_eq!(m.get_status(), ProbeStatus::Ready);
         }

@@ -5,10 +5,10 @@ use tracing::warn;
 
 use crate::command::ping::parse::parse as parse_ping;
 
-const PACKETS: u8 = 3;
+const PACKETS: u8 = 6;
 const TRIALS: usize = 3;
 const REQUIRED_PASSES: usize = 2;
-const PING_TIMEOUT_SECS: u64 = 15;
+const PING_TIMEOUT_SECS: u64 = 12;
 
 pub struct PingTest {
     pub failed: bool,
@@ -100,12 +100,14 @@ async fn ping_once(target: &str, ip_version: u8) -> TrialOutcome {
         Command::new("ping")
             .args([
                 flag.as_str(),
+                "-O",
+                "-n",
                 "-c",
                 &PACKETS.to_string(),
                 "-i",
-                "1",
-                "-w",
-                "10",
+                "0.5",
+                "-W",
+                "5",
                 target,
             ])
             .output(),

@@ -26,7 +26,9 @@ use crate::probe::{
     sysinfo::{disk_info_mb, total_memory_bytes},
 };
 use crate::status::{
-    icmp_tcp_test::IcmpTcpTest, ping_test::PingTest, status_manager::StatusManager,
+    icmp_tcp_test::{DEFAULT_TARGETS as ICMP_TCP_TARGETS, IcmpTcpTest},
+    ping_test::PingTest,
+    status_manager::StatusManager,
 };
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -360,50 +362,95 @@ pub async fn run_stats_loop(jobs: ActiveJobs, client: Client) {
 
 // ── Status loop ───────────────────────────────────────────────────────────────
 
-/// Background task: periodic ping + ICMP/TCP health checks every 10 minutes.
-/// Also refreshes the DNS server list each cycle.
+// Status checks run independently below: connectivity ping every 10 minutes,
+// ICMP/TCP VPN detection every hour, matching the official probe.
+async fn run_ping_status_cycle(
+    status: &Arc<Mutex<StatusManager>>,
+    client: &Client,
+    ping_target: &str,
+) {
+    let (ipv4, ipv6) = PingTest::new().run_once(ping_target).await;
+    let current_status = {
+        let mut mgr = status.lock().await;
+        mgr.ping_test_failed = Some(!ipv4 && !ipv6);
+        mgr.get_status().to_string()
+    };
+    client
+        .emit("probe:isIPv4Supported:update", json!(ipv4))
+        .await
+        .ok();
+    client
+        .emit("probe:isIPv6Supported:update", json!(ipv6))
+        .await
+        .ok();
+    client
+        .emit("probe:status:update", json!(current_status))
+        .await
+        .ok();
+    client
+        .emit("probe:dns:update", json!(get_dns_servers()))
+        .await
+        .ok();
+}
+
+async fn run_icmp_tcp_status_cycle(status: &Arc<Mutex<StatusManager>>, client: &Client) {
+    let initial_proxy = status.lock().await.icmp_tcp_test.is_proxy();
+    let mut test = IcmpTcpTest::new();
+    if let Some(is_proxy) = initial_proxy {
+        test.set_is_proxy(is_proxy);
+    }
+
+    let mut failed = if initial_proxy.is_some() {
+        Some(test.run_once(ICMP_TCP_TARGETS).await)
+    } else {
+        test.measure_once(ICMP_TCP_TARGETS).await;
+        None
+    };
+
+    let latest_proxy = status.lock().await.icmp_tcp_test.is_proxy();
+    if latest_proxy != initial_proxy
+        && let Some(is_proxy) = latest_proxy
+    {
+        test.set_is_proxy(is_proxy);
+        if test.is_vpn_detected() {
+            test.measure_once(ICMP_TCP_TARGETS).await;
+        }
+        failed = Some(test.is_vpn_detected());
+    }
+
+    let current_status = {
+        let mut mgr = status.lock().await;
+        mgr.icmp_tcp_test = test;
+        mgr.icmp_tcp_test_failed = failed;
+        mgr.recheck_disconnect_status();
+        mgr.get_status().to_string()
+    };
+    client
+        .emit("probe:status:update", json!(current_status))
+        .await
+        .ok();
+}
+
+/// Run the upstream status checks on their independent schedules: connectivity
+/// ping every 10 minutes and ICMP/TCP VPN detection every hour.
 pub async fn run_status_loop(
     status: Arc<Mutex<StatusManager>>,
     client: Client,
     ping_target: String,
 ) {
-    const INTERVAL: Duration = Duration::from_mins(10);
-    const ICMP_TARGETS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
-
-    loop {
-        let (ipv4, ipv6) = PingTest::new().run_once(&ping_target).await;
-        {
-            let mut mgr = status.lock().await;
-            mgr.ping_test_failed = Some(!ipv4 && !ipv6);
+    let ping_loop = async {
+        loop {
+            run_ping_status_cycle(&status, &client, &ping_target).await;
+            tokio::time::sleep(Duration::from_mins(10)).await;
         }
-        client
-            .emit("probe:isIPv4Supported:update", json!(ipv4))
-            .await
-            .ok();
-        client
-            .emit("probe:isIPv6Supported:update", json!(ipv6))
-            .await
-            .ok();
-
-        let vpn = IcmpTcpTest::new().run_once(ICMP_TARGETS).await;
-        {
-            let mut mgr = status.lock().await;
-            mgr.icmp_tcp_test_failed = Some(vpn);
-            // Re-evaluate disconnect status: TTL-expired entries may have cleared.
-            mgr.recheck_disconnect_status();
-            let st = mgr.get_status().to_string();
-            drop(mgr);
-            client.emit("probe:status:update", json!(st)).await.ok();
+    };
+    let icmp_tcp_loop = async {
+        loop {
+            run_icmp_tcp_status_cycle(&status, &client).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
         }
-
-        // Refresh DNS servers in case resolvers changed since last connect.
-        client
-            .emit("probe:dns:update", json!(get_dns_servers()))
-            .await
-            .ok();
-
-        tokio::time::sleep(INTERVAL).await;
-    }
+    };
+    tokio::join!(ping_loop, icmp_tcp_loop);
 }
 
 // ── Single connection attempt ─────────────────────────────────────────────────
@@ -553,11 +600,25 @@ async fn handle_proxy(state: ConnectionHandlers, payload: Payload, client: Clien
         .get("isProxy")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let status = {
+
+    let needs_confirmation = {
         let mut manager = state.status_manager.lock().await;
-        manager.on_proxy_status(is_proxy);
-        manager.get_status().to_string()
+        manager.on_proxy_status(is_proxy)
     };
+
+    if needs_confirmation {
+        let mut confirmation = IcmpTcpTest::new();
+        confirmation.set_is_proxy(is_proxy);
+        confirmation.measure_once(ICMP_TCP_TARGETS).await;
+
+        let mut manager = state.status_manager.lock().await;
+        let latest_proxy = manager.icmp_tcp_test.is_proxy().unwrap_or(is_proxy);
+        confirmation.set_is_proxy(latest_proxy);
+        manager.icmp_tcp_test_failed = Some(confirmation.is_vpn_detected());
+        manager.icmp_tcp_test = confirmation;
+    }
+
+    let status = state.status_manager.lock().await.get_status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
 }
 
