@@ -130,6 +130,7 @@ mod live {
             "type": "ping",
             "target": "1.1.1.1",
             "packets": 3,
+            "timeout": 10,
             "ipVersion": 4,
             "inProgressUpdates": true,
         });
@@ -206,6 +207,7 @@ mod live {
             "type": "ping",
             "target": "1.1.1.1",
             "packets": 2,
+            "timeout": 10,
             "ipVersion": 4,
             "inProgressUpdates": false,
         });

@@ -36,7 +36,7 @@ const NODE_VERSION: &str = "v22.22.3";
 
 /// Hard time limit for any single measurement. Prevents a hung process from
 /// holding a limiter slot indefinitely.
-pub const MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const MIN_MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often stats are flushed to the API.
 pub const STATS_INTERVAL: Duration = Duration::from_secs(10);
@@ -235,12 +235,22 @@ pub async fn dispatch(
         }
     };
 
-    let run_result: Result<Value> = tokio::time::timeout(MEASUREMENT_TIMEOUT, measurement_fut)
+    let requested_timeout = req
+        .measurement
+        .get("timeout")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(MIN_MEASUREMENT_TIMEOUT.as_secs());
+    let measurement_timeout = Duration::from_secs(
+        requested_timeout
+            .saturating_add(2)
+            .max(MIN_MEASUREMENT_TIMEOUT.as_secs()),
+    );
+    let run_result: Result<Value> = tokio::time::timeout(measurement_timeout, measurement_fut)
         .await
         .unwrap_or_else(|_| {
             warn!(
                 "Measurement {mid} timed out after {}s.",
-                MEASUREMENT_TIMEOUT.as_secs()
+                measurement_timeout.as_secs()
             );
             Ok(json!({
                 "status": "failed",

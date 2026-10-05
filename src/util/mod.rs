@@ -1,8 +1,10 @@
 pub mod by_line;
 pub mod logger;
 pub mod logs_transport;
+pub mod measurement_timeout;
 pub mod output_limit;
 pub mod private_ip;
 pub mod progress_buffer;
+pub mod resolve_target;
 pub mod tcp_ping;
 pub mod validate;

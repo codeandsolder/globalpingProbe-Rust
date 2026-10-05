@@ -14,7 +14,8 @@ pub enum PingStatus {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct PingTiming {
     pub rtt: f64,
-    pub ttl: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -32,6 +33,8 @@ pub struct PingStats {
 #[serde(rename_all = "camelCase")]
 pub struct ParsedPing {
     pub status: PingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_source: Option<String>,
     pub raw_output: String,
     pub resolved_address: Option<String>,
     pub resolved_hostname: Option<String>,
@@ -84,6 +87,7 @@ pub fn parse(raw_output: &str) -> ParsedPing {
 
     let failed = |raw: &str| ParsedPing {
         status: PingStatus::Failed,
+        failure_source: None,
         raw_output: raw.to_string(),
         resolved_address: None,
         resolved_hostname: None,
@@ -121,6 +125,7 @@ pub fn parse(raw_output: &str) -> ParsedPing {
 
     ParsedPing {
         status: PingStatus::Finished,
+        failure_source: None,
         raw_output: raw_output.trim_end_matches('\n').to_string(),
         resolved_address,
         resolved_hostname: Some(resolved_hostname),
@@ -135,7 +140,10 @@ fn parse_packet_line(line: &str) -> Option<PingTiming> {
     let caps = PACKET_RE.as_ref()?.captures(line)?;
     let ttl = caps.get(2)?.as_str().parse::<u32>().ok()?;
     let rtt = caps.get(3)?.as_str().parse::<f64>().ok()?;
-    Some(PingTiming { rtt, ttl })
+    Some(PingTiming {
+        rtt,
+        ttl: Some(ttl),
+    })
 }
 
 fn parse_summary(lines: &[&str]) -> PingStats {
@@ -242,9 +250,27 @@ From eth2-1109-fsn-lf-e03.productsup.int (10.254.254.17) icmp_seq=1 Destination 
             Some("lhr25s33-in-f14.1e100.net")
         );
         assert_eq!(r.timings.len(), 3);
-        assert_eq!(r.timings[0], PingTiming { rtt: 7.99, ttl: 37 });
-        assert_eq!(r.timings[1], PingTiming { rtt: 8.12, ttl: 37 });
-        assert_eq!(r.timings[2], PingTiming { rtt: 7.95, ttl: 37 });
+        assert_eq!(
+            r.timings[0],
+            PingTiming {
+                rtt: 7.99,
+                ttl: Some(37)
+            }
+        );
+        assert_eq!(
+            r.timings[1],
+            PingTiming {
+                rtt: 8.12,
+                ttl: Some(37)
+            }
+        );
+        assert_eq!(
+            r.timings[2],
+            PingTiming {
+                rtt: 7.95,
+                ttl: Some(37)
+            }
+        );
         assert_eq!(r.stats.min, Some(7.948));
         assert_eq!(r.stats.avg, Some(8.018));
         assert_eq!(r.stats.max, Some(8.120));

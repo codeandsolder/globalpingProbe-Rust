@@ -110,6 +110,7 @@ mod live {
         let opts = serde_json::json!({
             "target": target,
             "packets": 3,
+            "timeout": 10,
             "ipVersion": ip_version,
             "protocol": "ICMP",
             "inProgressUpdates": false,
@@ -134,7 +135,10 @@ mod live {
             "should have at least one timing"
         );
         assert!(parsed.timings[0].rtt > 0.0, "RTT should be positive");
-        assert!(parsed.timings[0].ttl > 0, "TTL should be positive");
+        assert!(
+            parsed.timings[0].ttl.is_some_and(|ttl| ttl > 0),
+            "TTL should be positive"
+        );
         assert_eq!(parsed.stats.total, Some(3));
         assert!(parsed.stats.min.is_some(), "min RTT should be present");
         assert!(parsed.stats.avg.is_some(), "avg RTT should be present");
@@ -188,11 +192,62 @@ mod live {
         let opts = serde_json::json!({
             "target": "10.0.0.1",
             "packets": 1,
+            "timeout": 5,
             "ipVersion": 4,
             "protocol": "ICMP",
             "inProgressUpdates": false,
         });
         let err = PingCommand.run(opts).await.unwrap_err();
         assert!(err.to_string().contains("Private IP"), "got: {err}");
+    }
+    #[tokio::test]
+    async fn live_tcp_cloudflare_https() {
+        let opts = serde_json::json!({
+            "target": "1.1.1.1",
+            "packets": 3,
+            "protocol": "TCP",
+            "port": 443,
+            "timeout": 5,
+            "ipVersion": 4,
+            "inProgressUpdates": false,
+        });
+        let result = PingCommand
+            .run(opts)
+            .await
+            .expect("TCP ping command failed");
+        let parsed: globalping_probe::command::ping::parse::ParsedPing =
+            serde_json::from_value(result).unwrap();
+        assert_eq!(parsed.status, PingStatus::Finished);
+        assert_eq!(parsed.resolved_address.as_deref(), Some("1.1.1.1"));
+        assert_eq!(parsed.stats.total, Some(3));
+        assert!(
+            parsed.stats.rcv.unwrap_or(0) > 0,
+            "Cloudflare:443 should answer TCP"
+        );
+        assert!(!parsed.timings.is_empty());
+        assert!(parsed.timings.iter().all(|timing| timing.ttl.is_none()));
+    }
+
+    #[tokio::test]
+    async fn hostname_resolving_private_is_rejected_before_measurement() {
+        let opts = serde_json::json!({
+            "target": "localhost",
+            "packets": 1,
+            "protocol": "ICMP",
+            "port": 80,
+            "timeout": 5,
+            "ipVersion": 4,
+            "inProgressUpdates": false,
+        });
+        let result = PingCommand
+            .run(opts)
+            .await
+            .expect("private resolution should be a result");
+        let parsed: globalping_probe::command::ping::parse::ParsedPing =
+            serde_json::from_value(result).unwrap();
+        assert_eq!(parsed.status, PingStatus::Failed);
+        assert_eq!(parsed.failure_source.as_deref(), Some("target"));
+        assert_eq!(parsed.raw_output, "Private IP ranges are not allowed.");
+        assert!(parsed.timings.is_empty());
     }
 }
