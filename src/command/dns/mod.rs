@@ -5,6 +5,7 @@ use super::ProgressTx;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -141,11 +142,23 @@ impl DnsCommand {
         let native = run_dig(&opts, progress.as_ref()).await?;
         if opts.trace {
             let mut result = parse_trace(&native.raw);
-            apply_trace_failure(&mut result, &native);
+            let is_private =
+                native.private_result || trace_has_private_answer(&result, &opts.target);
+            if is_private {
+                apply_private_trace_failure(&mut result);
+            } else {
+                apply_trace_failure(&mut result, &native);
+            }
             Ok(serde_json::to_value(result)?)
         } else {
             let mut result = parse_classic(&native.raw);
-            apply_classic_failure(&mut result, &native);
+            let is_private =
+                native.private_result || classic_has_private_answer(&result, &opts.target);
+            if is_private {
+                apply_private_classic_failure(&mut result);
+            } else {
+                apply_classic_failure(&mut result, &native);
+            }
             Ok(serde_json::to_value(result)?)
         }
     }
@@ -156,19 +169,67 @@ struct NativeDnsOutput {
     stderr: String,
     timed_out: bool,
     status: Option<std::process::ExitStatus>,
+    private_result: bool,
 }
-fn dns_progress_output(raw: &str, trace: bool) -> Option<String> {
-    if trace {
+
+enum DnsProgress {
+    Ignore,
+    Emit(String),
+    Private,
+}
+
+fn target_is_icann(target: &str) -> bool {
+    psl::suffix(target.trim_end_matches('.').as_bytes())
+        .is_some_and(|suffix| suffix.typ() == Some(psl::Type::Icann))
+}
+
+fn answer_is_private(value: &str) -> bool {
+    value.parse::<IpAddr>().is_ok_and(is_ip_private)
+}
+
+fn classic_has_private_answer(result: &ClassicResult, target: &str) -> bool {
+    !target_is_icann(target)
+        && result
+            .answers
+            .iter()
+            .any(|answer| answer_is_private(&answer.value))
+}
+
+fn trace_has_private_answer(result: &TraceResult, target: &str) -> bool {
+    !target_is_icann(target)
+        && result
+            .hops
+            .iter()
+            .flat_map(|hop| &hop.answers)
+            .any(|answer| answer_is_private(&answer.value))
+}
+
+fn dns_progress_output(raw: &str, opts: &DnsOptions) -> DnsProgress {
+    if opts.trace {
         let result = parse_trace(raw);
-        return (result.status == DnsStatus::Finished
-            || raw.to_ascii_lowercase().contains("connection refused"))
-        .then_some(result.raw_output);
+        if result.status == DnsStatus::Finished && trace_has_private_answer(&result, &opts.target) {
+            return DnsProgress::Private;
+        }
+        return if result.status == DnsStatus::Finished
+            || raw.to_ascii_lowercase().contains("connection refused")
+        {
+            DnsProgress::Emit(result.raw_output)
+        } else {
+            DnsProgress::Ignore
+        };
     }
 
     let result = parse_classic(raw);
-    (result.status == DnsStatus::Finished
-        || raw.to_ascii_lowercase().contains("connection refused"))
-    .then_some(result.raw_output)
+    if result.status == DnsStatus::Finished && classic_has_private_answer(&result, &opts.target) {
+        return DnsProgress::Private;
+    }
+    if result.status == DnsStatus::Finished
+        || raw.to_ascii_lowercase().contains("connection refused")
+    {
+        DnsProgress::Emit(result.raw_output)
+    } else {
+        DnsProgress::Ignore
+    }
 }
 
 async fn run_dig(opts: &DnsOptions, progress: Option<&ProgressTx>) -> Result<NativeDnsOutput> {
@@ -194,14 +255,23 @@ async fn run_dig(opts: &DnsOptions, progress: Option<&ProgressTx>) -> Result<Nat
     });
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let mut raw = String::new();
+    let mut private_result = false;
     let completed = timeout(process_timeout(f64::from(opts.timeout)), async {
         while let Some(line) = lines.next_line().await? {
             raw.push_str(&line);
             raw.push('\n');
-            if let Some(tx) = progress
-                && let Some(output) = dns_progress_output(&raw, opts.trace)
-            {
-                tx.send(json!({ "rawOutput": output })).ok();
+            match dns_progress_output(&raw, opts) {
+                DnsProgress::Private => {
+                    private_result = true;
+                    child.kill().await.ok();
+                    break;
+                }
+                DnsProgress::Emit(output) => {
+                    if let Some(tx) = progress {
+                        tx.send(json!({ "rawOutput": output })).ok();
+                    }
+                }
+                DnsProgress::Ignore => {}
             }
         }
         child.wait().await
@@ -218,6 +288,7 @@ async fn run_dig(opts: &DnsOptions, progress: Option<&ProgressTx>) -> Result<Nat
         stderr: stderr_task.await.unwrap_or_default(),
         timed_out,
         status,
+        private_result,
     })
 }
 
@@ -248,6 +319,25 @@ fn append_timeout(raw_output: &mut String) {
         raw_output.push_str("\n\n");
     }
     raw_output.push_str("The measurement command timed out.");
+}
+
+fn apply_private_classic_failure(result: &mut ClassicResult) {
+    let resolver = result.resolver.clone();
+    result.status = DnsStatus::Failed;
+    result.failure_source = Some("target".to_string());
+    result.status_code_name = None;
+    result.status_code = None;
+    result.answers.clear();
+    result.timings = parse::DnsTimings::default();
+    result.resolver = resolver;
+    result.raw_output = "Private IP ranges are not allowed.".to_string();
+}
+
+fn apply_private_trace_failure(result: &mut TraceResult) {
+    result.status = DnsStatus::Failed;
+    result.failure_source = Some("target".to_string());
+    result.hops.clear();
+    result.raw_output = "Private IP ranges are not allowed.".to_string();
 }
 
 fn apply_classic_failure(result: &mut ClassicResult, native: &NativeDnsOutput) {
@@ -300,7 +390,11 @@ pub async fn query_classic(
     };
     let native = run_dig(&opts, None).await?;
     let mut result = parse_classic(&native.raw);
-    apply_classic_failure(&mut result, &native);
+    if native.private_result || classic_has_private_answer(&result, target) {
+        apply_private_classic_failure(&mut result);
+    } else {
+        apply_classic_failure(&mut result, &native);
+    }
     Ok(result)
 }
 
@@ -322,7 +416,11 @@ pub async fn query_trace(target: &str, resolver: Option<&str>) -> Result<TraceRe
     };
     let native = run_dig(&opts, None).await?;
     let mut result = parse_trace(&native.raw);
-    apply_trace_failure(&mut result, &native);
+    if native.private_result || trace_has_private_answer(&result, target) {
+        apply_private_trace_failure(&mut result);
+    } else {
+        apply_trace_failure(&mut result, &native);
+    }
     Ok(result)
 }
 
@@ -454,5 +552,56 @@ mod tests {
         let mut opts = make_opts("A", false, "UDP");
         opts.resolver = Some("-x".into());
         assert!(validate(&opts).is_err());
+    }
+    fn private_answer_fixture(name: &str, ip: &str) -> String {
+        format!(
+            ";; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 1\n;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1\n\n;; QUESTION SECTION:\n;{name}. IN A\n\n;; ANSWER SECTION:\n{name}. 60 IN A {ip}\n\n;; Query time: 1 msec\n;; SERVER: 8.8.8.8#53(8.8.8.8) (UDP)\n"
+        )
+    }
+
+    #[test]
+    fn private_answer_rejected_for_non_icann_target() {
+        let parsed = parse_classic(&private_answer_fixture("printer.lan", "192.168.1.5"));
+        assert!(classic_has_private_answer(&parsed, "printer.lan"));
+        let mut failed = parsed;
+        apply_private_classic_failure(&mut failed);
+        assert_eq!(failed.status, DnsStatus::Failed);
+        assert_eq!(failed.failure_source.as_deref(), Some("target"));
+        assert_eq!(failed.raw_output, "Private IP ranges are not allowed.");
+        assert!(failed.answers.is_empty());
+        assert_eq!(failed.resolver.as_deref(), Some("8.8.8.8"));
+    }
+
+    #[test]
+    fn private_answer_allowed_for_icann_target() {
+        let parsed = parse_classic(&private_answer_fixture("example.com", "192.168.1.5"));
+        assert!(!classic_has_private_answer(&parsed, "example.com"));
+    }
+
+    #[test]
+    fn psl_private_section_is_not_icann() {
+        assert!(target_is_icann("example.com"));
+        assert!(!target_is_icann("foo.blogspot.com"));
+        assert!(!target_is_icann("printer.lan"));
+    }
+    #[test]
+    fn progress_suppresses_private_answer_for_non_icann_target() {
+        let mut opts = make_opts("A", false, "UDP");
+        opts.target = "printer.lan".into();
+        let raw = private_answer_fixture("printer.lan", "192.168.1.5");
+        assert!(matches!(
+            dns_progress_output(&raw, &opts),
+            DnsProgress::Private
+        ));
+    }
+
+    #[test]
+    fn progress_keeps_private_answer_for_icann_target() {
+        let opts = make_opts("A", false, "UDP");
+        let raw = private_answer_fixture("example.com", "192.168.1.5");
+        assert!(matches!(
+            dns_progress_output(&raw, &opts),
+            DnsProgress::Emit(_)
+        ));
     }
 }

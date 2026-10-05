@@ -50,6 +50,7 @@ axum = "0.8.9"
 rand = "0.9"
 if-addrs = "0.15.0"
 url = "2.5.8"
+psl = "2"
 
 [dev-dependencies]
 bytes         = "1"
