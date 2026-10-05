@@ -58,6 +58,11 @@ name = "integration"
 path = "tests/integration/mod.rs"
 required-features = ["native"]
 
+[[test]]
+name = "behavior_component"
+path = "tests/behavior_component.rs"
+required-features = ["native"]
+
 [[bin]]
 name = "globalping-sandbox"
 path = "src/bin/globalping-sandbox.rs"
