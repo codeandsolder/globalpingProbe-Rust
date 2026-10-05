@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferMode {
     Append,
     Diff,
@@ -10,7 +11,6 @@ pub struct ProgressBuffer {
     buffer: HashMap<String, String>,
     offset: HashMap<String, usize>,
     mode: BufferMode,
-    is_first: bool,
 }
 
 impl ProgressBuffer {
@@ -20,8 +20,17 @@ impl ProgressBuffer {
             buffer: HashMap::new(),
             offset: HashMap::new(),
             mode,
-            is_first: true,
         }
+    }
+
+    #[must_use]
+    pub const fn overwrite(&self) -> bool {
+        matches!(self.mode, BufferMode::Overwrite)
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
     }
 
     pub fn push(&mut self, field: &str, value: &str) {
@@ -29,35 +38,31 @@ impl ProgressBuffer {
             BufferMode::Append => {
                 self.buffer
                     .entry(field.to_string())
-                    .and_modify(|v| v.push_str(value))
+                    .and_modify(|current| current.push_str(value))
                     .or_insert_with(|| value.to_string());
             }
-            _ => {
+            BufferMode::Diff | BufferMode::Overwrite => {
                 self.buffer.insert(field.to_string(), value.to_string());
             }
         }
     }
 
     pub fn take_progress(&mut self) -> HashMap<String, String> {
-        if matches!(self.mode, BufferMode::Diff) {
-            let mut diff = HashMap::new();
-            for (field, value) in &self.buffer {
-                let offset = self.offset.get(field).copied().unwrap_or(0);
-                diff.insert(field.clone(), value[offset..].to_string());
-                self.offset.insert(field.clone(), value.len());
-            }
-            diff
-        } else {
-            let out = self.buffer.clone();
-            self.buffer.clear();
-            out
+        let current = std::mem::take(&mut self.buffer);
+        if !matches!(self.mode, BufferMode::Diff) {
+            return current;
         }
-    }
 
-    pub const fn is_first_progress(&mut self) -> bool {
-        let f = self.is_first;
-        self.is_first = false;
-        f
+        current
+            .into_iter()
+            .map(|(field, value)| {
+                let offset = self.offset.get(&field).copied().unwrap_or(0);
+                let safe_offset = value.floor_char_boundary(offset.min(value.len()));
+                let delta = value[safe_offset..].to_string();
+                self.offset.insert(field.clone(), value.len());
+                (field, delta)
+            })
+            .collect()
     }
 }
 
@@ -66,12 +71,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn append_mode_concatenates_values() {
+    fn append_mode_concatenates_values_and_clears_after_take() {
         let mut buf = ProgressBuffer::new(BufferMode::Append);
         buf.push("rawOutput", "line1\n");
         buf.push("rawOutput", "line2\n");
         let out = buf.take_progress();
         assert_eq!(out["rawOutput"], "line1\nline2\n");
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -87,18 +93,27 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_mode_replaces_value() {
+    fn diff_mode_does_not_repeat_fields_missing_from_later_updates() {
+        let mut buf = ProgressBuffer::new(BufferMode::Diff);
+        buf.push("rawHeaders", "content-type: text/plain");
+        buf.push("rawBody", "a");
+        let first = buf.take_progress();
+        assert_eq!(first["rawHeaders"], "content-type: text/plain");
+        assert_eq!(first["rawBody"], "a");
+
+        buf.push("rawBody", "ab");
+        let second = buf.take_progress();
+        assert_eq!(second["rawBody"], "b");
+        assert!(!second.contains_key("rawHeaders"));
+    }
+
+    #[test]
+    fn overwrite_mode_replaces_values_and_clears_after_take() {
         let mut buf = ProgressBuffer::new(BufferMode::Overwrite);
         buf.push("rawOutput", "first");
         buf.push("rawOutput", "second");
         let out = buf.take_progress();
         assert_eq!(out["rawOutput"], "second");
-    }
-
-    #[test]
-    fn is_first_returns_true_once() {
-        let mut buf = ProgressBuffer::new(BufferMode::Append);
-        assert!(buf.is_first_progress());
-        assert!(!buf.is_first_progress());
+        assert!(buf.is_empty());
     }
 }

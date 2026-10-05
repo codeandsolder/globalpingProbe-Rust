@@ -261,22 +261,9 @@ async fn run_native_traceroute(
         while let Some(line) = lines.next_line().await? {
             raw_lines.push(line);
             if let Some(tx) = progress {
-                let raw = raw_lines.join(
-                    "
-",
-                );
+                let raw = raw_lines.join("\n");
                 let normalized = normalize_numeric_output(&raw, target, &HashMap::new());
-                let partial = parse(&normalized);
-                if !partial.hops.is_empty() {
-                    tx.send(json!({
-                        "status": "in-progress",
-                        "rawOutput": normalized,
-                        "resolvedAddress": target.address.to_string(),
-                        "resolvedHostname": target.hostname,
-                        "hops": partial.hops,
-                    }))
-                    .ok();
-                }
+                tx.send(json!({ "rawOutput": normalized })).ok();
             }
         }
         child.wait().await

@@ -206,23 +206,10 @@ async fn run_icmp(
         while let Some(line) = lines.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
-            if let Some(tx) = &progress
-                && line.contains("bytes from ")
-                && line.contains(" time=")
-            {
-                let normalized = normalize_ping_output(&raw_output, &address, &target.hostname);
-                let partial = parse(&normalized);
-                if !partial.timings.is_empty() {
-                    tx.send(json!({
-                        "status": "in-progress",
-                        "rawOutput": normalized,
-                        "resolvedAddress": address,
-                        "resolvedHostname": target.hostname,
-                        "timings": partial.timings,
-                        "stats": partial.stats,
-                    }))
-                    .ok();
-                }
+            if let Some(tx) = &progress {
+                let mut normalized = normalize_ping_output(&line, &address, &target.hostname);
+                normalized.push('\n');
+                tx.send(json!({ "rawOutput": normalized })).ok();
             }
         }
         child.wait().await.map(|_| ())
@@ -333,24 +320,7 @@ async fn run_tcp(
         probes.push(probe);
 
         if let Some(tx) = &progress {
-            let stats = compute_tcp_stats(&probes, u8::try_from(probes.len()).unwrap_or(u8::MAX));
-            tx.send(json!({
-                "status": "in-progress",
-                "rawOutput": raw_lines.join("\n"),
-                "resolvedAddress": address,
-                "resolvedHostname": target.hostname,
-                "timings": timings,
-                "stats": {
-                    "min": stats.min,
-                    "max": stats.max,
-                    "avg": stats.avg,
-                    "total": stats.total,
-                    "loss": stats.loss,
-                    "rcv": stats.rcv,
-                    "drop": stats.drop,
-                },
-            }))
-            .ok();
+            tx.send(json!({ "rawOutput": raw_lines.join("\n") })).ok();
         }
     }
 

@@ -1,8 +1,10 @@
 pub mod parse;
 
+use super::ProgressTx;
+
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -124,9 +126,19 @@ impl DnsCommand {
     /// # Errors
     /// Returns an error for invalid options, rejected targets, process failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
+        self.run_inner(options, None).await
+    }
+
+    /// # Errors
+    /// Returns an error for invalid options, rejected targets, process failures, or serialization failures.
+    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+        self.run_inner(options, Some(tx)).await
+    }
+
+    async fn run_inner(&self, options: Value, progress: Option<ProgressTx>) -> Result<Value> {
         let opts: DnsOptions = serde_json::from_value(options)?;
         validate(&opts)?;
-        let native = run_dig(&opts).await?;
+        let native = run_dig(&opts, progress.as_ref()).await?;
         if opts.trace {
             let mut result = parse_trace(&native.raw);
             apply_trace_failure(&mut result, &native);
@@ -145,8 +157,21 @@ struct NativeDnsOutput {
     timed_out: bool,
     status: Option<std::process::ExitStatus>,
 }
+fn dns_progress_output(raw: &str, trace: bool) -> Option<String> {
+    if trace {
+        let result = parse_trace(raw);
+        return (result.status == DnsStatus::Finished
+            || raw.to_ascii_lowercase().contains("connection refused"))
+        .then_some(result.raw_output);
+    }
 
-async fn run_dig(opts: &DnsOptions) -> Result<NativeDnsOutput> {
+    let result = parse_classic(raw);
+    (result.status == DnsStatus::Finished
+        || raw.to_ascii_lowercase().contains("connection refused"))
+    .then_some(result.raw_output)
+}
+
+async fn run_dig(opts: &DnsOptions, progress: Option<&ProgressTx>) -> Result<NativeDnsOutput> {
     let mut child = Command::new("dig")
         .args(build_args(opts))
         .kill_on_drop(true)
@@ -173,6 +198,11 @@ async fn run_dig(opts: &DnsOptions) -> Result<NativeDnsOutput> {
         while let Some(line) = lines.next_line().await? {
             raw.push_str(&line);
             raw.push('\n');
+            if let Some(tx) = progress
+                && let Some(output) = dns_progress_output(&raw, opts.trace)
+            {
+                tx.send(json!({ "rawOutput": output })).ok();
+            }
         }
         child.wait().await
     })
@@ -268,7 +298,7 @@ pub async fn query_classic(
         in_progress_updates: false,
         timeout: 10,
     };
-    let native = run_dig(&opts).await?;
+    let native = run_dig(&opts, None).await?;
     let mut result = parse_classic(&native.raw);
     apply_classic_failure(&mut result, &native);
     Ok(result)
@@ -290,7 +320,7 @@ pub async fn query_trace(target: &str, resolver: Option<&str>) -> Result<TraceRe
         in_progress_updates: false,
         timeout: 10,
     };
-    let native = run_dig(&opts).await?;
+    let native = run_dig(&opts, None).await?;
     let mut result = parse_trace(&native.raw);
     apply_trace_failure(&mut result, &native);
     Ok(result)

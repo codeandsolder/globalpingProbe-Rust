@@ -424,9 +424,10 @@ pub mod parse {
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+use super::ProgressTx;
 use anyhow::{Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
@@ -533,7 +534,17 @@ impl MtrCommand {
     /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: MtrOptions = serde_json::from_value(options)?;
-        let result = run_mtr(&opts).await?;
+        let result = run_mtr(&opts, None).await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// Execute MTR while streaming overwrite snapshots.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
+    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+        let opts: MtrOptions = serde_json::from_value(options)?;
+        let result = run_mtr(&opts, Some(tx)).await?;
         Ok(serde_json::to_value(result)?)
     }
 }
@@ -557,7 +568,11 @@ struct NativeMtrOutput {
     timed_out: bool,
 }
 
-async fn run_native_mtr(args: &[String], process_timeout: Duration) -> Result<NativeMtrOutput> {
+async fn run_native_mtr(
+    args: &[String],
+    process_timeout: Duration,
+    progress: Option<&ProgressTx>,
+) -> Result<NativeMtrOutput> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
     let mut child = Command::new("mtr")
@@ -585,6 +600,10 @@ async fn run_native_mtr(args: &[String], process_timeout: Duration) -> Result<Na
         while let Some(line) = stdout_lines.next_line().await? {
             raw_stdout.push_str(&line);
             raw_stdout.push('\n');
+            if let Some(tx) = progress {
+                let hops = parse_raw(&raw_stdout, false);
+                tx.send(json!({ "rawOutput": build_output(&hops) })).ok();
+            }
         }
         child.wait().await.map(|_| ())
     })
@@ -603,7 +622,7 @@ async fn run_native_mtr(args: &[String], process_timeout: Duration) -> Result<Na
     })
 }
 
-async fn run_mtr(opts: &MtrOptions) -> Result<ParsedMtr> {
+async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<ParsedMtr> {
     validate(opts)?;
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = mtr_budget(opts.packets, opts.timeout);
@@ -614,7 +633,12 @@ async fn run_mtr(opts: &MtrOptions) -> Result<ParsedMtr> {
     };
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
-    let native = run_native_mtr(&build_args(&resolved_options), deadline.process_timeout()).await?;
+    let native = run_native_mtr(
+        &build_args(&resolved_options),
+        deadline.process_timeout(),
+        progress.as_ref(),
+    )
+    .await?;
 
     if native.stdout.trim().is_empty() {
         return Ok(ParsedMtr {
@@ -761,7 +785,7 @@ pub async fn run_measurement(target: &str, protocol: &str, ip_version: u8) -> Re
         in_progress_updates: false,
         timeout: 10,
     };
-    run_mtr(&opts).await
+    run_mtr(&opts, None).await
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

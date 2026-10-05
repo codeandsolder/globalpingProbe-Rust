@@ -1,7 +1,10 @@
 /// Integration tests for in-progress measurement streaming.
 /// Verifies that ping and traceroute emit partial results on the progress channel
 /// as they run, before the final result is returned.
-use globalping_probe::command::{ping::PingCommand, traceroute::TracerouteCommand};
+use globalping_probe::command::{
+    dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
+    traceroute::TracerouteCommand,
+};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -12,8 +15,17 @@ use tokio::sync::mpsc;
 fn progress_methods_are_constructible() {
     let (tx, _rx) = mpsc::unbounded_channel();
     let ping_future = PingCommand.run_with_progress(json!({}), tx.clone());
-    let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx);
-    drop((ping_future, traceroute_future));
+    let dns_future = DnsCommand.run_with_progress(json!({}), tx.clone());
+    let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx.clone());
+    let mtr_future = MtrCommand.run_with_progress(json!({}), tx.clone());
+    let http_future = HttpCommand.run_with_progress(json!({}), tx);
+    drop((
+        ping_future,
+        dns_future,
+        traceroute_future,
+        mtr_future,
+        http_future,
+    ));
 }
 
 /// Verify producers can detect a dropped progress receiver without panicking.
@@ -52,35 +64,32 @@ async fn progress_channel_terminates_when_sender_dropped() {
 async fn progress_channel_accepts_partial_ping_shape() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let partial = json!({
-        "status": "in-progress",
         "rawOutput": "PING 1.1.1.1 (1.1.1.1)\n64 bytes from 1.1.1.1: seq=1 ttl=58 time=10.1 ms\n",
-        "resolvedAddress": "1.1.1.1",
-        "resolvedHostname": null,
-        "timings": [{"rtt": 10.1, "ttl": 58}],
-        "stats": {"min": 10.1, "max": 10.1, "avg": 10.1},
     });
     tx.send(partial.clone()).unwrap();
     drop(tx);
     let received = rx.recv().await.unwrap();
-    assert_eq!(received["status"], "in-progress");
-    assert_eq!(received["timings"][0]["rtt"], 10.1);
+    assert!(
+        received["rawOutput"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
 }
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_traceroute_shape() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let partial = json!({
-        "status": "in-progress",
         "rawOutput": "traceroute to 1.1.1.1 (1.1.1.1), 20 hops max\n 1  _gateway (192.168.1.1)  1.2 ms\n",
-        "resolvedAddress": "1.1.1.1",
-        "resolvedHostname": null,
-        "hops": [{ "resolvedAddress": "192.168.1.1", "resolvedHostname": "_gateway", "timings": [{"rtt": 1.2}] }],
     });
     tx.send(partial).unwrap();
     drop(tx);
     let received = rx.recv().await.unwrap();
-    assert_eq!(received["status"], "in-progress");
-    assert!(received["hops"].as_array().unwrap().len() > 0);
+    assert!(
+        received["rawOutput"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
 }
 
 // ── inProgressUpdates flag parsing ───────────────────────────────────────────
@@ -141,15 +150,11 @@ mod live {
         let mut partial_count = 0usize;
         while let Some(partial) = rx.recv().await {
             partial_count += 1;
-            assert_eq!(
-                partial["status"], "in-progress",
-                "partial status should be in-progress"
-            );
             assert!(
-                partial["timings"]
-                    .as_array()
-                    .map_or(false, |t| !t.is_empty()),
-                "partial should have at least one timing"
+                partial["rawOutput"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "partial should contain raw output"
             );
         }
 
@@ -180,23 +185,108 @@ mod live {
         let measure =
             tokio::spawn(async move { TracerouteCommand.run_with_progress(options, tx).await });
 
-        let mut hop_counts: Vec<usize> = vec![];
+        let mut partial_count = 0usize;
         while let Some(partial) = rx.recv().await {
-            assert_eq!(partial["status"], "in-progress");
-            let hops = partial["hops"].as_array().map_or(0, |h| h.len());
-            hop_counts.push(hops);
+            partial_count += 1;
+            assert!(
+                partial["rawOutput"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "partial should contain raw output"
+            );
         }
 
         let final_result = measure.await.unwrap().unwrap();
-        println!("Traceroute progress events: {}", hop_counts.len());
-        println!("Hop counts per event: {hop_counts:?}");
+        println!("Traceroute progress events: {partial_count}");
         println!("Final status: {}", final_result["status"]);
+        assert!(partial_count >= 1, "expected at least 1 progress event");
+    }
 
-        assert!(!hop_counts.is_empty(), "expected at least 1 progress event");
-        // Hop counts should be non-decreasing
-        for w in hop_counts.windows(2) {
-            assert!(w[1] >= w[0], "hop count should not decrease");
+    #[tokio::test]
+    async fn live_dns_emits_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let options = json!({
+            "type": "dns",
+            "target": "example.com",
+            "protocol": "UDP",
+            "port": 53,
+            "resolver": "1.1.1.1",
+            "trace": false,
+            "query": { "type": "A" },
+            "ipVersion": 4,
+            "timeout": 5,
+            "inProgressUpdates": true,
+        });
+        let measure = tokio::spawn(async move { DnsCommand.run_with_progress(options, tx).await });
+        let mut count = 0usize;
+        while let Some(partial) = rx.recv().await {
+            count += 1;
+            assert!(
+                partial["rawOutput"]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty())
+            );
         }
+        let result = measure.await.unwrap().unwrap();
+        assert!(count >= 1, "expected DNS progress");
+        assert_eq!(result["status"], "finished");
+    }
+
+    #[tokio::test]
+    async fn live_mtr_emits_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let options = json!({
+            "type": "mtr",
+            "target": "1.1.1.1",
+            "protocol": "udp",
+            "port": 80,
+            "packets": 3,
+            "ipVersion": 4,
+            "timeout": 5,
+            "inProgressUpdates": true,
+        });
+        let measure = tokio::spawn(async move { MtrCommand.run_with_progress(options, tx).await });
+        let mut count = 0usize;
+        while let Some(partial) = rx.recv().await {
+            count += 1;
+            assert!(partial["rawOutput"].as_str().is_some());
+        }
+        let result = measure.await.unwrap().unwrap();
+        assert!(count >= 1, "expected MTR progress");
+        assert_eq!(result["status"], "finished");
+    }
+
+    #[tokio::test]
+    async fn live_http_get_emits_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let options = json!({
+            "type": "http",
+            "target": "example.com",
+            "protocol": "HTTPS",
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": true,
+            "request": {
+                "method": "GET",
+                "path": "/",
+                "query": "",
+                "headers": {}
+            }
+        });
+        let measure = tokio::spawn(async move { HttpCommand.run_with_progress(options, tx).await });
+        let mut count = 0usize;
+        let mut saw_body = false;
+        while let Some(partial) = rx.recv().await {
+            count += 1;
+            saw_body |= partial["rawBody"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty());
+            assert!(partial["rawOutput"].as_str().is_some());
+        }
+        let result = measure.await.unwrap().unwrap();
+        assert!(count >= 1, "expected HTTP GET progress");
+        assert!(saw_body, "expected an HTTP body chunk");
+        assert_eq!(result["status"], "finished");
     }
 
     /// Without inProgressUpdates, the channel should receive no events.

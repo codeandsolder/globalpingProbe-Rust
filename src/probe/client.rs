@@ -30,6 +30,7 @@ use crate::status::{
 };
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
+use crate::util::progress_buffer::BufferMode;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NODE_VERSION: &str = "v22.22.3";
@@ -153,6 +154,22 @@ enum CommandKind {
 }
 
 impl CommandKind {
+    fn progress_mode(&self, options: &Value) -> BufferMode {
+        match self {
+            Self::Ping
+                if options
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")) =>
+            {
+                BufferMode::Diff
+            }
+            Self::Ping | Self::Http => BufferMode::Append,
+            Self::Dns | Self::Traceroute => BufferMode::Diff,
+            Self::Mtr => BufferMode::Overwrite,
+        }
+    }
+
     async fn run(&self, options: Value) -> Result<Value> {
         match self {
             Self::Ping => PingCommand.run(options).await,
@@ -166,8 +183,10 @@ impl CommandKind {
     async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
         match self {
             Self::Ping => PingCommand.run_with_progress(options, tx).await,
+            Self::Dns => DnsCommand.run_with_progress(options, tx).await,
             Self::Traceroute => TracerouteCommand.run_with_progress(options, tx).await,
-            _ => self.run(options).await,
+            Self::Mtr => MtrCommand.run_with_progress(options, tx).await,
+            Self::Http => HttpCommand.run_with_progress(options, tx).await,
         }
     }
 }
@@ -227,9 +246,12 @@ pub async fn dispatch(
     let measurement_fut = async {
         if in_progress {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone());
-            tokio::spawn(emitter.forward(rx));
-            cmd.run_with_progress(req.measurement.clone(), tx).await
+            let mode = cmd.progress_mode(&req.measurement);
+            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone(), mode);
+            let emitter_task = tokio::spawn(emitter.forward(rx));
+            let result = cmd.run_with_progress(req.measurement.clone(), tx).await;
+            let _ = emitter_task.await;
+            result
         } else {
             cmd.run(req.measurement.clone()).await
         }

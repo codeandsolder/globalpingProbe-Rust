@@ -565,9 +565,10 @@ pub mod parse {
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
+use super::ProgressTx;
 use anyhow::{Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use tokio::fs;
 use tokio::process::Command;
@@ -1103,6 +1104,60 @@ fn curl_timeout_message(verbose: &str, is_https: bool) -> String {
     "Request timed out while establishing the TCP connection.".to_string()
 }
 
+async fn emit_http_progress(
+    headers_path: &str,
+    body_path: &str,
+    sent_body: &mut usize,
+    tx: &ProgressTx,
+) {
+    let body = read_capped(body_path, BODY_LIMIT).await;
+    let capped_len = body.len().min(BODY_LIMIT);
+    if capped_len <= *sent_body {
+        return;
+    }
+    let chunk = String::from_utf8_lossy(&body[*sent_body..capped_len]).to_string();
+    *sent_body = capped_len;
+    if chunk.is_empty() {
+        return;
+    }
+
+    if *sent_body == chunk.len() {
+        let header_file = fs::read_to_string(headers_path).await.unwrap_or_default();
+        let status_line = header_file
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('\r');
+        let status_line = status_line
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let raw_headers = parse_header_file(&header_file)
+            .into_iter()
+            .map(|(key, value)| format!("{key}: {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prefix = if status_line.is_empty() {
+            String::new()
+        } else {
+            format!("{status_line}\n{raw_headers}\n\n")
+        };
+        tx.send(json!({
+            "rawHeaders": raw_headers,
+            "rawBody": chunk,
+            "rawOutput": format!("{prefix}{chunk}"),
+        }))
+        .ok();
+    } else {
+        tx.send(json!({
+            "rawBody": chunk,
+            "rawOutput": chunk,
+        }))
+        .ok();
+    }
+}
+
 async fn execute_curl(
     opts: &HttpOptions,
     url: &str,
@@ -1110,7 +1165,10 @@ async fn execute_curl(
     resolved_ip: &str,
     remaining: Duration,
     is_https: bool,
+    progress: Option<&ProgressTx>,
 ) -> std::result::Result<CurlCapture, CurlRunError> {
+    use tokio::io::AsyncReadExt as _;
+
     let id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let headers_path = format!("/tmp/gp_hdr_{id}.txt");
     let body_path = format!("/tmp/gp_body_{id}.txt");
@@ -1123,34 +1181,75 @@ async fn execute_curl(
         &body_path,
         remaining,
     );
-    let mut command = Command::new("curl");
-    command.args(&args).kill_on_drop(true);
-    let curl_result = timeout(remaining, command.output()).await;
-    let curl_output = match curl_result {
-        Ok(Ok(output)) => output,
+    let mut child = Command::new("curl")
+        .args(&args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| CurlRunError::Spawn(format!("curl failed to spawn: {error}")))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CurlRunError::Spawn("curl stdout pipe unavailable".to_string()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CurlRunError::Spawn("curl stderr pipe unavailable".to_string()))?;
+    let stdout_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes).await;
+        bytes
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes).await;
+        bytes
+    });
+
+    let mut sent_body = 0_usize;
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await;
+    let completed = timeout(remaining, async {
+        loop {
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = poll.tick(), if progress.is_some() => {
+                    if let Some(tx) = progress {
+                        emit_http_progress(&headers_path, &body_path, &mut sent_body, tx).await;
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    let (status, timed_out) = match completed {
+        Ok(Ok(status)) => (Some(status), false),
         Ok(Err(error)) => {
             remove_curl_files(&headers_path, &body_path).await;
-            return Err(CurlRunError::Spawn(format!(
-                "curl failed to spawn: {error}"
-            )));
+            return Err(CurlRunError::Spawn(format!("curl wait failed: {error}")));
         }
         Err(_) => {
-            remove_curl_files(&headers_path, &body_path).await;
-            return Err(CurlRunError::TimedOut(
-                "Request timed out while establishing the TCP connection.".to_string(),
-            ));
+            child.kill().await.ok();
+            let status = child.wait().await.ok();
+            (status, true)
         }
     };
-    let verbose = String::from_utf8_lossy(&curl_output.stderr).to_string();
-    if !curl_output.status.success() && curl_output.status.code() == Some(28) {
+    if let Some(tx) = progress {
+        emit_http_progress(&headers_path, &body_path, &mut sent_body, tx).await;
+    }
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
+    let verbose = String::from_utf8_lossy(&stderr).to_string();
+    if timed_out || status.is_some_and(|status| !status.success() && status.code() == Some(28)) {
         let message = curl_timeout_message(&verbose, is_https);
         remove_curl_files(&headers_path, &body_path).await;
         return Err(CurlRunError::TimedOut(message));
     }
     let capture = CurlCapture {
-        stats: String::from_utf8_lossy(&curl_output.stdout)
-            .trim()
-            .to_string(),
+        stats: String::from_utf8_lossy(&stdout).trim().to_string(),
         verbose,
         raw_headers: fs::read_to_string(&headers_path).await.unwrap_or_default(),
         raw_body: read_capped(&body_path, BODY_LIMIT).await,
@@ -1246,7 +1345,65 @@ async fn build_tls_info(
     Some(tls)
 }
 
-async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
+async fn build_success_http_result(
+    opts: &HttpOptions,
+    capture: &CurlCapture,
+    stats: &CurlStats,
+    final_resolved_ip: String,
+    dns_ms: Option<u64>,
+    port: u16,
+    deadline: MeasurementDeadline,
+) -> ParsedHttp {
+    let is_https = !opts.protocol.eq_ignore_ascii_case("HTTP");
+    let status_text = parse_status_text(&capture.raw_headers);
+    let truncate_result = truncate_headers(parse_header_file(&capture.raw_headers));
+    let headers = dedup_headers(&truncate_result.headers);
+    let raw_headers = truncate_result
+        .headers
+        .iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (raw_body, body_truncated) = truncate_body(&capture.raw_body);
+    let truncated = truncate_result.truncated || body_truncated;
+    let http_version = normalize_http_version(&stats.http_version);
+    let tls = build_tls_info(
+        opts,
+        stats,
+        &final_resolved_ip,
+        port,
+        is_https,
+        &capture.verbose,
+        deadline,
+    )
+    .await;
+    let timings = build_http_timings(stats, dns_ms, is_https);
+    let raw_body = (!raw_body.is_empty()).then_some(raw_body);
+    let raw_output = build_raw_output(
+        http_version.as_deref(),
+        Some(stats.response_code),
+        Some(&raw_headers),
+        raw_body.as_deref(),
+        &opts.request.method,
+    );
+    ParsedHttp {
+        status: HttpStatus::Finished,
+        failure_source: None,
+        status_code: Some(stats.response_code),
+        status_code_name: status_text,
+        resolved_address: Some(final_resolved_ip),
+        http_version,
+        headers,
+        raw_headers: (!raw_headers.is_empty()).then_some(raw_headers),
+        raw_body,
+        truncated,
+        tls,
+        timings,
+        raw_output,
+    }
+}
+
+async fn run_http(opts: &HttpOptions, progress: Option<ProgressTx>) -> Result<ParsedHttp> {
     validate(opts)?;
     let deadline = MeasurementDeadline::new(opts.timeout);
     let protocol = opts.protocol.to_uppercase();
@@ -1278,7 +1435,17 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         ));
     }
     let url = build_url(opts, port);
-    let capture = match execute_curl(opts, &url, port, &resolved_ip, remaining, is_https).await {
+    let capture = match execute_curl(
+        opts,
+        &url,
+        port,
+        &resolved_ip,
+        remaining,
+        is_https,
+        progress.as_ref(),
+    )
+    .await
+    {
         Ok(capture) => capture,
         Err(CurlRunError::TimedOut(message)) => return Ok(failed_result("target", message)),
         Err(CurlRunError::Spawn(message)) => return Ok(failed_result("internal", message)),
@@ -1299,52 +1466,16 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         ));
     }
 
-    let status_text = parse_status_text(&capture.raw_headers);
-    let truncate_result = truncate_headers(parse_header_file(&capture.raw_headers));
-    let headers = dedup_headers(&truncate_result.headers);
-    let raw_headers = truncate_result
-        .headers
-        .iter()
-        .map(|(key, value)| format!("{key}: {value}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (raw_body, body_truncated) = truncate_body(&capture.raw_body);
-    let truncated = truncate_result.truncated || body_truncated;
-    let http_version = normalize_http_version(&stats.http_version);
-    let tls = build_tls_info(
+    Ok(build_success_http_result(
         opts,
+        &capture,
         &stats,
-        &final_resolved_ip,
+        final_resolved_ip,
+        dns_ms,
         port,
-        is_https,
-        &capture.verbose,
         deadline,
     )
-    .await;
-    let timings = build_http_timings(&stats, dns_ms, is_https);
-    let raw_body = (!raw_body.is_empty()).then_some(raw_body);
-    let raw_output = build_raw_output(
-        http_version.as_deref(),
-        Some(stats.response_code),
-        Some(&raw_headers),
-        raw_body.as_deref(),
-        &opts.request.method,
-    );
-    Ok(ParsedHttp {
-        status: HttpStatus::Finished,
-        failure_source: None,
-        status_code: Some(stats.response_code),
-        status_code_name: status_text,
-        resolved_address: Some(final_resolved_ip),
-        http_version,
-        headers,
-        raw_headers: (!raw_headers.is_empty()).then_some(raw_headers),
-        raw_body,
-        truncated,
-        tls,
-        timings,
-        raw_output,
-    })
+    .await)
 }
 
 fn failed_result(failure_source: &str, message: String) -> ParsedHttp {
@@ -1376,7 +1507,17 @@ impl HttpCommand {
     /// Returns an error for invalid options, DNS/process failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: HttpOptions = serde_json::from_value(options)?;
-        let result = run_http(&opts).await?;
+        let result = run_http(&opts, None).await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    /// Execute an HTTP command while streaming response-body progress.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, DNS/process failures, or serialization failures.
+    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+        let opts: HttpOptions = serde_json::from_value(options)?;
+        let result = run_http(&opts, Some(tx)).await?;
         Ok(serde_json::to_value(result)?)
     }
 }
@@ -1411,7 +1552,7 @@ pub async fn run_measurement(
             headers: HashMap::new(),
         },
     };
-    run_http(&opts).await
+    run_http(&opts, None).await
 }
 
 // ── Security / validation tests ───────────────────────────────────────────────
