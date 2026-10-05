@@ -89,10 +89,11 @@ fn canonicalize(ip: IpAddr) -> IpAddr {
     ip
 }
 
+#[cfg(feature = "native")]
 fn get_local_ips() -> HashSet<IpAddr> {
     use std::net::UdpSocket;
     let mut ips = HashSet::new();
-    // Probe the OS for the outbound IP — lightweight, no external crate needed yet
+    // Probe the OS for the outbound IP — lightweight, no external crate needed yet.
     if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.connect("8.8.8.8:80");
         if let Ok(addr) = sock.local_addr() {
@@ -100,6 +101,11 @@ fn get_local_ips() -> HashSet<IpAddr> {
         }
     }
     ips
+}
+
+#[cfg(not(feature = "native"))]
+fn get_local_ips() -> HashSet<IpAddr> {
+    HashSet::new()
 }
 
 #[cfg(test)]

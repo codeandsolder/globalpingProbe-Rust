@@ -1,5 +1,10 @@
+#[cfg(feature = "native")]
 pub mod command;
+#[cfg(feature = "native")]
 pub mod config;
+pub mod parsers;
+#[cfg(feature = "native")]
 pub mod probe;
+#[cfg(feature = "native")]
 pub mod status;
 pub mod util;

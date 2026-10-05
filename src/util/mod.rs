@@ -1,10 +1,15 @@
+#[cfg(feature = "native")]
 pub mod by_line;
+#[cfg(feature = "native")]
 pub mod logger;
+#[cfg(feature = "native")]
 pub mod logs_transport;
 pub mod measurement_timeout;
 pub mod output_limit;
 pub mod private_ip;
 pub mod progress_buffer;
+#[cfg(feature = "native")]
 pub mod resolve_target;
+#[cfg(feature = "native")]
 pub mod tcp_ping;
 pub mod validate;

@@ -9,6 +9,27 @@ repository = "https://github.com/codeandsolder/globalpingProbe-Rust"
 keywords = ["network", "probe", "globalping", "measurement"]
 categories = ["network-programming", "command-line-utilities"]
 
+[features]
+default = ["native"]
+native = [
+    "dep:anyhow",
+    "dep:axum",
+    "dep:config",
+    "dep:futures",
+    "dep:futures-util",
+    "dep:if-addrs",
+    "dep:psl",
+    "dep:rand",
+    "dep:reqwest",
+    "dep:rust_socketio",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:url",
+    "dep:uuid",
+]
+wasm-core = []
+
 [lints.rust]
 unsafe_code = "deny"
 rust_2024_compatibility = { level = "deny", priority = -1 }
@@ -25,32 +46,39 @@ unimplemented = "deny"
 [[bin]]
 name = "globalping-probe"
 path = "src/main.rs"
+required-features = ["native"]
 
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "globalping-sandbox"
+path = "src/bin/globalping-sandbox.rs"
+required-features = ["wasm-core"]
 
 [dependencies]
-tokio       = { version = "1", features = ["full"] }
-anyhow        = "1"
-tracing     = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"] }
+tokio       = { version = "1", features = ["full"], optional = true }
+anyhow        = { version = "1", optional = true }
+tracing     = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "registry"], optional = true }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-config      = "0.14"
-uuid        = { version = "1", features = ["v4"] }
+config      = { version = "0.14", optional = true }
+uuid        = { version = "1", features = ["v4"], optional = true }
 chrono      = { version = "0.4", features = ["serde"] }
 ipnet       = "2"
 regex       = "1"
-futures     = "0.3"
-futures-util  = "0.3"
-rust_socketio = { version = "0.5", features = ["async"] }
-reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-axum = "0.8.9"
-rand = "0.9"
-if-addrs = "0.15.0"
-url = "2.5.8"
-psl = "2"
+futures     = { version = "0.3", optional = true }
+futures-util  = { version = "0.3", optional = true }
+rust_socketio = { version = "0.5", features = ["async"], optional = true }
+reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+axum = { version = "0.8.9", optional = true }
+rand = { version = "0.9", optional = true }
+if-addrs = { version = "0.15.0", optional = true }
+url = { version = "2.5.8", optional = true }
+psl = { version = "2", optional = true }
 
 [dev-dependencies]
 bytes         = "1"
