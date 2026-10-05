@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use super::update::VerifiedBehavior;
@@ -94,7 +94,8 @@ impl BehaviorRuntime {
     /// the component call, or the guest-level self-test fails.
     pub async fn self_test(&self, compiled: &CompiledBehavior) -> Result<(), RuntimeError> {
         let mut linker = Linker::<SelfTestState>::new(&self.engine);
-        ProbeBehavior::add_to_linker(&mut linker, |state| state).map_err(RuntimeError::Linker)?;
+        ProbeBehavior::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+            .map_err(RuntimeError::Linker)?;
 
         let mut store = Store::new(&self.engine, SelfTestState::new());
         store.limiter(|state| &mut state.limits);
