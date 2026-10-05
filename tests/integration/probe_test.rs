@@ -1,10 +1,10 @@
-/// Integration tests for the probe module (UUID, sysinfo, DNS servers, client wire types, reconnect, limiter).
+/// Integration tests for the probe module (UUID, sysinfo, DNS servers, client wire types, reconnect, active jobs).
 /// Live tests are gated on #[cfg(target_os = "linux")].
 use globalping_probe::probe::{
     client::{ClientConfig, MeasurementRequest, VERSION, connection_url},
     dns_servers::parse_resolv_conf,
-    limiter::{MAX_CONCURRENT, MeasurementLimiter},
-    reconnect::{ConnectOutcome, ExponentialBackoff, classify_error, reconnect_delay},
+    jobs::ActiveJobs,
+    reconnect::{ConnectOutcome, classify_error, reconnect_delay},
     sysinfo::{parse_df_output, parse_meminfo_total},
     uuid::ProbeUuid,
 };
@@ -265,31 +265,27 @@ fn live_dns_servers_readable() {
 // ── Reconnect logic ───────────────────────────────────────────────────────────
 
 #[test]
-fn reconnect_classify_ip_limit() {
-    assert_eq!(classify_error("ip limit"), ConnectOutcome::IpLimitOrVpn);
-}
-
-#[test]
-fn reconnect_classify_vpn() {
-    assert_eq!(classify_error("VPN detected"), ConnectOutcome::IpLimitOrVpn);
-}
-
-#[test]
-fn reconnect_classify_geoip() {
-    assert_eq!(classify_error("geoip error"), ConnectOutcome::IpLimitOrVpn);
+fn reconnect_classifies_current_probe_policy_errors() {
+    for message in [
+        "ip limit",
+        "user asn limit exceeded",
+        "VPN detected",
+        "unresolvable geoip",
+    ] {
+        assert_eq!(classify_error(message), ConnectOutcome::ProbePolicyError);
+    }
 }
 
 #[test]
 fn reconnect_classify_metadata() {
     assert_eq!(
-        classify_error("metadata error"),
+        classify_error("failed to collect probe metadata"),
         ConnectOutcome::MetadataError
     );
 }
 
 #[test]
 fn reconnect_classify_invalid_version() {
-    // Matches what the API actually sends
     assert_eq!(
         classify_error("invalid probe version (0.1.0)"),
         ConnectOutcome::InvalidVersion
@@ -299,7 +295,7 @@ fn reconnect_classify_invalid_version() {
 #[test]
 fn reconnect_classify_server_terminating() {
     assert_eq!(
-        classify_error("server-terminating"),
+        classify_error("server is terminating"),
         ConnectOutcome::ServerTerminating
     );
 }
@@ -310,167 +306,63 @@ fn reconnect_classify_unknown_is_transient() {
         classify_error("connection reset"),
         ConnectOutcome::Transient
     );
-    assert_eq!(classify_error(""), ConnectOutcome::Transient);
 }
 
 #[test]
-fn reconnect_delay_ip_limit_is_one_hour() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
+fn reconnect_policy_matches_current_upstream_delays() {
     assert_eq!(
-        reconnect_delay(&ConnectOutcome::IpLimitOrVpn, &mut bo),
+        reconnect_delay(&ConnectOutcome::ProbePolicyError),
         Some(Duration::from_secs(3600))
     );
-}
-
-#[test]
-fn reconnect_delay_metadata_is_one_minute() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
     assert_eq!(
-        reconnect_delay(&ConnectOutcome::MetadataError, &mut bo),
+        reconnect_delay(&ConnectOutcome::MetadataError),
         Some(Duration::from_secs(60))
     );
-}
-
-#[test]
-fn reconnect_delay_clean_shutdown_is_none() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
     assert_eq!(
-        reconnect_delay(&ConnectOutcome::CleanShutdown, &mut bo),
-        None
+        reconnect_delay(&ConnectOutcome::Transient),
+        Some(Duration::from_secs(2))
     );
-}
-
-#[test]
-fn reconnect_delay_invalid_version_is_none() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
     assert_eq!(
-        reconnect_delay(&ConnectOutcome::InvalidVersion, &mut bo),
-        None
+        reconnect_delay(&ConnectOutcome::ServerTerminating),
+        Some(Duration::from_secs(2))
     );
 }
 
 #[test]
-fn reconnect_delay_server_terminating_is_zero() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-    assert_eq!(
-        reconnect_delay(&ConnectOutcome::ServerTerminating, &mut bo),
-        Some(Duration::ZERO)
-    );
-}
-
-#[test]
-fn reconnect_backoff_doubles_and_caps() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-    let d1 = reconnect_delay(&ConnectOutcome::Transient, &mut bo).unwrap();
-    let d2 = reconnect_delay(&ConnectOutcome::Transient, &mut bo).unwrap();
-    let d3 = reconnect_delay(&ConnectOutcome::Transient, &mut bo).unwrap();
-    assert_eq!(d1, Duration::from_secs(1));
-    assert_eq!(d2, Duration::from_secs(2));
-    assert_eq!(d3, Duration::from_secs(4));
-}
-
-#[test]
-fn reconnect_backoff_resets_after_policy_error() {
-    let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-    reconnect_delay(&ConnectOutcome::Transient, &mut bo); // advance
-    reconnect_delay(&ConnectOutcome::Transient, &mut bo); // now at 2s
-    bo.reset();
-    let d = reconnect_delay(&ConnectOutcome::Transient, &mut bo).unwrap();
-    assert_eq!(d, Duration::from_secs(1));
-}
-
-#[test]
-fn reconnect_classifies_real_api_error_envelope() {
-    // The API wraps errors: {"message":"ip limit","data":{"ipAddress":"..."}}
-    // The client extracts the "message" field before classifying.
-    let msg = "ip limit"; // as extracted from the JSON envelope
-    assert_eq!(classify_error(msg), ConnectOutcome::IpLimitOrVpn);
-
-    let msg2 = "\"nodeVersion\" with value \"rust-probe\" fails to match the required pattern";
-    assert_eq!(classify_error(msg2), ConnectOutcome::Transient); // treated as transient (version fixed separately)
-}
-
-// ── Measurement limiter ───────────────────────────────────────────────────────
-
-#[test]
-fn limiter_default_capacity_is_three() {
-    let lim = MeasurementLimiter::new();
-    assert_eq!(lim.capacity(), MAX_CONCURRENT);
-    assert_eq!(lim.capacity(), 3);
-}
-
-#[test]
-fn limiter_starts_with_zero_in_flight() {
-    let lim = MeasurementLimiter::new();
-    assert_eq!(lim.in_flight(), 0);
-}
-
-#[test]
-fn limiter_tracks_in_flight_count() {
-    let lim = MeasurementLimiter::with_capacity(3);
-    let _s1 = lim.try_acquire().unwrap();
-    assert_eq!(lim.in_flight(), 1);
-    let _s2 = lim.try_acquire().unwrap();
-    assert_eq!(lim.in_flight(), 2);
-    let _s3 = lim.try_acquire().unwrap();
-    assert_eq!(lim.in_flight(), 3);
-}
-
-#[test]
-fn limiter_returns_none_when_at_capacity() {
-    let lim = MeasurementLimiter::with_capacity(2);
-    let _s1 = lim.try_acquire().unwrap();
-    let _s2 = lim.try_acquire().unwrap();
-    assert!(
-        lim.try_acquire().is_none(),
-        "limiter must reject at capacity"
-    );
-}
-
-#[test]
-fn limiter_releases_slot_on_drop() {
-    let lim = MeasurementLimiter::with_capacity(1);
-    {
-        let _s = lim.try_acquire().unwrap();
-        assert!(lim.try_acquire().is_none());
+fn reconnect_exit_outcomes_do_not_retry() {
+    for outcome in [
+        ConnectOutcome::CleanShutdown,
+        ConnectOutcome::RestartRequested,
+        ConnectOutcome::InvalidVersion,
+    ] {
+        assert_eq!(reconnect_delay(&outcome), None);
     }
-    // Slot freed — should be acquirable again
-    assert!(lim.try_acquire().is_some());
-    assert_eq!(lim.in_flight(), 0);
 }
 
+// ── Active jobs ────────────────────────────────────────────────────────────────
+
 #[test]
-fn limiter_clone_shares_pool() {
-    let lim1 = MeasurementLimiter::with_capacity(2);
-    let lim2 = lim1.clone();
-    let _slot = lim1.try_acquire().unwrap();
-    assert_eq!(lim2.in_flight(), 1);
-    assert_eq!(lim2.capacity(), 2);
+fn active_jobs_start_at_zero_and_have_no_local_cap() {
+    let jobs = ActiveJobs::new();
+    let guards: Vec<_> = (0..32).map(|_| jobs.start()).collect();
+    assert_eq!(jobs.count(), 32);
+    drop(guards);
+    assert_eq!(jobs.count(), 0);
 }
 
 #[tokio::test]
-async fn limiter_slot_can_be_cycled_many_times() {
-    let lim = MeasurementLimiter::with_capacity(1);
-    for i in 0..20 {
-        let s = lim
-            .try_acquire()
-            .unwrap_or_else(|| panic!("failed at iteration {i}"));
-        assert_eq!(lim.in_flight(), 1);
-        drop(s);
-        assert_eq!(lim.in_flight(), 0);
-    }
-}
-
-#[test]
-fn limiter_multiple_slots_all_released_together() {
-    let lim = MeasurementLimiter::with_capacity(3);
-    let s1 = lim.try_acquire().unwrap();
-    let s2 = lim.try_acquire().unwrap();
-    let s3 = lim.try_acquire().unwrap();
-    assert_eq!(lim.in_flight(), 3);
-    drop(s1);
-    drop(s2);
-    drop(s3);
-    assert_eq!(lim.in_flight(), 0);
-    assert!(lim.try_acquire().is_some());
+async fn active_jobs_wait_idle_tracks_all_guards() {
+    let jobs = ActiveJobs::new();
+    let first = jobs.start();
+    let second = jobs.start();
+    let waiter = {
+        let jobs = jobs.clone();
+        tokio::spawn(async move { jobs.wait_idle().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!waiter.is_finished());
+    drop(first);
+    assert!(!waiter.is_finished());
+    drop(second);
+    waiter.await.unwrap();
 }

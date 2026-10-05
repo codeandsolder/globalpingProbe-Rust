@@ -20,15 +20,15 @@ use crate::command::{
 use crate::probe::progress::ProgressEmitter;
 use crate::probe::{
     dns_servers::get_dns_servers,
-    limiter::MeasurementLimiter,
-    reconnect::{ConnectOutcome, ExponentialBackoff, classify_error, reconnect_delay},
-    stats::MeasurementStats,
+    jobs::ActiveJobs,
+    reconnect::{ConnectOutcome, classify_error, reconnect_delay},
+    stats::get_cpu_usage,
     sysinfo::{disk_info_mb, total_memory_bytes},
 };
 use crate::status::{
     icmp_tcp_test::IcmpTcpTest, ping_test::PingTest, status_manager::StatusManager,
 };
-use crate::util::logs_transport::{API_LOG_BUFFER, run_logs_loop};
+use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,10 +39,12 @@ const NODE_VERSION: &str = "v22.22.3";
 pub const MEASUREMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often stats are flushed to the API.
-pub const STATS_INTERVAL: Duration = Duration::from_secs(60);
+pub const STATS_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Maximum time to wait for in-flight measurements to finish on graceful shutdown.
-pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum time to wait for measurements on ordinary process shutdown.
+pub const SIGTERM_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum time to wait when the API explicitly requests a probe restart.
+pub const RESTART_DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -191,30 +193,14 @@ pub async fn dispatch(
     req: MeasurementRequest,
     client: Client,
     status_manager: Arc<Mutex<StatusManager>>,
-    limiter: MeasurementLimiter,
-    measurement_stats: Arc<MeasurementStats>,
+    jobs: ActiveJobs,
 ) {
     let mid = req.measurement_id.clone();
     let tid = req.test_id.clone();
 
-    // Concurrency guard — reject if already at capacity.
-    let Some(_slot) = limiter.try_acquire() else {
-        warn!(
-            "Measurement {mid} rejected — already running {} of {} max.",
-            limiter.in_flight(),
-            limiter.capacity()
-        );
-        return;
-    };
-
     let current_status = status_manager.lock().await.get_status().to_string();
     if current_status != "ready" {
         warn!("Measurement was sent to probe with {current_status} status.");
-        return;
-    }
-
-    if let Err(e) = client.emit("probe:measurement:ack", json!(null)).await {
-        warn!("Failed to ack measurement {mid}: {e}");
         return;
     }
 
@@ -225,18 +211,10 @@ pub async fn dispatch(
         .unwrap_or("");
 
     let Some(cmd) = make_command(mtype) else {
-        let result_json = json!({ "status": "failed", "rawOutput": format!("Unknown measurement type: {mtype}") });
-        client
-            .emit(
-                "probe:measurement:result",
-                json!({
-                    "testId": tid, "measurementId": mid, "result": result_json,
-                }),
-            )
-            .await
-            .ok();
+        warn!("Unknown measurement type: {mtype}");
         return;
     };
+    let _job = jobs.start();
 
     let in_progress = req
         .measurement
@@ -245,7 +223,6 @@ pub async fn dispatch(
         .unwrap_or(false);
 
     debug!("{mtype} request {mid} received.");
-    measurement_stats.record_start();
 
     let measurement_fut = async {
         if in_progress {
@@ -265,16 +242,18 @@ pub async fn dispatch(
                 "Measurement {mid} timed out after {}s.",
                 MEASUREMENT_TIMEOUT.as_secs()
             );
-            Ok(json!({ "status": "failed", "rawOutput": "Measurement timed out." }))
+            Ok(json!({
+                "status": "failed",
+                "failureSource": "internal",
+                "rawOutput": "Measurement timed out."
+            }))
         });
-
-    measurement_stats.record_finish();
 
     let mut result_json = match run_result {
         Ok(v) => v,
         Err(e) => {
             error!(target: "test-error-handler", "Failed to run the measurement: {e}");
-            json!({ "status": "failed", "rawOutput": e.to_string() })
+            json!({ "status": "failed", "failureSource": "internal", "rawOutput": e.to_string() })
         }
     };
 
@@ -310,21 +289,27 @@ pub fn extract_first_string(payload: &Payload) -> Option<String> {
 
 // ── Stats loop ────────────────────────────────────────────────────────────────
 
-/// Background task: flush measurement counters to the API every minute.
-pub async fn run_stats_loop(stats: Arc<MeasurementStats>, client: Client) {
+/// Background task: report per-CPU utilization and active jobs every 10 seconds.
+pub async fn run_stats_loop(jobs: ActiveJobs, client: Client) {
     loop {
         tokio::time::sleep(STATS_INTERVAL).await;
-        let (started, finished) = stats.take();
-        client
-            .emit(
-                "probe:stats:report",
-                json!({
-                    "measurementsStarted":  started,
-                    "measurementsFinished": finished,
-                }),
-            )
-            .await
-            .ok();
+        match get_cpu_usage().await {
+            Ok(load) => {
+                client
+                    .emit(
+                        "probe:stats:report",
+                        json!({
+                            "cpu": { "load": load },
+                            "jobs": { "count": jobs.count() },
+                        }),
+                    )
+                    .await
+                    .ok();
+            }
+            Err(error) => {
+                warn!(target: "probe-stats-reporter", %error, "Failed to collect CPU usage");
+            }
+        }
     }
 }
 
@@ -381,8 +366,7 @@ pub async fn run_status_loop(
 #[derive(Clone)]
 struct ConnectionHandlers {
     status_manager: Arc<Mutex<StatusManager>>,
-    limiter: MeasurementLimiter,
-    measurement_stats: Arc<MeasurementStats>,
+    jobs: ActiveJobs,
     signal: OutcomeSignal,
     already_connected: Arc<AtomicBool>,
 }
@@ -391,8 +375,7 @@ impl ConnectionHandlers {
     fn new(status_manager: Arc<Mutex<StatusManager>>) -> Self {
         Self {
             status_manager,
-            limiter: MeasurementLimiter::new(),
-            measurement_stats: MeasurementStats::new(),
+            jobs: ActiveJobs::new(),
             signal: OutcomeSignal::new(),
             already_connected: Arc::new(AtomicBool::new(false)),
         }
@@ -433,7 +416,7 @@ async fn handle_error(state: ConnectionHandlers, payload: Payload) {
     if !matches!(outcome, ConnectOutcome::ServerTerminating) {
         error!(target: "api:error", "Connection to API failed: {message}");
     }
-    if matches!(outcome, ConnectOutcome::IpLimitOrVpn) && message.contains("ip limit") {
+    if matches!(outcome, ConnectOutcome::ProbePolicyError) && message.contains("ip limit") {
         let ip = ip_address.as_deref().unwrap_or("");
         error!(target: "api:error",
             "Only 1 connection per IP address is allowed. Please make sure you don't have another probe running on IP {ip}.");
@@ -555,13 +538,7 @@ fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Clie
     };
     match serde_json::from_value::<MeasurementRequest>(data) {
         Ok(request) => {
-            tokio::spawn(dispatch(
-                request,
-                client,
-                state.status_manager,
-                state.limiter,
-                state.measurement_stats,
-            ));
+            tokio::spawn(dispatch(request, client, state.status_manager, state.jobs));
         }
         Err(error) => warn!("Bad measurement request: {error}"),
     }
@@ -573,6 +550,7 @@ fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) 
     let error = state.clone();
     let proxy = state.clone();
     let measurement = state.clone();
+    let restart = state.clone();
     builder
         .on("open", move |_, client| {
             let state = open.clone();
@@ -586,10 +564,14 @@ fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) 
             let state = error.clone();
             async move { handle_error(state, payload).await }.boxed()
         })
-        .on("probe:sigkill", |_, _| {
+        .on("probe:sigkill", move |_, _| {
+            let state = restart.clone();
             async move {
-                info!("Probe restart requested by the API. Exiting...");
-                std::process::exit(0);
+                info!(
+                    "Probe restart requested by the API; draining {} active jobs.",
+                    state.jobs.count()
+                );
+                state.signal.signal(ConnectOutcome::RestartRequested).await;
             }
             .boxed()
         })
@@ -629,10 +611,7 @@ impl ConnectionTasks {
                 socket.clone(),
                 ping_target.to_string(),
             )),
-            metrics: tokio::spawn(run_stats_loop(
-                Arc::clone(&state.measurement_stats),
-                socket.clone(),
-            )),
+            metrics: tokio::spawn(run_stats_loop(state.jobs.clone(), socket.clone())),
             logs: tokio::spawn(run_logs_loop(socket.clone())),
         }
     }
@@ -644,32 +623,33 @@ impl ConnectionTasks {
     }
 }
 
-async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client) {
+async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_timeout: Duration) {
     state.status_manager.lock().await.set_sigterm();
     socket
         .emit("probe:status:update", json!("sigterm"))
         .await
         .ok();
-    if state.limiter.in_flight() > 0
-        && tokio::time::timeout(DRAIN_TIMEOUT, state.limiter.wait_idle())
+    if state.jobs.count() > 0
+        && tokio::time::timeout(drain_timeout, state.jobs.wait_idle())
             .await
             .is_err()
     {
-        warn!("SIGTERM timeout. Force closing.");
+        warn!(
+            "Shutdown timeout after {}s with {} active jobs. Force closing.",
+            drain_timeout.as_secs(),
+            state.jobs.count()
+        );
     }
+    flush_logs(socket).await;
 }
 
-/// Connect once, run until shutdown or disconnect.
-/// Returns `(outcome, was_connected)` — `was_connected` is true if the socket.io
-/// `connect` event fired at least once, meaning the session was real (not just a
-/// handshake failure). The caller uses this to decide whether to reset backoff.
+/// Connect once and run until shutdown, an API-requested restart, or disconnect.
 async fn connect_once(
     cfg: &ClientConfig,
     status_manager: Arc<Mutex<StatusManager>>,
     mut shutdown_rx: watch::Receiver<bool>,
-) -> (ConnectOutcome, bool) {
+) -> ConnectOutcome {
     let state = ConnectionHandlers::new(status_manager);
-    let connected_reader = Arc::clone(&state.already_connected);
     let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
@@ -677,7 +657,7 @@ async fn connect_once(
         Ok(socket) => socket,
         Err(error) => {
             error!(target: "api:error", "Connection to API failed: {error}");
-            return (ConnectOutcome::Transient, false);
+            return ConnectOutcome::Transient;
         }
     };
 
@@ -688,12 +668,17 @@ async fn connect_once(
     };
     tasks.abort();
 
-    if matches!(outcome, ConnectOutcome::CleanShutdown) {
-        graceful_shutdown(&state, &socket).await;
+    match outcome {
+        ConnectOutcome::CleanShutdown => {
+            graceful_shutdown(&state, &socket, SIGTERM_DRAIN_TIMEOUT).await;
+        }
+        ConnectOutcome::RestartRequested => {
+            graceful_shutdown(&state, &socket, RESTART_DRAIN_TIMEOUT).await;
+        }
+        _ => {}
     }
     socket.disconnect().await.ok();
-    let was_connected = connected_reader.load(Ordering::SeqCst);
-    (outcome, was_connected)
+    outcome
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -720,33 +705,24 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let mut backoff = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        let (outcome, was_connected) =
-            connect_once(&cfg, Arc::clone(&status), shutdown_rx.clone()).await;
+        let outcome = connect_once(&cfg, Arc::clone(&status), shutdown_rx.clone()).await;
 
-        match reconnect_delay(&outcome, &mut backoff) {
+        match reconnect_delay(&outcome) {
             None => {
                 if matches!(outcome, ConnectOutcome::InvalidVersion) {
                     info!(target: "api:error", "Detected an outdated probe. Restarting.");
-                    std::process::exit(1);
+                    std::process::exit(0);
                 }
                 break;
             }
             Some(delay) => {
-                // Reset backoff when: outcome is non-transient (explicit server policy),
-                // OR the session was real (connect event fired).  Without this, EngineIO
-                // errors during a long healthy session would accumulate backoff toward 5 min.
-                if !matches!(outcome, ConnectOutcome::Transient) || was_connected {
-                    backoff.reset();
-                }
                 match &outcome {
-                    ConnectOutcome::IpLimitOrVpn => {
+                    ConnectOutcome::ProbePolicyError => {
                         error!(target: "api:error", "Retrying in 1 hour. Probe temporarily disconnected.");
                     }
                     ConnectOutcome::MetadataError => {
@@ -757,14 +733,12 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
                     }
                     _ => {}
                 }
-                if !delay.is_zero() {
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        () = async {
-                            let mut rx = shutdown_rx.clone();
-                            let _ = rx.changed().await;
-                        } => break,
-                    }
+                tokio::select! {
+                    () = tokio::time::sleep(delay) => {}
+                    () = async {
+                        let mut rx = shutdown_rx.clone();
+                        let _ = rx.changed().await;
+                    } => break,
                 }
             }
         }
@@ -887,10 +861,10 @@ mod tests {
         let sig = OutcomeSignal::new();
         let sig2 = sig.clone();
         tokio::spawn(async move {
-            sig2.signal(ConnectOutcome::IpLimitOrVpn).await;
+            sig2.signal(ConnectOutcome::ProbePolicyError).await;
         });
         let outcome = sig.wait().await;
-        assert_eq!(outcome, ConnectOutcome::IpLimitOrVpn);
+        assert_eq!(outcome, ConnectOutcome::ProbePolicyError);
     }
 
     #[tokio::test]
@@ -993,6 +967,6 @@ mod tests {
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("");
-        assert_eq!(classify_error(raw), ConnectOutcome::IpLimitOrVpn);
+        assert_eq!(classify_error(raw), ConnectOutcome::ProbePolicyError);
     }
 }

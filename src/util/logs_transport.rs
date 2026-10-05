@@ -174,14 +174,16 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ApiLogsLayer {
 use rust_socketio::asynchronous::Client;
 use tokio::time::{Duration, sleep};
 
+pub async fn flush_logs(client: &Client) {
+    if let Some(payload) = API_LOG_BUFFER.take() {
+        client.emit("probe:logs", payload).await.ok();
+    }
+}
+
 pub async fn run_logs_loop(client: Client) {
     loop {
         let interval = API_LOG_BUFFER.send_interval_ms();
         sleep(Duration::from_millis(interval)).await;
-
-        let Some(payload) = API_LOG_BUFFER.take() else {
-            continue;
-        };
-        client.emit("probe:logs", payload).await.ok();
+        flush_logs(&client).await;
     }
 }
