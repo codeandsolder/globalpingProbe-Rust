@@ -21,5 +21,5 @@ todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
-serde_json = "1"
-wit-bindgen = "0.61"
+dlmalloc = { version = "0.2", features = ["global"] }
+wit-bindgen = { version = "0.61", default-features = false, features = ["macros", "realloc"] }
