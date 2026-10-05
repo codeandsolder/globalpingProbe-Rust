@@ -2,12 +2,13 @@
 //!
 //! The stable native supervisor only compiles artifacts that already passed
 //! signature, digest, ABI, and anti-rollback verification. Per-job stores are
-//! separately bounded by memory, fuel, and epoch deadlines.
+//! separately bounded by memory, fuel, and epoch deadlines. The linker exposes
+//! only the versioned Globalping host interface; ambient WASI is never linked.
 
 use std::sync::Arc;
 
-use wasmtime::component::Component;
-use wasmtime::{Config, Engine, StoreLimits, StoreLimitsBuilder};
+use wasmtime::component::{Component, Linker};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 use super::update::VerifiedBehavior;
 
@@ -21,6 +22,11 @@ pub const JOB_FUEL: u64 = 50_000_000;
 pub enum RuntimeError {
     Engine(wasmtime::Error),
     Component(wasmtime::Error),
+    Linker(wasmtime::Error),
+    Store(wasmtime::Error),
+    Instantiate(wasmtime::Error),
+    Call(wasmtime::Error),
+    GuestSelfTest(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -28,6 +34,13 @@ impl std::fmt::Display for RuntimeError {
         match self {
             Self::Engine(error) => write!(f, "failed to configure Wasmtime: {error}"),
             Self::Component(error) => write!(f, "invalid WebAssembly component: {error}"),
+            Self::Linker(error) => write!(f, "failed to configure behavior linker: {error}"),
+            Self::Store(error) => write!(f, "failed to configure behavior store: {error}"),
+            Self::Instantiate(error) => {
+                write!(f, "failed to instantiate behavior component: {error}")
+            }
+            Self::Call(error) => write!(f, "behavior component call failed: {error}"),
+            Self::GuestSelfTest(error) => write!(f, "behavior component self-test failed: {error}"),
         }
     }
 }
@@ -73,6 +86,32 @@ impl BehaviorRuntime {
         })
     }
 
+    /// Instantiate the component with no ambient WASI and execute its built-in
+    /// self-test under the same resource ceilings used for measurement jobs.
+    ///
+    /// # Errors
+    /// Returns an error when linking, instantiation, resource configuration,
+    /// the component call, or the guest-level self-test fails.
+    pub async fn self_test(&self, compiled: &CompiledBehavior) -> Result<(), RuntimeError> {
+        let mut linker = Linker::<SelfTestState>::new(&self.engine);
+        ProbeBehavior::add_to_linker(&mut linker, |state| state).map_err(RuntimeError::Linker)?;
+
+        let mut store = Store::new(&self.engine, SelfTestState::new());
+        store.limiter(|state| &mut state.limits);
+        store.set_fuel(JOB_FUEL).map_err(RuntimeError::Store)?;
+        store.set_epoch_deadline(1);
+
+        let bindings = ProbeBehavior::instantiate_async(&mut store, &compiled.component, &linker)
+            .await
+            .map_err(RuntimeError::Instantiate)?;
+        let result = bindings
+            .codeandsolder_globalping_behavior_guest()
+            .call_self_test(&mut store)
+            .await
+            .map_err(RuntimeError::Call)?;
+        result.map_err(RuntimeError::GuestSelfTest)
+    }
+
     #[must_use]
     pub fn store_limits() -> StoreLimits {
         StoreLimitsBuilder::new()
@@ -93,6 +132,74 @@ pub struct CompiledBehavior {
     pub sequence: u64,
     pub build_id: String,
     pub component: Arc<Component>,
+}
+
+struct SelfTestState {
+    limits: StoreLimits,
+}
+
+impl SelfTestState {
+    fn new() -> Self {
+        Self {
+            limits: BehaviorRuntime::store_limits(),
+        }
+    }
+
+    fn denied<T>() -> Result<T, codeandsolder::globalping_behavior::host::HostError> {
+        use codeandsolder::globalping_behavior::host::{HostError, HostErrorCode};
+
+        Err(HostError {
+            code: HostErrorCode::PolicyDenied,
+            message: "host capabilities are unavailable during component self-test".to_string(),
+        })
+    }
+}
+
+impl codeandsolder::globalping_behavior::host::Host for SelfTestState {
+    async fn start(
+        &mut self,
+        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+    ) -> Result<
+        codeandsolder::globalping_behavior::host::ExecutionStart,
+        codeandsolder::globalping_behavior::host::HostError,
+    > {
+        Self::denied()
+    }
+
+    async fn poll(
+        &mut self,
+        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+    ) -> Result<
+        Option<codeandsolder::globalping_behavior::host::ExecutionEvent>,
+        codeandsolder::globalping_behavior::host::HostError,
+    > {
+        Self::denied()
+    }
+
+    async fn reverse_lookup(
+        &mut self,
+        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+        _address: String,
+    ) -> Result<Option<String>, codeandsolder::globalping_behavior::host::HostError> {
+        Self::denied()
+    }
+
+    async fn lookup_asn(
+        &mut self,
+        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+        _address: String,
+    ) -> Result<Vec<u32>, codeandsolder::globalping_behavior::host::HostError> {
+        Self::denied()
+    }
+
+    async fn emit_progress(
+        &mut self,
+        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+        _result_json: String,
+        _overwrite: bool,
+    ) -> Result<(), codeandsolder::globalping_behavior::host::HostError> {
+        Self::denied()
+    }
 }
 
 wasmtime::component::bindgen!({
