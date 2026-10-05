@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-use super::{MeasurementCommand, ProgressTx};
+use super::ProgressTx;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
 use parse::{ParsedTraceroute, TracerouteStatus, parse};
@@ -88,26 +88,29 @@ pub fn build_args(opts: &TracerouteOptions) -> Vec<String> {
 
 pub struct TracerouteCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for TracerouteCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl TracerouteCommand {
+    /// Execute a traceroute command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process/IO failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: TracerouteOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_traceroute(&opts, None).await?;
         Ok(serde_json::to_value(result)?)
     }
 
-    async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+    /// Execute traceroute while streaming partial hop results.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process/IO failures, or serialization failures.
+    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
         let opts: TracerouteOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_traceroute(&opts, Some(tx)).await?;
         Ok(serde_json::to_value(result)?)
     }
 }
-
-// Matches any traceroute hop line: starts with whitespace + hop number
-static HOP_LINE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"^\s*\d+\s").unwrap());
 
 async fn run_traceroute(
     opts: &TracerouteOptions,
@@ -135,7 +138,10 @@ async fn run_traceroute(
 
         // Emit a partial result after every hop line
         if let Some(tx) = &progress
-            && HOP_LINE.is_match(&line)
+            && line
+                .split_whitespace()
+                .next()
+                .is_some_and(|field| field.bytes().all(|byte| byte.is_ascii_digit()))
         {
             let accumulated = raw_lines.join("\n");
             let partial = parse(&accumulated);
@@ -182,6 +188,10 @@ async fn run_traceroute(
 
 // ── Helper for integration tests ──────────────────────────────────────────────
 
+/// Run one traceroute measurement without the socket layer.
+///
+/// # Errors
+/// Returns an error for invalid options or process/IO failures.
 pub async fn run_trace(target: &str, protocol: &str, ip_version: u8) -> Result<ParsedTraceroute> {
     let opts = TracerouteOptions {
         target: target.to_string(),

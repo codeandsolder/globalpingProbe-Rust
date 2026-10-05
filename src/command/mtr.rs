@@ -1,6 +1,7 @@
 pub mod parse {
     use serde::Serialize;
     use std::collections::HashMap;
+    use std::fmt::Write as _;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
     #[serde(rename_all = "lowercase")]
@@ -170,6 +171,10 @@ pub mod parse {
             .collect()
     }
 
+    fn count_as_f64(count: usize) -> f64 {
+        f64::from(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
     pub fn compute_stats(timings: &[HopTiming], is_final: bool) -> HopStats {
         if timings.is_empty() {
             return HopStats::default();
@@ -182,9 +187,10 @@ pub mod parse {
         } else {
             let min = rtts.iter().copied().fold(f64::INFINITY, f64::min);
             let max = rtts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let avg = r1(rtts.iter().sum::<f64>() / rtts.len() as f64);
+            let avg = r1(rtts.iter().sum::<f64>() / count_as_f64(rtts.len()));
             // Node.js uses the rounded avg when computing stDev
-            let var = rtts.iter().map(|&x| (x - avg).powi(2)).sum::<f64>() / rtts.len() as f64;
+            let var =
+                rtts.iter().map(|&x| (x - avg).powi(2)).sum::<f64>() / count_as_f64(rtts.len());
             (min, max, avg, r1(var.sqrt()))
         };
 
@@ -200,7 +206,7 @@ pub mod parse {
                 drop += 1;
             }
         }
-        let loss = r1((drop as f64 / total as f64) * 100.0);
+        let loss = r1((count_as_f64(drop) / count_as_f64(total)) * 100.0);
 
         // Jitter: absolute diff between consecutive pairs of received RTTs
         let mut jv: Vec<f64> = Vec::new();
@@ -215,7 +221,7 @@ pub mod parse {
             (
                 r1(jv.iter().copied().fold(f64::INFINITY, f64::min)),
                 r1(jv.iter().copied().fold(f64::NEG_INFINITY, f64::max)),
-                r1(jv.iter().sum::<f64>() / jv.len() as f64),
+                r1(jv.iter().sum::<f64>() / count_as_f64(jv.len())),
             )
         };
 
@@ -238,95 +244,112 @@ pub mod parse {
         (v * 10.0).round() / 10.0
     }
 
-    /// Build a human-readable table from parsed hops.
-    /// First hop hostname is replaced with `_gateway` (mirrors Node.js behavior).
-    #[must_use]
-    pub fn build_output(hops: &[MtrHop]) -> String {
-        if hops.is_empty() {
-            return String::new();
-        }
-
-        // Skip trailing all-star hops (no resolved address from that point on)
-        let mut filtered: Vec<(usize, &MtrHop)> = Vec::new();
-        for (i, hop) in hops.iter().enumerate() {
+    fn filter_output_hops(hops: &[MtrHop]) -> Vec<&MtrHop> {
+        let mut filtered = Vec::new();
+        for (index, hop) in hops.iter().enumerate() {
             if hop.resolved_address.is_none() {
-                let from = i.saturating_sub(1);
-                if hops[from..].iter().all(|h| h.resolved_address.is_none()) {
+                let from = index.saturating_sub(1);
+                if hops[from..]
+                    .iter()
+                    .all(|candidate| candidate.resolved_address.is_none())
+                {
                     continue;
                 }
             }
-            filtered.push((i, hop));
+            filtered.push(hop);
         }
-        if filtered.is_empty() {
-            return String::new();
+        filtered
+    }
+
+    fn asn_string(hop: &MtrHop) -> String {
+        if hop.asn.is_empty() {
+            "AS???".to_string()
+        } else {
+            format!(
+                "AS{}",
+                hop.asn
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
         }
+    }
 
-        // Dynamic column widths
-        let idx_w = filtered.len().to_string().len();
+    fn display_host(display_index: usize, hop: &MtrHop) -> String {
+        if display_index == 0 {
+            "_gateway".to_string()
+        } else {
+            hop.resolved_hostname
+                .as_deref()
+                .or(hop.resolved_address.as_deref())
+                .unwrap_or("")
+                .to_string()
+        }
+    }
 
-        let asn_str = |h: &MtrHop| -> String {
-            if h.asn.is_empty() {
-                "AS???".to_string()
-            } else {
-                format!(
-                    "AS{}",
-                    h.asn
-                        .iter()
-                        .map(std::string::ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            }
-        };
-        let asn_w = 2 + filtered
+    struct OutputWidths {
+        index: usize,
+        asn: usize,
+        hostname: usize,
+        loss: usize,
+        drop: usize,
+        received: usize,
+        average: usize,
+        stdev: usize,
+        jitter: usize,
+        host: usize,
+    }
+
+    fn output_widths(hops: &[&MtrHop]) -> OutputWidths {
+        let index = hops.len().to_string().len();
+        let asn = 2 + hops
             .iter()
-            .map(|(_, h)| asn_str(h).len())
+            .map(|hop| asn_string(hop).len())
             .max()
             .unwrap_or(5);
-
-        let addr_w = filtered
+        let address = hops
             .iter()
-            .map(|(_, h)| h.resolved_address.as_deref().unwrap_or("").len())
+            .map(|hop| hop.resolved_address.as_deref().unwrap_or("").len())
             .max()
             .unwrap_or(0);
-        let display_host = |display_i: usize, h: &MtrHop| -> String {
-            if display_i == 0 {
-                "_gateway".to_string()
-            } else {
-                h.resolved_hostname
-                    .as_deref()
-                    .or(h.resolved_address.as_deref())
-                    .unwrap_or("")
-                    .to_string()
-            }
-        };
-        let hn_w = filtered
+        let hostname_name = hops
             .iter()
             .enumerate()
-            .map(|(di, (_, h))| display_host(di, h).len())
+            .map(|(display_index, hop)| display_host(display_index, hop).len())
             .max()
             .unwrap_or(0);
-        let hostname_col = 3 + addr_w + hn_w; // space + hostname + space + (address)
-
-        let loss_w = 6usize; // "100.0%" = 6
-        let drop_max = filtered
+        let hostname = 3 + address + hostname_name;
+        let drop_max = hops
             .iter()
-            .map(|(_, h)| h.stats.drop.to_string().len())
+            .map(|hop| hop.stats.drop.to_string().len())
             .max()
             .unwrap_or(1);
-        let drop_w = drop_max.max(4);
-        let rcv_w = 2 + drop_max;
-        let avg_w = filtered
+        let drop = drop_max.max(4);
+        let received = 2 + drop_max;
+        let average = hops
             .iter()
-            .map(|(_, h)| format!("{:.1}", h.stats.avg).len())
+            .map(|hop| format!("{:.1}", hop.stats.avg).len())
             .max()
             .unwrap_or(3)
             .max(3);
-        let stdev_w = 6usize;
-        let javg_w = 5usize;
-        let host_col = idx_w + asn_w + hostname_col + 4;
+        let asn_width = asn;
+        OutputWidths {
+            index,
+            asn,
+            hostname,
+            loss: 6,
+            drop,
+            received,
+            average,
+            stdev: 6,
+            jitter: 5,
+            host: index + asn_width + hostname + 4,
+        }
+    }
 
-        let mut out = format!(
+    fn render_header(widths: &OutputWidths) -> String {
+        format!(
             "{:<hc$} {:>lw$} {:>dw$} {:>rw$} {:>aw$} {:>sw$} {:>jw$}\n",
             "Host",
             "Loss%",
@@ -335,47 +358,65 @@ pub mod parse {
             "Avg",
             "StDev",
             "Javg",
-            hc = host_col,
-            lw = loss_w + 1,
-            dw = drop_w,
-            rw = rcv_w,
-            aw = avg_w,
-            sw = stdev_w,
-            jw = javg_w,
+            hc = widths.host,
+            lw = widths.loss + 1,
+            dw = widths.drop,
+            rw = widths.received,
+            aw = widths.average,
+            sw = widths.stdev,
+            jw = widths.jitter,
+        )
+    }
+
+    fn render_row(display_index: usize, hop: &MtrHop, widths: &OutputWidths) -> String {
+        let index = format!("{:>width$}.", display_index + 1, width = widths.index);
+        let asn = format!("{:<width$}", asn_string(hop), width = widths.asn);
+        let hostname = display_host(display_index, hop);
+        let host_label = hop.resolved_address.as_ref().map_or_else(
+            || "(waiting for reply)".to_string(),
+            |address| format!("{hostname} ({address})"),
         );
-
-        for (di, (_, hop)) in filtered.iter().enumerate() {
-            let sindex = format!("{:>iw$}.", di + 1, iw = idx_w);
-            let sasn = format!("{:<aw$}", asn_str(hop), aw = asn_w);
-            let hn = display_host(di, hop);
-            let shost = if let Some(addr) = &hop.resolved_address {
-                format!("{:<hw$}", format!("{} ({})", hn, addr), hw = hostname_col)
-            } else {
-                format!("{:<hw$}", "(waiting for reply)", hw = hostname_col)
-            };
-            let mut line = format!("{sindex} {sasn} {shost}");
-            if hop.resolved_address.is_some() {
-                line.push_str(&format!(
-                    " {:>lw$}% {:>dw$} {:>rw$} {:>aw$.1} {:>sw$.1} {:>jw$.1}",
-                    format!("{:.1}", hop.stats.loss),
-                    hop.stats.drop,
-                    hop.stats.rcv,
-                    hop.stats.avg,
-                    hop.stats.st_dev,
-                    hop.stats.j_avg,
-                    lw = loss_w - 1,
-                    dw = drop_w,
-                    rw = rcv_w,
-                    aw = avg_w,
-                    sw = stdev_w,
-                    jw = javg_w,
-                ));
-            }
-            line.push('\n');
-            out.push_str(&line);
+        let host = format!("{host_label:<width$}", width = widths.hostname);
+        let mut line = format!("{index} {asn} {host}");
+        if hop.resolved_address.is_some() {
+            let _ = write!(
+                line,
+                " {:>lw$}% {:>dw$} {:>rw$} {:>aw$.1} {:>sw$.1} {:>jw$.1}",
+                format!("{:.1}", hop.stats.loss),
+                hop.stats.drop,
+                hop.stats.rcv,
+                hop.stats.avg,
+                hop.stats.st_dev,
+                hop.stats.j_avg,
+                lw = widths.loss - 1,
+                dw = widths.drop,
+                rw = widths.received,
+                aw = widths.average,
+                sw = widths.stdev,
+                jw = widths.jitter,
+            );
         }
+        line.push('\n');
+        line
+    }
 
-        out
+    /// Build a human-readable table from parsed hops.
+    /// First hop hostname is replaced with `_gateway` (mirrors Node.js behavior).
+    #[must_use]
+    pub fn build_output(hops: &[MtrHop]) -> String {
+        if hops.is_empty() {
+            return String::new();
+        }
+        let filtered = filter_output_hops(hops);
+        if filtered.is_empty() {
+            return String::new();
+        }
+        let widths = output_widths(&filtered);
+        let mut output = render_header(&widths);
+        for (display_index, hop) in filtered.into_iter().enumerate() {
+            output.push_str(&render_row(display_index, hop, &widths));
+        }
+        output
     }
 }
 
@@ -387,7 +428,6 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-use super::MeasurementCommand;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
 use parse::{MtrStatus, ParsedMtr, build_output, parse_raw};
@@ -484,9 +524,12 @@ pub fn build_args(opts: &MtrOptions) -> Vec<String> {
 
 pub struct MtrCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for MtrCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl MtrCommand {
+    /// Execute an MTR command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: MtrOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_mtr(&opts).await?;
@@ -638,6 +681,10 @@ async fn lookup_asn(addr: &str) -> Vec<u32> {
 
 // ── Public helper for integration tests ───────────────────────────────────────
 
+/// Run one MTR measurement without the socket layer.
+///
+/// # Errors
+/// Returns an error when validation or the underlying MTR/ASN lookup process fails.
 pub async fn run_measurement(target: &str, protocol: &str, ip_version: u8) -> Result<ParsedMtr> {
     let opts = MtrOptions {
         target: target.to_string(),

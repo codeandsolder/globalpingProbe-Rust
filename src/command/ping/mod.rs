@@ -6,10 +6,10 @@ use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-use super::{MeasurementCommand, ProgressTx};
+use super::ProgressTx;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
-use parse::{ParsedPing, PingStatus, parse};
+use parse::{ParsedPing, PingStats, PingStatus, parse};
 
 // ── Options (deserialised from the socket.io job payload) ───────────────────
 
@@ -88,26 +88,29 @@ pub fn build_args(opts: &PingOptions) -> Vec<String> {
 
 pub struct PingCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for PingCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl PingCommand {
+    /// Execute a ping command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process/IO failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: PingOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_icmp(&opts, None).await?;
         Ok(serde_json::to_value(result)?)
     }
 
-    async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+    /// Execute a ping command while streaming partial packet results.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, process/IO failures, or serialization failures.
+    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
         let opts: PingOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let result = run_icmp(&opts, Some(tx)).await?;
         Ok(serde_json::to_value(result)?)
     }
 }
-
-// Regex that matches a ping packet reply line: "64 bytes from … time=X ms"
-static PACKET_LINE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"bytes from .* time=").unwrap());
 
 async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<ParsedPing> {
     let args = build_args(opts);
@@ -149,7 +152,8 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
 
         // Emit in-progress partial after each packet reply line
         if let Some(tx) = &progress
-            && PACKET_LINE.is_match(&line)
+            && line.contains("bytes from ")
+            && line.contains(" time=")
         {
             let partial = parse(&raw_output);
             if !partial.timings.is_empty() {
@@ -176,7 +180,7 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
             resolved_address: None,
             resolved_hostname: None,
             timings: vec![],
-            stats: Default::default(),
+            stats: PingStats::default(),
         });
     }
 
@@ -185,6 +189,10 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
 
 // ── Public helper for integration tests / status manager ─────────────────────
 
+/// Run one ping measurement without the socket layer.
+///
+/// # Errors
+/// Returns an error for invalid options or process/IO failures.
 pub async fn run_measurement(
     target: &str,
     ip_version: u8,

@@ -581,7 +581,6 @@ version = "0.48.0"
 dependencies = [
  "anyhow",
  "assert_matches",
- "async-trait",
  "bytes",
  "chrono",
  "config",

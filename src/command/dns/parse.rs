@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use crate::util::private_ip::is_ip_private;
 
@@ -61,51 +62,54 @@ pub struct TraceResult {
 
 // ── Regex patterns ────────────────────────────────────────────────────────────
 
-static SECTION_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"(;; )(\S+)( SECTION:)").unwrap());
-static QUERY_TIME_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"Query\s+time:\s+(\d+)").unwrap());
-static RESOLVER_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"SERVER:.*?\((.*?)\)").unwrap());
-static STATUS_CODE_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"status:\s*([A-Z]+)").unwrap());
+fn compile_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(pattern).ok()
+}
+
+static SECTION_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"(;; )(\S+)( SECTION:)"));
+static QUERY_TIME_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"Query\s+time:\s+(\d+)"));
+static RESOLVER_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"SERVER:.*?\((.*?)\)"));
+static STATUS_CODE_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"status:\s*([A-Z]+)"));
 // Trace: ";; Received N bytes from IP#53(name) in N ms"
-static TRACE_RECEIVED_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"from\s+\S+\(([^)]+)\)\s+in\s+(\d+)\s+ms").unwrap());
+static TRACE_RECEIVED_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"from\s+\S+\(([^)]+)\)\s+in\s+(\d+)\s+ms"));
 // Match an IPv4 or IPv6 address in a SERVER line
-static IP_IN_SERVER_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"SERVER:\s*([^\s#]+)").unwrap());
+static IP_IN_SERVER_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"SERVER:\s*([^\s#]+)"));
 
 // ── Status code map ───────────────────────────────────────────────────────────
 
-static STATUS_MAP: std::sync::LazyLock<HashMap<&'static str, u16>> =
-    std::sync::LazyLock::new(|| {
-        [
-            ("noerror", 0),
-            ("formerr", 1),
-            ("servfail", 2),
-            ("nxdomain", 3),
-            ("notimp", 4),
-            ("refused", 5),
-            ("yxdomain", 6),
-            ("yxrrset", 7),
-            ("nxrrset", 8),
-            ("notauth", 9),
-            ("notzone", 10),
-            ("dsotypeni", 11),
-            ("badvers", 16),
-            ("badsig", 16),
-            ("badkey", 17),
-            ("badtime", 18),
-            ("badmode", 19),
-            ("badname", 20),
-            ("badalg", 21),
-            ("badtrunc", 22),
-            ("badcookie", 23),
-        ]
-        .into_iter()
-        .collect()
-    });
+static STATUS_MAP: LazyLock<HashMap<&'static str, u16>> = LazyLock::new(|| {
+    [
+        ("noerror", 0),
+        ("formerr", 1),
+        ("servfail", 2),
+        ("nxdomain", 3),
+        ("notimp", 4),
+        ("refused", 5),
+        ("yxdomain", 6),
+        ("yxrrset", 7),
+        ("nxrrset", 8),
+        ("notauth", 9),
+        ("notzone", 10),
+        ("dsotypeni", 11),
+        ("badvers", 16),
+        ("badsig", 16),
+        ("badkey", 17),
+        ("badtime", 18),
+        ("badmode", 19),
+        ("badname", 20),
+        ("badalg", 21),
+        ("badtrunc", 22),
+        ("badcookie", 23),
+    ]
+    .into_iter()
+    .collect()
+});
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -141,15 +145,15 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
     let mut section_changed;
 
     for line in &lines {
-        if let Some(caps) = QUERY_TIME_RE.captures(line) {
+        if let Some(caps) = QUERY_TIME_RE.as_ref().and_then(|re| re.captures(line)) {
             timings.total = caps[1].parse().unwrap_or(0);
         }
-        if let Some(caps) = STATUS_CODE_RE.captures(line) {
+        if let Some(caps) = STATUS_CODE_RE.as_ref().and_then(|re| re.captures(line)) {
             let name = caps[1].to_string();
             status_code = STATUS_MAP.get(name.to_lowercase().as_str()).copied();
             status_code_name = Some(name);
         }
-        if let Some(caps) = RESOLVER_RE.captures(line) {
+        if let Some(caps) = RESOLVER_RE.as_ref().and_then(|re| re.captures(line)) {
             let ip = &caps[1];
             resolver = Some(if ip == "x.x.x.x" {
                 "private".into()
@@ -161,7 +165,7 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
         section_changed = false;
         if line.is_empty() {
             section = "";
-        } else if let Some(caps) = SECTION_RE.captures(line) {
+        } else if let Some(caps) = SECTION_RE.as_ref().and_then(|re| re.captures(line)) {
             section = match &caps[2] {
                 s if s.eq_ignore_ascii_case("ANSWER") => "answer",
                 s if s.eq_ignore_ascii_case("QUESTION") => "question",
@@ -234,7 +238,7 @@ fn rewrite_classic(raw: &str) -> String {
                 return line.to_string();
             }
             // Extract the IP before '#'
-            if let Some(caps) = IP_IN_SERVER_RE.captures(line) {
+            if let Some(caps) = IP_IN_SERVER_RE.as_ref().and_then(|re| re.captures(line)) {
                 let ip_str = &caps[1];
                 if let Ok(ip) = ip_str.parse()
                     && is_ip_private(ip)
@@ -294,7 +298,7 @@ fn parse_trace_hops(lines: &[&str]) -> Vec<TraceHop> {
             continue;
         }
         if line.starts_with(";;") {
-            if let Some(caps) = TRACE_RECEIVED_RE.captures(line) {
+            if let Some(caps) = TRACE_RECEIVED_RE.as_ref().and_then(|re| re.captures(line)) {
                 current_resolver = Some(caps[1].to_string());
                 current_timings.total = caps[2].parse().unwrap_or(0);
             }

@@ -1,9 +1,7 @@
 /// Integration tests for in-progress measurement streaming.
 /// Verifies that ping and traceroute emit partial results on the progress channel
 /// as they run, before the final result is returned.
-use globalping_probe::command::{
-    MeasurementCommand, ping::PingCommand, traceroute::TracerouteCommand,
-};
+use globalping_probe::command::{ping::PingCommand, traceroute::TracerouteCommand};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -11,14 +9,11 @@ use tokio::sync::mpsc;
 
 /// Verify the progress channel path exists and is type-correct (compile check).
 #[test]
-fn ping_run_with_progress_signature_compiles() {
-    // Just checks the function exists and has the right signature at compile time.
-    let _: &dyn MeasurementCommand = &PingCommand;
-}
-
-#[test]
-fn traceroute_run_with_progress_signature_compiles() {
-    let _: &dyn MeasurementCommand = &TracerouteCommand;
+fn progress_methods_are_constructible() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let ping_future = PingCommand.run_with_progress(json!({}), tx.clone());
+    let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx);
+    drop((ping_future, traceroute_future));
 }
 
 /// Verify producers can detect a dropped progress receiver without panicking.

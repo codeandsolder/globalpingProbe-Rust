@@ -50,18 +50,18 @@ impl Default for PingTest {
 /// Run all TRIALS for one IP version; log per-trial failures and summary.
 /// Returns true if ≥ `REQUIRED_PASSES` have zero loss.
 async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
-    let mut passes = 0usize;
+    let mut pass_count = 0usize;
     let mut failures: Vec<TrialOutcome> = Vec::new();
 
     for _ in 0..TRIALS {
         match ping_once(target, ip_version).await {
-            TrialOutcome::Pass => passes += 1,
-            fail => failures.push(fail),
+            TrialOutcome::Pass => pass_count += 1,
+            fail @ TrialOutcome::Fail { .. } => failures.push(fail),
         }
     }
 
-    let passed = passes >= REQUIRED_PASSES;
-    let pass_text = if passed {
+    let meets_threshold = pass_count >= REQUIRED_PASSES;
+    let pass_text = if meets_threshold {
         format!(". IPv{ip_version} tests pass")
     } else {
         String::new()
@@ -82,14 +82,14 @@ async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
         }
     }
 
-    if !passed {
+    if !meets_threshold {
         warn!(
             target: "status-manager",
             "IPv{ip_version} ping tests failed. Retrying in 10 minutes. Probe marked as not supporting IPv{ip_version}."
         );
     }
 
-    passed
+    meets_threshold
 }
 
 /// Run one `ping` subprocess; return Pass or Fail with details.

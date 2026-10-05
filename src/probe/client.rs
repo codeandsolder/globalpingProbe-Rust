@@ -14,7 +14,7 @@ use rust_socketio::{
 };
 
 use crate::command::{
-    MeasurementCommand, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
+    ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
     traceroute::TracerouteCommand,
 };
 use crate::probe::progress::ProgressEmitter;
@@ -114,9 +114,16 @@ impl OutcomeSignal {
 
     /// Record the outcome and wake the waiter (only the first call has effect).
     async fn signal(&self, outcome: ConnectOutcome) {
-        let mut guard = self.value.lock().await;
-        if guard.is_none() {
-            *guard = Some(outcome);
+        let should_notify = {
+            let mut guard = self.value.lock().await;
+            if guard.is_some() {
+                false
+            } else {
+                *guard = Some(outcome);
+                true
+            }
+        };
+        if should_notify {
             self.notify.notify_one();
         }
     }
@@ -125,8 +132,9 @@ impl OutcomeSignal {
     async fn wait(&self) -> ConnectOutcome {
         loop {
             self.notify.notified().await;
-            if let Some(o) = self.value.lock().await.clone() {
-                return o;
+            let outcome = self.value.lock().await.clone();
+            if let Some(outcome) = outcome {
+                return outcome;
             }
         }
     }
@@ -134,14 +142,42 @@ impl OutcomeSignal {
 
 // ── Measurement dispatch ──────────────────────────────────────────────────────
 
-/// Map a measurement type string to its command object.
-fn make_command(mtype: &str) -> Option<Box<dyn MeasurementCommand>> {
+enum CommandKind {
+    Ping,
+    Dns,
+    Traceroute,
+    Mtr,
+    Http,
+}
+
+impl CommandKind {
+    async fn run(&self, options: Value) -> Result<Value> {
+        match self {
+            Self::Ping => PingCommand.run(options).await,
+            Self::Dns => DnsCommand.run(options).await,
+            Self::Traceroute => TracerouteCommand.run(options).await,
+            Self::Mtr => MtrCommand.run(options).await,
+            Self::Http => HttpCommand.run(options).await,
+        }
+    }
+
+    async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+        match self {
+            Self::Ping => PingCommand.run_with_progress(options, tx).await,
+            Self::Traceroute => TracerouteCommand.run_with_progress(options, tx).await,
+            _ => self.run(options).await,
+        }
+    }
+}
+
+/// Map a measurement type string to its command implementation.
+fn make_command(mtype: &str) -> Option<CommandKind> {
     match mtype {
-        "ping" => Some(Box::new(PingCommand)),
-        "dns" => Some(Box::new(DnsCommand)),
-        "traceroute" => Some(Box::new(TracerouteCommand)),
-        "mtr" => Some(Box::new(MtrCommand)),
-        "http" => Some(Box::new(HttpCommand)),
+        "ping" => Some(CommandKind::Ping),
+        "dns" => Some(CommandKind::Dns),
+        "traceroute" => Some(CommandKind::Traceroute),
+        "mtr" => Some(CommandKind::Mtr),
+        "http" => Some(CommandKind::Http),
         _ => None,
     }
 }
@@ -154,17 +190,15 @@ fn make_command(mtype: &str) -> Option<Box<dyn MeasurementCommand>> {
 pub async fn dispatch(
     req: MeasurementRequest,
     client: Client,
-    status: Arc<Mutex<StatusManager>>,
+    status_manager: Arc<Mutex<StatusManager>>,
     limiter: MeasurementLimiter,
-    stats: Arc<MeasurementStats>,
+    measurement_stats: Arc<MeasurementStats>,
 ) {
     let mid = req.measurement_id.clone();
     let tid = req.test_id.clone();
 
     // Concurrency guard — reject if already at capacity.
-    let _slot = if let Some(s) = limiter.try_acquire() {
-        s
-    } else {
+    let Some(_slot) = limiter.try_acquire() else {
         warn!(
             "Measurement {mid} rejected — already running {} of {} max.",
             limiter.in_flight(),
@@ -173,13 +207,10 @@ pub async fn dispatch(
         return;
     };
 
-    {
-        let mgr = status.lock().await;
-        let st = mgr.get_status().to_string();
-        if st != "ready" {
-            warn!("Measurement was sent to probe with {st} status.");
-            return;
-        }
+    let current_status = status_manager.lock().await.get_status().to_string();
+    if current_status != "ready" {
+        warn!("Measurement was sent to probe with {current_status} status.");
+        return;
     }
 
     if let Err(e) = client.emit("probe:measurement:ack", json!(null)).await {
@@ -193,9 +224,7 @@ pub async fn dispatch(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let cmd = if let Some(c) = make_command(mtype) {
-        c
-    } else {
+    let Some(cmd) = make_command(mtype) else {
         let result_json = json!({ "status": "failed", "rawOutput": format!("Unknown measurement type: {mtype}") });
         client
             .emit(
@@ -216,7 +245,7 @@ pub async fn dispatch(
         .unwrap_or(false);
 
     debug!("{mtype} request {mid} received.");
-    stats.record_start();
+    measurement_stats.record_start();
 
     let measurement_fut = async {
         if in_progress {
@@ -229,18 +258,17 @@ pub async fn dispatch(
         }
     };
 
-    let run_result: Result<Value> =
-        if let Ok(r) = tokio::time::timeout(MEASUREMENT_TIMEOUT, measurement_fut).await {
-            r
-        } else {
+    let run_result: Result<Value> = tokio::time::timeout(MEASUREMENT_TIMEOUT, measurement_fut)
+        .await
+        .unwrap_or_else(|_| {
             warn!(
                 "Measurement {mid} timed out after {}s.",
                 MEASUREMENT_TIMEOUT.as_secs()
             );
             Ok(json!({ "status": "failed", "rawOutput": "Measurement timed out." }))
-        };
+        });
 
-    stats.record_finish();
+    measurement_stats.record_finish();
 
     let mut result_json = match run_result {
         Ok(v) => v,
@@ -350,249 +378,330 @@ pub async fn run_status_loop(
 
 // ── Single connection attempt ─────────────────────────────────────────────────
 
+#[derive(Clone)]
+struct ConnectionHandlers {
+    status_manager: Arc<Mutex<StatusManager>>,
+    limiter: MeasurementLimiter,
+    measurement_stats: Arc<MeasurementStats>,
+    signal: OutcomeSignal,
+    already_connected: Arc<AtomicBool>,
+}
+
+impl ConnectionHandlers {
+    fn new(status_manager: Arc<Mutex<StatusManager>>) -> Self {
+        Self {
+            status_manager,
+            limiter: MeasurementLimiter::new(),
+            measurement_stats: MeasurementStats::new(),
+            signal: OutcomeSignal::new(),
+            already_connected: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+async fn handle_open(state: ConnectionHandlers, client: Client) {
+    if state.already_connected.swap(true, Ordering::SeqCst) {
+        state.signal.signal(ConnectOutcome::Transient).await;
+        return;
+    }
+    let status = state.status_manager.lock().await.get_status().to_string();
+    client.emit("probe:status:update", json!(status)).await.ok();
+    client
+        .emit("probe:dns:update", json!(get_dns_servers()))
+        .await
+        .ok();
+    debug!("Connection to API established.");
+}
+
+async fn handle_close(state: ConnectionHandlers, payload: Payload, client: Client) {
+    let reason = extract_first_string(&payload).unwrap_or_default();
+    debug!(target: "api:error", "Disconnected from API: ({reason}).");
+    if reason == "ping timeout" || reason == "transport error" {
+        let status = {
+            let mut manager = state.status_manager.lock().await;
+            manager.report_disconnect();
+            manager.get_status().to_string()
+        };
+        client.emit("probe:status:update", json!(status)).await.ok();
+    }
+    state.signal.signal(ConnectOutcome::Transient).await;
+}
+
+async fn handle_error(state: ConnectionHandlers, payload: Payload) {
+    let (message, ip_address) = parse_connect_error(&payload);
+    let outcome = classify_error(&message);
+    if !matches!(outcome, ConnectOutcome::ServerTerminating) {
+        error!(target: "api:error", "Connection to API failed: {message}");
+    }
+    if matches!(outcome, ConnectOutcome::IpLimitOrVpn) && message.contains("ip limit") {
+        let ip = ip_address.as_deref().unwrap_or("");
+        error!(target: "api:error",
+            "Only 1 connection per IP address is allowed. Please make sure you don't have another probe running on IP {ip}.");
+    }
+    state.signal.signal(outcome).await;
+}
+
+async fn handle_location(payload: Payload, client: Client) {
+    if let Some(location) = extract_first_value(&payload) {
+        let text = |key: &str| {
+            location
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or("?")
+                .to_string()
+        };
+        let number = |key: &str| {
+            location
+                .get(key)
+                .and_then(|value| {
+                    value
+                        .as_f64()
+                        .map(|number| number.to_string())
+                        .or_else(|| value.as_str().map(str::to_string))
+                })
+                .unwrap_or_else(|| "?".to_string())
+        };
+        let asn = location
+            .get("asn")
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .map(|number| number.to_string())
+                    .or_else(|| value.as_str().map(str::to_string))
+            })
+            .unwrap_or_else(|| "?".to_string());
+        info!(
+            target: "api:connect:location",
+            "Connected from {}, {}, {} ({}, ASN: {}, lat: {} long: {}).",
+            text("city"), text("country"), text("continent"), text("network"), asn,
+            number("latitude"), number("longitude"),
+        );
+    }
+    client
+        .emit("probe:dns:update", json!(get_dns_servers()))
+        .await
+        .ok();
+}
+
+fn handle_adoption(payload: &Payload) {
+    let Some(value) = extract_first_value(payload) else {
+        return;
+    };
+    let message = value
+        .get("message")
+        .and_then(|field| field.as_str())
+        .unwrap_or("");
+    match value
+        .get("level")
+        .and_then(|field| field.as_str())
+        .unwrap_or("info")
+    {
+        "warn" => warn!(target: "api:connect:adoption", "{message}"),
+        "error" => error!(target: "api:connect:adoption", "{message}"),
+        _ => info!(target: "api:connect:adoption", "{message}"),
+    }
+}
+
+fn handle_ip(payload: &Payload, client: Client) {
+    let Some(value) = extract_first_value(payload) else {
+        return;
+    };
+    let main_ip = value
+        .get("ip")
+        .and_then(|field| field.as_str())
+        .unwrap_or("?")
+        .to_string();
+    tokio::spawn(async move {
+        crate::probe::alt_ips::refresh_alt_ips(&client, "https://api.globalping.io/v1", &main_ip)
+            .await;
+    });
+}
+
+async fn handle_proxy(state: ConnectionHandlers, payload: Payload, client: Client) {
+    let Some(value) = extract_first_value(&payload) else {
+        return;
+    };
+    let is_proxy = value
+        .get("isProxy")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let status = {
+        let mut manager = state.status_manager.lock().await;
+        manager.on_proxy_status(is_proxy);
+        manager.get_status().to_string()
+    };
+    client.emit("probe:status:update", json!(status)).await.ok();
+}
+
+fn handle_logs_transport(payload: &Payload) {
+    let Some(value) = extract_first_value(payload) else {
+        return;
+    };
+    let is_active = value.get("isActive").and_then(serde_json::Value::as_bool);
+    let send_interval = value
+        .get("sendInterval")
+        .and_then(serde_json::Value::as_u64);
+    let max_buffer = value
+        .get("maxBufferSize")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|number| usize::try_from(number).ok());
+    API_LOG_BUFFER.update(is_active, send_interval, max_buffer);
+}
+
+fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Client) {
+    let Some(data) = extract_first_value(payload) else {
+        warn!("Empty measurement payload");
+        return;
+    };
+    match serde_json::from_value::<MeasurementRequest>(data) {
+        Ok(request) => {
+            tokio::spawn(dispatch(
+                request,
+                client,
+                state.status_manager,
+                state.limiter,
+                state.measurement_stats,
+            ));
+        }
+        Err(error) => warn!("Bad measurement request: {error}"),
+    }
+}
+
+fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) -> ClientBuilder {
+    let open = state.clone();
+    let close = state.clone();
+    let error = state.clone();
+    let proxy = state.clone();
+    let measurement = state.clone();
+    builder
+        .on("open", move |_, client| {
+            let state = open.clone();
+            async move { handle_open(state, client).await }.boxed()
+        })
+        .on("close", move |payload, client| {
+            let state = close.clone();
+            async move { handle_close(state, payload, client).await }.boxed()
+        })
+        .on("error", move |payload, _| {
+            let state = error.clone();
+            async move { handle_error(state, payload).await }.boxed()
+        })
+        .on("probe:sigkill", |_, _| {
+            async move {
+                info!("Probe restart requested by the API. Exiting...");
+                std::process::exit(0);
+            }
+            .boxed()
+        })
+        .on("api:connect:location", |payload, client| {
+            async move { handle_location(payload, client).await }.boxed()
+        })
+        .on("api:connect:adoption", |payload, _| {
+            async move { handle_adoption(&payload) }.boxed()
+        })
+        .on("api:connect:ip", |payload, client| {
+            async move { handle_ip(&payload, client) }.boxed()
+        })
+        .on("api:connect:isProxy", move |payload, client| {
+            let state = proxy.clone();
+            async move { handle_proxy(state, payload, client).await }.boxed()
+        })
+        .on("api:logs-transport:set", |payload, _| {
+            async move { handle_logs_transport(&payload) }.boxed()
+        })
+        .on("probe:measurement:request", move |payload, client| {
+            let state = measurement.clone();
+            async move { handle_measurement(state, &payload, client) }.boxed()
+        })
+}
+
+struct ConnectionTasks {
+    health: tokio::task::JoinHandle<()>,
+    metrics: tokio::task::JoinHandle<()>,
+    logs: tokio::task::JoinHandle<()>,
+}
+
+impl ConnectionTasks {
+    fn spawn(state: &ConnectionHandlers, socket: &Client, ping_target: &str) -> Self {
+        Self {
+            health: tokio::spawn(run_status_loop(
+                Arc::clone(&state.status_manager),
+                socket.clone(),
+                ping_target.to_string(),
+            )),
+            metrics: tokio::spawn(run_stats_loop(
+                Arc::clone(&state.measurement_stats),
+                socket.clone(),
+            )),
+            logs: tokio::spawn(run_logs_loop(socket.clone())),
+        }
+    }
+
+    fn abort(self) {
+        self.health.abort();
+        self.metrics.abort();
+        self.logs.abort();
+    }
+}
+
+async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client) {
+    state.status_manager.lock().await.set_sigterm();
+    socket
+        .emit("probe:status:update", json!("sigterm"))
+        .await
+        .ok();
+    if state.limiter.in_flight() > 0
+        && tokio::time::timeout(DRAIN_TIMEOUT, state.limiter.wait_idle())
+            .await
+            .is_err()
+    {
+        warn!("SIGTERM timeout. Force closing.");
+    }
+}
+
 /// Connect once, run until shutdown or disconnect.
 /// Returns `(outcome, was_connected)` — `was_connected` is true if the socket.io
 /// `connect` event fired at least once, meaning the session was real (not just a
-/// handshake failure).  The caller uses this to decide whether to reset backoff.
+/// handshake failure). The caller uses this to decide whether to reset backoff.
 async fn connect_once(
     cfg: &ClientConfig,
-    status: Arc<Mutex<StatusManager>>,
+    status_manager: Arc<Mutex<StatusManager>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> (ConnectOutcome, bool) {
-    let url = connection_url(cfg);
-
-    let limiter = MeasurementLimiter::new();
-    let limiter_drain = limiter.clone(); // kept in connect_once for graceful drain
-    let stats = MeasurementStats::new();
-    let signal = OutcomeSignal::new();
-    let s_error = signal.clone();
-    let s_disco = signal.clone();
-    let s_conn_signal = signal.clone();
-    let s_proxy = Arc::clone(&status);
-    let s_conn = Arc::clone(&status);
-    let s_meas = Arc::clone(&status);
-    let s_stats = Arc::clone(&stats);
-    let s_disco_status = Arc::clone(&status);
-    // Tracks whether we've already had one successful connect event.
-    // rust-socketio 0.5 reconnects internally on transport close without firing
-    // `disconnect`, so we detect the reconnect via a second `connect` event and
-    // hand control back to our outer reconnect loop.
-    let already_connected = Arc::new(AtomicBool::new(false));
-    let ac_reader = Arc::clone(&already_connected); // kept to read was_connected after closure moves the Arc
-
-    let socket = match ClientBuilder::new(url)
+    let state = ConnectionHandlers::new(status_manager);
+    let connected_reader = Arc::clone(&state.already_connected);
+    let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
-        .namespace("/probes")
-
-        .on("open", move |_, client: Client| {
-            let status = Arc::clone(&s_conn);
-            let signal = s_conn_signal.clone();
-            let ac     = Arc::clone(&already_connected);
-            async move {
-                if ac.swap(true, Ordering::SeqCst) {
-                    signal.signal(ConnectOutcome::Transient).await;
-                    return;
-                }
-                let st = status.lock().await.get_status().to_string();
-                client.emit("probe:status:update", json!(st)).await.ok();
-                client.emit("probe:dns:update", json!(get_dns_servers())).await.ok();
-                debug!("Connection to API established.");
-            }.boxed()
-        })
-
-        .on("close", move |payload: Payload, client: Client| {
-            let signal = s_disco.clone();
-            let status = Arc::clone(&s_disco_status);
-            async move {
-                let reason = extract_first_string(&payload).unwrap_or_default();
-                debug!(target: "api:error", "Disconnected from API: ({reason}).");
-
-                // Only count problematic disconnects (mirrors Node.js error handler).
-                // "io server disconnect" = normal server restart, not a network problem.
-                if reason == "ping timeout" || reason == "transport error" {
-                    let st = {
-                        let mut mgr = status.lock().await;
-                        mgr.report_disconnect();
-                        mgr.get_status().to_string()
-                    };
-                    client.emit("probe:status:update", json!(st)).await.ok();
-                }
-
-                signal.signal(ConnectOutcome::Transient).await;
-            }.boxed()
-        })
-
-        .on("error", move |payload: Payload, _| {
-            let signal = s_error.clone();
-            async move {
-                // rust-socketio wraps connect errors as JSON: {"message":"Received an ConnectError frame: {...}"}
-                // Extract the inner message and optional ipAddress to match Node.js log format.
-                let (message, ip_address) = parse_connect_error(&payload);
-                let outcome = classify_error(&message);
-                // Node.js only logs "Connection to API failed" for non-terminating errors.
-                if !matches!(outcome, ConnectOutcome::ServerTerminating) {
-                    error!(target: "api:error", "Connection to API failed: {message}");
-                }
-                // For ip limit: log the extra "Only 1 connection per IP" message (mirrors Node.js).
-                if matches!(outcome, ConnectOutcome::IpLimitOrVpn) && message.contains("ip limit") {
-                    let ip = ip_address.as_deref().unwrap_or("");
-                    error!(target: "api:error",
-                        "Only 1 connection per IP address is allowed. Please make sure you don't have another probe running on IP {ip}.");
-                }
-                signal.signal(outcome).await;
-            }.boxed()
-        })
-
-        .on("probe:sigkill", |_, _| async move {
-            info!("Probe restart requested by the API. Exiting...");
-            std::process::exit(0);
-        }.boxed())
-
-        .on("api:connect:location", |payload: Payload, client: Client| async move {
-            if let Some(loc) = extract_first_value(&payload) {
-                let str_field = |key: &str| {
-                    loc.get(key).and_then(|v| v.as_str()).unwrap_or("?").to_string()
-                };
-                let num_field = |key: &str| {
-                    loc.get(key)
-                        .and_then(|v| v.as_f64().map(|n| n.to_string())
-                            .or_else(|| v.as_str().map(str::to_string)))
-                        .unwrap_or_else(|| "?".to_string())
-                };
-                let asn = loc.get("asn")
-                    .and_then(|v| v.as_u64().map(|n| n.to_string())
-                        .or_else(|| v.as_str().map(str::to_string)))
-                    .unwrap_or_else(|| "?".to_string());
-                info!(
-                    target: "api:connect:location",
-                    "Connected from {}, {}, {} ({}, ASN: {}, lat: {} long: {}).",
-                    str_field("city"), str_field("country"), str_field("continent"),
-                    str_field("network"), asn,
-                    num_field("latitude"), num_field("longitude"),
-                );
-            }
-            client.emit("probe:dns:update", json!(get_dns_servers())).await.ok();
-        }.boxed())
-
-        .on("api:connect:adoption", |payload: Payload, _| async move {
-            if let Some(v) = extract_first_value(&payload) {
-                let message = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                let level   = v.get("level").and_then(|l| l.as_str()).unwrap_or("info");
-                match level {
-                    "warn"  => warn!(target: "api:connect:adoption", "{message}"),
-                    "error" => error!(target: "api:connect:adoption", "{message}"),
-                    _       => info!(target: "api:connect:adoption", "{message}"),
-                }
-            }
-        }.boxed())
-
-        .on("api:connect:ip", |payload: Payload, client: Client| async move {
-            if let Some(v) = extract_first_value(&payload) {
-                let main_ip = v.get("ip").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                // Spawn so this 15-second wait doesn't block the socket.io event queue.
-                // Subsequent events (location, adoption, measurements) must process immediately.
-                tokio::spawn(async move {
-                    crate::probe::alt_ips::refresh_alt_ips(
-                        &client,
-                        "https://api.globalping.io/v1",
-                        &main_ip,
-                    ).await;
-                });
-            }
-        }.boxed())
-
-        .on("api:connect:isProxy", move |payload: Payload, client: Client| {
-            let status = Arc::clone(&s_proxy);
-            async move {
-                if let Some(v) = extract_first_value(&payload) {
-                    let is_proxy = v.get("isProxy").and_then(serde_json::Value::as_bool).unwrap_or(false);
-                    let mut mgr = status.lock().await;
-                    mgr.on_proxy_status(is_proxy);
-                    let st = mgr.get_status().to_string();
-                    drop(mgr);
-                    client.emit("probe:status:update", json!(st)).await.ok();
-                }
-            }.boxed()
-        })
-
-        .on("api:logs-transport:set", |payload: Payload, _| async move {
-            if let Some(v) = extract_first_value(&payload) {
-                let is_active     = v.get("isActive").and_then(serde_json::Value::as_bool);
-                let send_interval = v.get("sendInterval").and_then(serde_json::Value::as_u64);
-                let max_buffer    = v.get("maxBufferSize").and_then(serde_json::Value::as_u64).map(|n| n as usize);
-                API_LOG_BUFFER.update(is_active, send_interval, max_buffer);
-            }
-        }.boxed())
-
-        .on("probe:measurement:request", move |payload: Payload, client: Client| {
-            let status  = Arc::clone(&s_meas);
-            let limiter = limiter.clone();
-            let stats   = Arc::clone(&s_stats);
-            async move {
-                let data = if let Some(v) = extract_first_value(&payload) { v } else { warn!("Empty measurement payload"); return; };
-                match serde_json::from_value::<MeasurementRequest>(data) {
-                    Ok(req)  => { tokio::spawn(dispatch(req, client, status, limiter, stats)); }
-                    Err(e)   => warn!("Bad measurement request: {e}"),
-                }
-            }.boxed()
-        })
-
-        .connect()
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            error!(target: "api:error", "Connection to API failed: {e}");
+        .namespace("/probes");
+    let socket = match register_socket_handlers(builder, &state).connect().await {
+        Ok(socket) => socket,
+        Err(error) => {
+            error!(target: "api:error", "Connection to API failed: {error}");
             return (ConnectOutcome::Transient, false);
         }
     };
 
-    // Background loops — aborted when we leave this function.
-    let status_handle = tokio::spawn(run_status_loop(
-        Arc::clone(&status),
-        socket.clone(),
-        cfg.ping_target.clone(),
-    ));
-    let stats_handle = tokio::spawn(run_stats_loop(Arc::clone(&stats), socket.clone()));
-    let logs_handle = tokio::spawn(run_logs_loop(socket.clone()));
-
-    // Wait for: clean shutdown signal  OR  disconnect/error outcome from handlers.
+    let tasks = ConnectionTasks::spawn(&state, &socket, &cfg.ping_target);
     let outcome = tokio::select! {
-        _ = shutdown_rx.changed() => {
-            ConnectOutcome::CleanShutdown
-        }
-        o = signal.wait() => o,
+        _ = shutdown_rx.changed() => ConnectOutcome::CleanShutdown,
+        outcome = state.signal.wait() => outcome,
     };
-
-    status_handle.abort();
-    stats_handle.abort();
-    logs_handle.abort();
+    tasks.abort();
 
     if matches!(outcome, ConnectOutcome::CleanShutdown) {
-        status.lock().await.set_sigterm();
-        socket
-            .emit("probe:status:update", json!("sigterm"))
-            .await
-            .ok();
-
-        let in_flight = limiter_drain.in_flight();
-        if in_flight > 0
-            && tokio::time::timeout(DRAIN_TIMEOUT, limiter_drain.wait_idle())
-                .await
-                .is_err()
-        {
-            warn!("SIGTERM timeout. Force closing.");
-        }
+        graceful_shutdown(&state, &socket).await;
     }
     socket.disconnect().await.ok();
-
-    let was_connected = ac_reader.load(Ordering::SeqCst);
+    let was_connected = connected_reader.load(Ordering::SeqCst);
     (outcome, was_connected)
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 /// Connect to the Globalping API and run with automatic reconnection until shutdown.
+///
+/// # Errors
+/// Returns an error if process-signal setup or a fatal client operation fails.
 pub async fn run(cfg: ClientConfig) -> Result<()> {
     let status = Arc::new(Mutex::new(StatusManager::with_api_host(&cfg.ping_target)));
 

@@ -103,7 +103,6 @@ fn empty_and_no_header_return_failed() {
 
 #[cfg(target_os = "linux")]
 mod live {
-    use globalping_probe::command::MeasurementCommand;
     use globalping_probe::command::ping::PingCommand;
     use globalping_probe::command::ping::parse::PingStatus;
 

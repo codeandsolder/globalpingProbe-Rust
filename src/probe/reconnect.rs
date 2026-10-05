@@ -42,12 +42,11 @@ pub fn reconnect_delay(
     backoff: &mut ExponentialBackoff,
 ) -> Option<Duration> {
     match outcome {
-        ConnectOutcome::CleanShutdown => None,
-        ConnectOutcome::InvalidVersion => None,
+        ConnectOutcome::CleanShutdown | ConnectOutcome::InvalidVersion => None,
         ConnectOutcome::IpLimitOrVpn => Some(Duration::from_hours(1)),
         ConnectOutcome::MetadataError => Some(Duration::from_secs(60)),
         ConnectOutcome::ServerTerminating => Some(Duration::ZERO),
-        ConnectOutcome::Transient => Some(backoff.next()),
+        ConnectOutcome::Transient => Some(backoff.next_delay()),
     }
 }
 
@@ -71,7 +70,7 @@ impl ExponentialBackoff {
     }
 
     /// Return the current delay and double it for next time.
-    pub fn next(&mut self) -> Duration {
+    pub fn next_delay(&mut self) -> Duration {
         let d = self.current;
         self.current = (self.current * 2).min(self.max);
         d
@@ -225,28 +224,28 @@ mod tests {
     #[test]
     fn backoff_doubles_each_call() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        assert_eq!(bo.next(), Duration::from_secs(1));
-        assert_eq!(bo.next(), Duration::from_secs(2));
-        assert_eq!(bo.next(), Duration::from_secs(4));
-        assert_eq!(bo.next(), Duration::from_secs(8));
+        assert_eq!(bo.next_delay(), Duration::from_secs(1));
+        assert_eq!(bo.next_delay(), Duration::from_secs(2));
+        assert_eq!(bo.next_delay(), Duration::from_secs(4));
+        assert_eq!(bo.next_delay(), Duration::from_secs(8));
     }
 
     #[test]
     fn backoff_clamps_at_max() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(128), Duration::from_secs(300));
-        bo.next(); // 128
-        bo.next(); // 256
-        bo.next(); // would be 512, clamped to 300
-        assert_eq!(bo.next(), Duration::from_secs(300));
+        bo.next_delay(); // 128
+        bo.next_delay(); // 256
+        bo.next_delay(); // would be 512, clamped to 300
+        assert_eq!(bo.next_delay(), Duration::from_secs(300));
     }
 
     #[test]
     fn backoff_resets_to_min() {
         let mut bo = ExponentialBackoff::new(Duration::from_secs(1), Duration::from_secs(300));
-        bo.next();
-        bo.next();
-        bo.next(); // advance a few times
+        bo.next_delay();
+        bo.next_delay();
+        bo.next_delay(); // advance a few times
         bo.reset();
-        assert_eq!(bo.next(), Duration::from_secs(1));
+        assert_eq!(bo.next_delay(), Duration::from_secs(1));
     }
 }

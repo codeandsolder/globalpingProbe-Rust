@@ -60,7 +60,7 @@ pub async fn tcp_ping(
 
 pub fn compute_tcp_stats(probes: &[TcpPingProbe], total: u8) -> TcpPingStats {
     let rtts: Vec<f64> = probes.iter().filter_map(|p| p.rtt_ms).collect();
-    let rcv = rtts.len() as u32;
+    let rcv = u32::try_from(rtts.len()).unwrap_or(u32::MAX);
     let drop = u32::from(total) - rcv;
     let loss = if total > 0 {
         (f64::from(drop) / f64::from(total)) * 100.0
@@ -83,9 +83,10 @@ pub fn compute_tcp_stats(probes: &[TcpPingProbe], total: u8) -> TcpPingStats {
 
     let min = rtts.iter().copied().fold(f64::INFINITY, f64::min);
     let max = rtts.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let avg = rtts.iter().sum::<f64>() / rtts.len() as f64;
+    let sample_count = f64::from(rcv);
+    let avg = rtts.iter().sum::<f64>() / sample_count;
     let tsum2: f64 = rtts.iter().map(|r| r * r).sum();
-    let mdev = avg.mul_add(-avg, tsum2 / rtts.len() as f64).max(0.0).sqrt();
+    let mdev = avg.mul_add(-avg, tsum2 / sample_count).max(0.0).sqrt();
 
     TcpPingStats {
         min: Some(min),

@@ -1,6 +1,10 @@
 // Splits a stream of bytes into complete lines, mirroring src/lib/by-line.ts
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
+/// Read `reader` line by line and invoke `on_line` for each complete line.
+///
+/// # Errors
+/// Returns an error if the underlying asynchronous reader fails.
 pub async fn by_line<R, F>(reader: R, mut on_line: F) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,

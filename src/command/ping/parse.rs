@@ -1,5 +1,6 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 // ── Output types ────────────────────────────────────────────────────────────
 
@@ -40,37 +41,41 @@ pub struct ParsedPing {
 
 // ── Regex patterns (compiled once) ──────────────────────────────────────────
 
+fn compile_regex(pattern: &str) -> Option<Regex> {
+    Regex::new(pattern).ok()
+}
+
 // Matches: PING <host> (<addr>)   or   PING <host>(<ipv6-host> (<addr>))
-static HEADER_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"^PING\s([^()\s]*?)\s?\((?:[^()\s]+\s?\()?([^()\s]+?)\)").unwrap()
-});
+static HEADER_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"^PING\s([^()\s]*?)\s?\((?:[^()\s]+\s?\()?([^()\s]+?)\)"));
 
 // Matches:  64 bytes from <host> [(<ip>)]: [icmp_]seq=N ttl=T time=X ms
-static PACKET_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"^\d+ bytes from (.*?)(?:\s\([^)]*\))?: (?:icmp_)?seq=\d+ ttl=(\d+) time=(\d*(?:\.\d+)?) ms").unwrap()
+static PACKET_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(
+        r"^\d+ bytes from (.*?)(?:\s\([^)]*\))?: (?:icmp_)?seq=\d+ ttl=(\d+) time=(\d*(?:\.\d+)?) ms",
+    )
 });
 
 // Captures the hostname from the first reply line: "from <host> (" or "from <host>: "
-static HOSTNAME_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"from\s(.*?)(?:\s\(|:\s)").unwrap());
+static HOSTNAME_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"from\s(.*?)(?:\s\(|:\s)"));
 
-static STATS_HEADER_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"^---\s.*\sstatistics ---").unwrap());
+static STATS_HEADER_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"^---\s.*\sstatistics ---"));
 
 // rtt min/avg/max/mdev = X/Y/Z/W ms   or   round-trip min/avg/max = X/Y/Z ms
-static RTT_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
-    Regex::new(r"^(?:round-trip|rtt)\s.*\s=\s(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)")
-        .unwrap()
+static RTT_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
+    compile_regex(r"^(?:round-trip|rtt)\s.*\s=\s(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)\/(\d*(?:\.\d+)?)")
 });
 
-static TRANSMITTED_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"\b(\d+)\spackets\stransmitted").unwrap());
+static TRANSMITTED_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"\b(\d+)\spackets\stransmitted"));
 
-static RCV_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"\b(\d+)\s(?:received|packets received)").unwrap());
+static RCV_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"\b(\d+)\s(?:received|packets received)"));
 
-static LOSS_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"\b(\d*(?:\.\d+)?)%\spacket\sloss").unwrap());
+static LOSS_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"\b(\d*(?:\.\d+)?)%\spacket\sloss"));
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -90,9 +95,8 @@ pub fn parse(raw_output: &str) -> ParsedPing {
         return failed(raw_output);
     }
 
-    let header_caps = match HEADER_RE.captures(lines[0]) {
-        Some(c) => c,
-        None => return failed(raw_output),
+    let Some(header_caps) = HEADER_RE.as_ref().and_then(|re| re.captures(lines[0])) else {
+        return failed(raw_output);
     };
 
     let resolved_address = header_caps.get(2).map(|m| m.as_str().to_string());
@@ -100,7 +104,7 @@ pub fn parse(raw_output: &str) -> ParsedPing {
     // Hostname comes from the first reply line, not the header
     let resolved_hostname = lines
         .get(1)
-        .and_then(|l| HOSTNAME_RE.captures(l))
+        .and_then(|l| HOSTNAME_RE.as_ref().and_then(|re| re.captures(l)))
         .and_then(|c| c.get(1))
         .map(|m| m.as_str().to_string())
         .unwrap_or_default();
@@ -111,7 +115,9 @@ pub fn parse(raw_output: &str) -> ParsedPing {
         .filter_map(|l| parse_packet_line(l))
         .collect();
 
-    let stats_idx = lines.iter().position(|l| STATS_HEADER_RE.is_match(l));
+    let stats_idx = lines
+        .iter()
+        .position(|l| STATS_HEADER_RE.as_ref().is_some_and(|re| re.is_match(l)));
     let stats = stats_idx
         .map(|i| parse_summary(&lines[i + 1..]))
         .unwrap_or_default();
@@ -129,7 +135,7 @@ pub fn parse(raw_output: &str) -> ParsedPing {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn parse_packet_line(line: &str) -> Option<PingTiming> {
-    let caps = PACKET_RE.captures(line)?;
+    let caps = PACKET_RE.as_ref()?.captures(line)?;
     let ttl = caps.get(2)?.as_str().parse::<u32>().ok()?;
     let rtt = caps.get(3)?.as_str().parse::<f64>().ok()?;
     Some(PingTiming { rtt, ttl })
@@ -140,17 +146,20 @@ fn parse_summary(lines: &[&str]) -> PingStats {
 
     if let Some(&packets_line) = lines.first() {
         stats.total = TRANSMITTED_RE
-            .captures(packets_line)
+            .as_ref()
+            .and_then(|re| re.captures(packets_line))
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse().ok());
 
         stats.rcv = RCV_RE
-            .captures(packets_line)
+            .as_ref()
+            .and_then(|re| re.captures(packets_line))
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse().ok());
 
         stats.loss = LOSS_RE
-            .captures(packets_line)
+            .as_ref()
+            .and_then(|re| re.captures(packets_line))
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse().ok());
 
@@ -161,7 +170,7 @@ fn parse_summary(lines: &[&str]) -> PingStats {
     }
 
     if let Some(&rtt_line) = lines.get(1)
-        && let Some(caps) = RTT_RE.captures(rtt_line)
+        && let Some(caps) = RTT_RE.as_ref().and_then(|re| re.captures(rtt_line))
     {
         stats.min = caps.get(1).and_then(|m| m.as_str().parse().ok());
         // Order in the string: min/avg/max/mdev — we capture min(1), avg(2), max(3)

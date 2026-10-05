@@ -67,7 +67,7 @@ pub mod parse {
         pub resolved_address: Option<String>,
         #[serde(skip)]
         pub http_version: Option<String>,
-        /// Lowercased header name → string or vec<string> if duplicate
+        /// Lowercased header name → string or `Vec<String>` if duplicate
         pub headers: HashMap<String, serde_json::Value>,
         pub raw_headers: Option<String>,
         pub raw_body: Option<String>,
@@ -162,7 +162,7 @@ pub mod parse {
                 .enumerate()
                 .map(|(i, (k, v))| (i, pair_min_size(k, v)))
                 .collect();
-            indexed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            indexed.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
 
             let mut dropped = std::collections::HashSet::new();
             for (i, min) in &indexed {
@@ -571,7 +571,6 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::time::{Duration, Instant, timeout};
 
-use super::MeasurementCommand;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::{is_safe_host, is_safe_url_component};
 use parse::{
@@ -716,7 +715,7 @@ async fn resolve_target(
     )
     .await
     .map_err(|_| anyhow::anyhow!("DNS resolution timed out for {target}"))??;
-    let dns_ms = start.elapsed().as_millis() as u64;
+    let dns_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let ip = stdout
@@ -842,13 +841,13 @@ fn build_curl_args(
     // Force connection to pre-resolved IP (bypasses curl's DNS)
     if opts.target.parse::<std::net::IpAddr>().is_err() {
         args.push("--resolve".into());
-        let resolve_ip = if resolved_ip.contains(':') {
+        let connection_ip = if resolved_ip.contains(':') {
             // IPv6: curl needs brackets in --resolve
             format!("[{resolved_ip}]")
         } else {
             resolved_ip.to_string()
         };
-        args.push(format!("{}:{}:{}", opts.target, port, resolve_ip));
+        args.push(format!("{}:{}:{}", opts.target, port, connection_ip));
     }
 
     args.push(url.to_string());
@@ -887,8 +886,8 @@ async fn run_capturing(
 
 /// Extract the first PEM certificate block (inclusive of BEGIN/END markers).
 fn extract_pem(s: &str) -> Option<String> {
-    let begin = s.find("-----BEGIN CERTIFICATE-----")?;
     const END: &str = "-----END CERTIFICATE-----";
+    let begin = s.find("-----BEGIN CERTIFICATE-----")?;
     let end = s[begin..].find(END)? + begin + END.len();
     Some(s[begin..end].to_string())
 }
@@ -1028,179 +1027,208 @@ async fn enrich_tls(tls: &mut TlsInfo, ip: &str, port: u16, servername: &str) {
 
 const BODY_LIMIT: usize = 10_000;
 
-async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
-    validate(opts)?;
+fn rounded_millis(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    let Ok(duration) = Duration::try_from_secs_f64(seconds) else {
+        return u64::MAX;
+    };
+    let millis = duration.as_nanos().saturating_add(500_000) / 1_000_000;
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
 
-    let proto = opts.protocol.to_uppercase();
-    let is_https = proto != "HTTP";
-    let port = opts.port.unwrap_or(if proto == "HTTP" { 80 } else { 443 });
+struct CurlCapture {
+    stats: String,
+    verbose: String,
+    raw_headers: String,
+    raw_body: Vec<u8>,
+}
 
-    // Pre-resolve target hostname; check for private IPs
-    let (resolved_ip, dns_ms) =
-        resolve_target(&opts.target, opts.resolver.as_deref(), opts.ip_version).await?;
+async fn remove_curl_files(headers_path: &str, body_path: &str) {
+    let _ = fs::remove_file(headers_path).await;
+    let _ = fs::remove_file(body_path).await;
+}
 
-    let url = build_url(opts, port);
-
-    // Temp files for headers and body
+async fn execute_curl(
+    opts: &HttpOptions,
+    url: &str,
+    port: u16,
+    resolved_ip: &str,
+) -> Result<CurlCapture> {
     let id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let headers_path = format!("/tmp/gp_hdr_{id}.txt");
     let body_path = format!("/tmp/gp_body_{id}.txt");
-
-    let args = build_curl_args(opts, &url, port, &resolved_ip, &headers_path, &body_path);
+    let args = build_curl_args(opts, url, port, resolved_ip, &headers_path, &body_path);
 
     let curl_result = timeout(
         Duration::from_secs(15),
         Command::new("curl").args(&args).output(),
     )
     .await;
-
-    let curl_out = match curl_result {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            let _ = fs::remove_file(&headers_path).await;
-            let _ = fs::remove_file(&body_path).await;
-            bail!("curl failed to spawn: {e}");
+    let curl_output = match curl_result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            remove_curl_files(&headers_path, &body_path).await;
+            bail!("curl failed to spawn: {error}");
         }
         Err(_) => {
-            let _ = fs::remove_file(&headers_path).await;
-            let _ = fs::remove_file(&body_path).await;
+            remove_curl_files(&headers_path, &body_path).await;
             bail!("curl timed out");
         }
     };
 
-    let stats_str = String::from_utf8_lossy(&curl_out.stdout).trim().to_string();
-    let verbose = String::from_utf8_lossy(&curl_out.stderr).to_string();
-
-    // Read temp files then clean up
-    let raw_headers_file = fs::read_to_string(&headers_path).await.unwrap_or_default();
-    // Bound the body we pull into memory; it's truncated to BODY_LIMIT below anyway.
-    let raw_body_bytes = read_capped(&body_path, BODY_LIMIT).await;
-    let _ = fs::remove_file(&headers_path).await;
-    let _ = fs::remove_file(&body_path).await;
-
-    // If curl stats are missing/malformed, it's a hard failure
-    let stats: CurlStats = if let Ok(s) = serde_json::from_str(&stats_str) {
-        s
-    } else {
-        // Extract error message from curl stderr
-        let err_msg = verbose
-            .lines()
-            .find(|l| l.contains("curl:") || l.contains("error") || l.starts_with("* "))
-            .map_or_else(
-                || "HTTP request failed".to_string(),
-                |l| l.trim_start_matches("* ").trim().to_string(),
-            );
-        return Ok(failed_result(err_msg));
+    let capture = CurlCapture {
+        stats: String::from_utf8_lossy(&curl_output.stdout)
+            .trim()
+            .to_string(),
+        verbose: String::from_utf8_lossy(&curl_output.stderr).to_string(),
+        raw_headers: fs::read_to_string(&headers_path).await.unwrap_or_default(),
+        raw_body: read_capped(&body_path, BODY_LIMIT).await,
     };
+    remove_curl_files(&headers_path, &body_path).await;
+    Ok(capture)
+}
 
+fn curl_failure_message(verbose: &str, prefer_last: bool) -> String {
+    let candidate =
+        |line: &&str| line.contains("curl:") || line.contains("error") || line.starts_with("* ");
+    let mut lines = verbose.lines();
+    let line = if prefer_last {
+        lines.rfind(candidate)
+    } else {
+        lines.find(candidate)
+    };
+    line.map_or_else(
+        || "HTTP request failed".to_string(),
+        |value| value.trim_start_matches("* ").trim().to_string(),
+    )
+}
+
+fn parse_curl_stats(capture: &CurlCapture) -> std::result::Result<CurlStats, String> {
+    let stats: CurlStats = serde_json::from_str(&capture.stats)
+        .map_err(|_| curl_failure_message(&capture.verbose, false))?;
     if stats.response_code == 0 {
-        let err = verbose
-            .lines()
-            .rfind(|l| l.starts_with("* ") || l.contains("error"))
-            .map_or_else(
-                || "HTTP request failed".to_string(),
-                |l| l.trim_start_matches("* ").trim().to_string(),
-            );
-        return Ok(failed_result(err));
+        return Err(curl_failure_message(&capture.verbose, true));
     }
+    Ok(stats)
+}
 
-    // Resolved address (curl may override if --resolve was used)
-    let final_resolved_ip = if stats.remote_ip.is_empty() {
-        resolved_ip.clone()
+fn truncate_body(raw_body: &[u8]) -> (String, bool) {
+    if raw_body.len() > BODY_LIMIT {
+        (
+            String::from_utf8_lossy(&raw_body[..BODY_LIMIT]).to_string(),
+            true,
+        )
     } else {
-        stats.remote_ip.clone()
-    };
-
-    // Post-resolution private IP check
-    if let Ok(ip) = final_resolved_ip.parse()
-        && is_ip_private(ip)
-    {
-        return Ok(failed_result("Private IP ranges are not allowed.".into()));
+        (String::from_utf8_lossy(raw_body).to_string(), false)
     }
+}
 
-    // Parse headers file
-    let header_pairs_raw = parse_header_file(&raw_headers_file);
-    let status_text = parse_status_text(&raw_headers_file);
-    let truncate_res = truncate_headers(header_pairs_raw);
-    let headers_map = dedup_headers(&truncate_res.headers);
-    let raw_headers_str = truncate_res
-        .headers
-        .iter()
-        .map(|(k, v)| format!("{k}: {v}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Body: limit to BODY_LIMIT bytes
-    let (raw_body, body_truncated) = if raw_body_bytes.len() > BODY_LIMIT {
-        let truncated = String::from_utf8_lossy(&raw_body_bytes[..BODY_LIMIT]).to_string();
-        (truncated, true)
-    } else {
-        (String::from_utf8_lossy(&raw_body_bytes).to_string(), false)
-    };
-    let truncated = truncate_res.truncated || body_truncated;
-
-    // HTTP version from curl stats
-    let http_version = match stats.http_version.as_str() {
+fn normalize_http_version(version: &str) -> Option<String> {
+    match version {
         "2" | "2.0" => Some("2".to_string()),
         "1.0" => Some("1.0".to_string()),
         "1.1" => Some("1.1".to_string()),
-        v if !v.is_empty() => Some(v.to_string()),
+        value if !value.is_empty() => Some(value.to_string()),
         _ => None,
-    };
-
-    // TLS info
-    let mut tls: Option<TlsInfo> = if is_https {
-        parse_tls_verbose(&verbose, stats.ssl_verify_result)
-    } else {
-        None
-    };
-
-    // Enrich TLS with fields curl -v doesn't expose (fingerprint256, serial, etc.)
-    if let Some(ref mut t) = tls {
-        let sni = opts.request.host.as_deref().unwrap_or(&opts.target);
-        enrich_tls(t, &final_resolved_ip, port, sni).await;
     }
+}
 
-    // Timings: curl reports cumulative seconds from start; convert to incremental ms
-    // When --resolve is used, time_namelookup is near 0 (DNS was pre-done by us)
-    let t_dns = dns_ms; // our measured DNS time (None if target was an IP)
-    let t_lookup = (stats.time_namelookup * 1000.0).round() as u64;
-    let t_tcp = ((stats.time_connect - stats.time_namelookup) * 1000.0).round() as u64;
-    let t_tls = if is_https {
-        let v = ((stats.time_appconnect - stats.time_connect) * 1000.0).round() as u64;
-        Some(v)
-    } else {
-        None
-    };
+fn build_http_timings(stats: &CurlStats, dns_ms: Option<u64>, is_https: bool) -> HttpTimings {
+    let lookup = rounded_millis(stats.time_namelookup);
+    let tcp = rounded_millis(stats.time_connect - stats.time_namelookup);
+    let tls = is_https.then(|| rounded_millis(stats.time_appconnect - stats.time_connect));
     let app_connect = if is_https {
         stats.time_appconnect
     } else {
         stats.time_connect
     };
-    let t_first = ((stats.time_starttransfer - app_connect) * 1000.0).round() as u64;
-    let t_download = ((stats.time_total - stats.time_starttransfer) * 1000.0).round() as u64;
-    // Total = our DNS time + curl total
-    let t_total = t_dns.unwrap_or(0) + (stats.time_total * 1000.0).round() as u64;
+    let first_byte = rounded_millis(stats.time_starttransfer - app_connect);
+    let download = rounded_millis(stats.time_total - stats.time_starttransfer);
+    let total = dns_ms
+        .unwrap_or(0)
+        .saturating_add(rounded_millis(stats.time_total));
+    HttpTimings {
+        total: Some(total),
+        dns: dns_ms,
+        tcp: Some(tcp + lookup),
+        tls,
+        first_byte: Some(first_byte),
+        download: Some(download),
+    }
+}
 
-    let timings = HttpTimings {
-        total: Some(t_total),
-        dns: t_dns,
-        tcp: Some(t_tcp + t_lookup), // include curl's namelookup if target was an IP
-        tls: t_tls,
-        first_byte: Some(t_first),
-        download: Some(t_download),
+async fn build_tls_info(
+    opts: &HttpOptions,
+    stats: &CurlStats,
+    final_resolved_ip: &str,
+    port: u16,
+    is_https: bool,
+    verbose: &str,
+) -> Option<TlsInfo> {
+    if !is_https {
+        return None;
+    }
+    let mut tls = parse_tls_verbose(verbose, stats.ssl_verify_result)?;
+    let server_name = opts.request.host.as_deref().unwrap_or(&opts.target);
+    enrich_tls(&mut tls, final_resolved_ip, port, server_name).await;
+    Some(tls)
+}
+
+async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
+    validate(opts)?;
+    let protocol = opts.protocol.to_uppercase();
+    let is_https = protocol != "HTTP";
+    let port = opts
+        .port
+        .unwrap_or(if protocol == "HTTP" { 80 } else { 443 });
+    let (resolved_ip, dns_ms) =
+        resolve_target(&opts.target, opts.resolver.as_deref(), opts.ip_version).await?;
+    let url = build_url(opts, port);
+    let capture = execute_curl(opts, &url, port, &resolved_ip).await?;
+    let stats = match parse_curl_stats(&capture) {
+        Ok(stats) => stats,
+        Err(message) => return Ok(failed_result(message)),
     };
 
-    let raw_body_opt = if raw_body.is_empty() {
-        None
+    let final_resolved_ip = if stats.remote_ip.is_empty() {
+        resolved_ip
     } else {
-        Some(raw_body.clone())
+        stats.remote_ip.clone()
     };
+    if final_resolved_ip.parse().is_ok_and(is_ip_private) {
+        return Ok(failed_result("Private IP ranges are not allowed.".into()));
+    }
+
+    let status_text = parse_status_text(&capture.raw_headers);
+    let truncate_result = truncate_headers(parse_header_file(&capture.raw_headers));
+    let headers = dedup_headers(&truncate_result.headers);
+    let raw_headers = truncate_result
+        .headers
+        .iter()
+        .map(|(key, value)| format!("{key}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (raw_body, body_truncated) = truncate_body(&capture.raw_body);
+    let truncated = truncate_result.truncated || body_truncated;
+    let http_version = normalize_http_version(&stats.http_version);
+    let tls = build_tls_info(
+        opts,
+        &stats,
+        &final_resolved_ip,
+        port,
+        is_https,
+        &capture.verbose,
+    )
+    .await;
+    let timings = build_http_timings(&stats, dns_ms, is_https);
+    let raw_body = (!raw_body.is_empty()).then_some(raw_body);
     let raw_output = build_raw_output(
         http_version.as_deref(),
         Some(stats.response_code),
-        Some(&raw_headers_str),
-        raw_body_opt.as_deref(),
+        Some(&raw_headers),
+        raw_body.as_deref(),
         &opts.request.method,
     );
 
@@ -1210,13 +1238,9 @@ async fn run_http(opts: &HttpOptions) -> Result<ParsedHttp> {
         status_code_name: status_text,
         resolved_address: Some(final_resolved_ip),
         http_version,
-        headers: headers_map,
-        raw_headers: if raw_headers_str.is_empty() {
-            None
-        } else {
-            Some(raw_headers_str)
-        },
-        raw_body: raw_body_opt,
+        headers,
+        raw_headers: (!raw_headers.is_empty()).then_some(raw_headers),
+        raw_body,
         truncated,
         tls,
         timings,
@@ -1245,9 +1269,12 @@ fn failed_result(message: String) -> ParsedHttp {
 
 pub struct HttpCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for HttpCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl HttpCommand {
+    /// Execute an HTTP command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, DNS/process failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: HttpOptions = serde_json::from_value(options)?;
         let result = run_http(&opts).await?;
         Ok(serde_json::to_value(result)?)
@@ -1256,6 +1283,10 @@ impl MeasurementCommand for HttpCommand {
 
 // ── Public helper for integration tests ───────────────────────────────────────
 
+/// Run one HTTP measurement without the socket layer.
+///
+/// # Errors
+/// Returns an error when validation, DNS resolution, process execution, or result serialization fails.
 pub async fn run_measurement(
     target: &str,
     protocol: &str,

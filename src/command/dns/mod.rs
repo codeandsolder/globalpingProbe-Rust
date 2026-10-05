@@ -6,7 +6,6 @@ use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-use super::MeasurementCommand;
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::is_safe_host;
 use parse::{ClassicResult, TraceResult, parse_classic, parse_trace};
@@ -137,9 +136,12 @@ pub fn build_args(opts: &DnsOptions) -> Vec<String> {
 
 pub struct DnsCommand;
 
-#[async_trait::async_trait]
-impl MeasurementCommand for DnsCommand {
-    async fn run(&self, options: Value) -> Result<Value> {
+impl DnsCommand {
+    /// Execute a DNS command from a socket payload.
+    ///
+    /// # Errors
+    /// Returns an error for invalid options, rejected targets, process failures, or serialization failures.
+    pub async fn run(&self, options: Value) -> Result<Value> {
         let opts: DnsOptions = serde_json::from_value(options)?;
         validate(&opts)?;
 
@@ -187,6 +189,9 @@ async fn run_dig(opts: &DnsOptions) -> Result<String> {
 // ── Helpers for integration tests ─────────────────────────────────────────────
 
 /// Run a classic query and return the parsed result directly (no socket layer).
+///
+/// # Errors
+/// Returns an error if the `dig` process cannot be executed or its output cannot be read.
 pub async fn query_classic(
     target: &str,
     record_type: &str,
@@ -209,6 +214,9 @@ pub async fn query_classic(
 }
 
 /// Run a trace query and return the parsed result directly.
+///
+/// # Errors
+/// Returns an error if the `dig` process cannot be executed or its output cannot be read.
 pub async fn query_trace(target: &str, resolver: Option<&str>) -> Result<TraceResult> {
     let opts = DnsOptions {
         target: target.to_string(),

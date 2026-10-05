@@ -57,10 +57,19 @@ impl MeasurementLimiter {
     /// are released immediately on return, so callers that start measurements
     /// afterwards will still be able to acquire slots normally.
     pub async fn wait_idle(&self) {
-        let Ok(_guard) = self.semaphore.acquire_many(self.capacity as u32).await else {
+        if self.capacity == 0 {
+            return;
+        }
+        let Ok(mut all_permits) = self.semaphore.acquire().await else {
             return;
         };
-        // _guard dropped here, all permits returned
+        for _ in 1..self.capacity {
+            let Ok(permit) = self.semaphore.acquire().await else {
+                return;
+            };
+            all_permits.merge(permit);
+        }
+        // `all_permits` now represents the full capacity, so in-flight work is drained.
     }
 }
 
