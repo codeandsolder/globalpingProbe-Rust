@@ -35,6 +35,8 @@ pub struct DnsTimings {
 #[serde(rename_all = "camelCase")]
 pub struct ClassicResult {
     pub status: DnsStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_source: Option<String>,
     pub status_code_name: Option<String>,
     pub status_code: Option<u16>,
     pub answers: Vec<DnsAnswer>,
@@ -56,6 +58,8 @@ pub struct TraceHop {
 #[serde(rename_all = "camelCase")]
 pub struct TraceResult {
     pub status: DnsStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_source: Option<String>,
     pub hops: Vec<TraceHop>,
     pub raw_output: String,
 }
@@ -120,6 +124,7 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
 
     let failed = |output: &str| ClassicResult {
         status: DnsStatus::Failed,
+        failure_source: None,
         status_code_name: None,
         status_code: None,
         answers: vec![],
@@ -189,6 +194,7 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
 
     ClassicResult {
         status: DnsStatus::Finished,
+        failure_source: None,
         status_code_name,
         status_code,
         answers,
@@ -205,6 +211,7 @@ pub fn parse_trace(raw: &str) -> TraceResult {
 
     let failed = || TraceResult {
         status: DnsStatus::Failed,
+        failure_source: None,
         hops: vec![],
         raw_output: raw.to_string(),
     };
@@ -222,6 +229,7 @@ pub fn parse_trace(raw: &str) -> TraceResult {
 
     TraceResult {
         status: DnsStatus::Finished,
+        failure_source: None,
         hops,
         raw_output: raw.to_string(),
     }
