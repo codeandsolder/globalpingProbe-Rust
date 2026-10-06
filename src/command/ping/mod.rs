@@ -292,8 +292,8 @@ async fn run_tcp(
 
     let mut probes: Vec<TcpPingProbe> = Vec::with_capacity(usize::from(opts.packets));
     let mut raw_lines = vec![format!(
-        "PING {} ({}) on port {}.",
-        target.hostname, address, opts.port
+        "PING {} ({address}) on port {}.",
+        target.hostname, opts.port
     )];
     let mut timings = Vec::new();
 
@@ -304,17 +304,15 @@ async fn run_tcp(
             Some(rtt) => {
                 timings.push(PingTiming { rtt, ttl: None });
                 raw_lines.push(format!(
-                    "Reply from {} ({}) on port {}: tcp_conn={} time={} ms",
+                    "Reply from {} ({address}) on port {}: tcp_conn={number} time={} ms",
                     target.hostname,
-                    address,
                     opts.port,
-                    number,
                     format_compact(rtt, 2),
                 ));
             }
             None => raw_lines.push(format!(
-                "No reply from {} ({}) on port {}: tcp_conn={number}",
-                target.hostname, address, opts.port,
+                "No reply from {} ({address}) on port {}: tcp_conn={number}",
+                target.hostname, opts.port,
             )),
         }
         probes.push(probe);
@@ -328,15 +326,13 @@ async fn run_tcp(
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     raw_lines.push(String::new());
     raw_lines.push(format!(
-        "--- {} ({}) ping statistics ---",
-        target.hostname, address
+        "--- {} ({address}) ping statistics ---",
+        target.hostname
     ));
+    let loss = format_compact(stats.loss, 2);
     raw_lines.push(format!(
-        "{} packets transmitted, {} received, {}% packet loss, time {} ms",
-        stats.total,
-        stats.rcv,
-        format_compact(stats.loss, 2),
-        elapsed_ms,
+        "{} packets transmitted, {} received, {loss}% packet loss, time {elapsed_ms} ms",
+        stats.total, stats.rcv,
     ));
     if let (Some(min), Some(avg), Some(max), Some(mdev)) =
         (stats.min, stats.avg, stats.max, stats.mdev)

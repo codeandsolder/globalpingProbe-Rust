@@ -71,6 +71,10 @@ impl From<UpdateError> for StorageError {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the explicit sequence suffix is part of the persisted state schema and distinguishes all three monotonic sequence roles"
+)]
 struct PersistedState {
     accepted_sequence: u64,
     active_sequence: u64,
@@ -319,7 +323,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
             .open(&temp_path)
         {
             Ok(file) => break (temp_path, file),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
     };
