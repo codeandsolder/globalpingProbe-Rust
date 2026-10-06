@@ -126,6 +126,8 @@ mod component {
     struct MeasurementRequest {
         target: String,
         #[serde(default)]
+        protocol: Option<String>,
+        #[serde(default)]
         in_progress_updates: bool,
     }
 
@@ -147,7 +149,14 @@ mod component {
             }
 
             match job.kind {
-                MeasurementKind::Ping => ping::run(&job.token, measurement.in_progress_updates),
+                MeasurementKind::Ping => ping::run(
+                    &job.token,
+                    measurement.in_progress_updates,
+                    measurement
+                        .protocol
+                        .as_deref()
+                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
+                ),
                 MeasurementKind::Traceroute => {
                     traceroute::run(&job.token, measurement.in_progress_updates)
                 }

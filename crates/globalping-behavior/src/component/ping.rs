@@ -199,17 +199,29 @@ fn shape(native: &NativeExecution) -> ResultPayload {
     }
 }
 
-pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String, BehaviorError> {
-    let native = execution::collect(token, MeasurementKind::Ping, |line, _all, start| {
+pub fn run(
+    token: &CapabilityToken,
+    in_progress_updates: bool,
+    tcp_progress: bool,
+) -> Result<String, BehaviorError> {
+    let native = execution::collect(token, MeasurementKind::Ping, |line, all, start| {
         if !in_progress_updates {
             return Ok(());
         }
-        let mut progress = normalize(
-            line,
-            &start.resolved_hostname,
-            Some(&start.resolved_address),
-        );
-        progress.push('\n');
+        let progress = if tcp_progress {
+            if !line.contains("tcp_conn=") {
+                return Ok(());
+            }
+            normalize(all, &start.resolved_hostname, Some(&start.resolved_address))
+        } else {
+            let mut line = normalize(
+                line,
+                &start.resolved_hostname,
+                Some(&start.resolved_address),
+            );
+            line.push('\n');
+            line
+        };
         let payload = serde_json::to_string(&serde_json::json!({ "rawOutput": progress }))
             .map_err(|error| BehaviorError::Internal(error.to_string()))?;
         execution::emit_progress(token, &payload, false)

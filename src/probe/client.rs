@@ -1197,6 +1197,20 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn tcp_ping_uses_diff_progress_buffering() {
+        let options = json!({ "type": "ping", "protocol": "TCP" });
+        assert!(matches!(
+            CommandKind::Ping.progress_mode(&options),
+            BufferMode::Diff
+        ));
+        let icmp = json!({ "type": "ping", "protocol": "ICMP" });
+        assert!(matches!(
+            CommandKind::Ping.progress_mode(&icmp),
+            BufferMode::Append
+        ));
+    }
+
     // ── Error message parsing via reconnect ───────────────────────────────────
 
     #[test]

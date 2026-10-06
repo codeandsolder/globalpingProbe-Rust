@@ -220,7 +220,7 @@ mod differential_tests {
     use wasmtime::component::{Component, HasSelf, Linker};
 
     use super::*;
-    use crate::command::ping::{normalize_ping_output, shape_icmp_output};
+    use crate::command::ping::{normalize_ping_output, shape_ping_output};
     use crate::command::traceroute::{normalize_numeric_output, shape_traceroute_output};
     use crate::util::resolve_target::ResolvedTarget;
 
@@ -492,6 +492,23 @@ mod differential_tests {
         )).collect()
     }
 
+    fn tcp_ping_progress(raw: &str, address: &str, hostname: &str) -> Vec<(Value, bool)> {
+        let mut lines = Vec::new();
+        let mut progress = Vec::new();
+        for line in raw.lines() {
+            lines.push(line);
+            if line.contains("tcp_conn=") {
+                progress.push((
+                    json!({
+                        "rawOutput": normalize_ping_output(&lines.join("\n"), address, hostname)
+                    }),
+                    false,
+                ));
+            }
+        }
+        progress
+    }
+
     fn traceroute_progress(raw: &str, target: &ResolvedTarget) -> Vec<(Value, bool)> {
         let lines = raw.lines().collect::<Vec<_>>();
         (1..=lines.len()).map(|count| {
@@ -520,12 +537,84 @@ rtt min/avg/max/mdev = 41.700/41.900/42.100/0.200 ms\n";
         )
         .await;
         let expected =
-            serde_json::to_value(shape_icmp_output(RAW, "1.1.1.1", "one.one.one.one", false))
+            serde_json::to_value(shape_ping_output(RAW, "1.1.1.1", "one.one.one.one", false))
                 .unwrap_or_else(|error| panic!("native ping serialization failed: {error}"));
         assert_eq!(actual.final_json, expected);
         assert_eq!(
             actual.progress,
             ping_progress(RAW, "1.1.1.1", "one.one.one.one")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_tcp_ping_matches_native_final_and_cumulative_progress() {
+        const RAW: &str = "PING one.one.one.one (1.1.1.1) on port 443.\n\
+Reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=1 time=12.34 ms\n\
+No reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=2\n\
+Reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=3 time=13 ms\n\
+\n\
+--- one.one.one.one (1.1.1.1) ping statistics ---\n\
+3 packets transmitted, 2 received, 33.33% packet loss, time 1000 ms\n\
+rtt min/avg/max/mdev = 12.340/12.670/13.000/0.330 ms";
+        let mut events = chunked_stdout(RAW, &[9, 37, 76, 113, 158, 202, 249]);
+        events.push(wit_host::ExecutionEvent::Exited(0));
+        let actual = run_fixture(
+            FixtureKind::Ping,
+            json!({
+                "type":"ping",
+                "target":"one.one.one.one",
+                "protocol":"TCP",
+                "port":443,
+                "timeout":10,
+                "inProgressUpdates":true
+            }),
+            events,
+            HashMap::new(),
+        )
+        .await;
+        let expected =
+            serde_json::to_value(shape_ping_output(RAW, "1.1.1.1", "one.one.one.one", false))
+                .unwrap_or_else(|error| panic!("native TCP ping serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert_eq!(
+            actual.progress,
+            tcp_ping_progress(RAW, "1.1.1.1", "one.one.one.one")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_tcp_ping_all_drop_matches_native() {
+        const RAW: &str = "PING one.one.one.one (1.1.1.1) on port 443.\n\
+No reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=1\n\
+No reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=2\n\
+\n\
+--- one.one.one.one (1.1.1.1) ping statistics ---\n\
+2 packets transmitted, 0 received, 100% packet loss, time 1000 ms";
+        let mut events = chunked_stdout(RAW, &[5, 41, 83, 127]);
+        events.push(wit_host::ExecutionEvent::Exited(0));
+        let actual = run_fixture(
+            FixtureKind::Ping,
+            json!({
+                "type":"ping",
+                "target":"one.one.one.one",
+                "protocol":"TCP",
+                "port":443,
+                "timeout":10,
+                "inProgressUpdates":true
+            }),
+            events,
+            HashMap::new(),
+        )
+        .await;
+        let expected =
+            serde_json::to_value(shape_ping_output(RAW, "1.1.1.1", "one.one.one.one", false))
+                .unwrap_or_else(|error| panic!("native TCP ping serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert_eq!(
+            actual.progress,
+            tcp_ping_progress(RAW, "1.1.1.1", "one.one.one.one")
         );
     }
 
@@ -566,7 +655,7 @@ no answer yet for icmp_seq=1\n\
             events, HashMap::new(),
         ).await;
         let expected =
-            serde_json::to_value(shape_icmp_output(RAW, "1.1.1.1", "one.one.one.one", true))
+            serde_json::to_value(shape_ping_output(RAW, "1.1.1.1", "one.one.one.one", true))
                 .unwrap_or_else(|error| panic!("native ping serialization failed: {error}"));
         assert_eq!(actual.final_json, expected);
         assert!(actual.progress.is_empty());

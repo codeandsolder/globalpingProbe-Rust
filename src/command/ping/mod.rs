@@ -14,7 +14,7 @@ use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
 use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, resolve_command_target};
 use crate::util::tcp_ping::{TcpPingProbe, compute_tcp_stats, tcp_ping_single};
 use crate::util::validate::is_safe_host;
-use parse::{ParsedPing, PingStats, PingStatus, PingTiming, parse};
+use parse::{ParsedPing, PingStats, PingStatus, parse};
 
 // ── Options (deserialised from the socket.io job payload) ───────────────────
 
@@ -181,7 +181,7 @@ pub(crate) fn normalize_ping_output(output: &str, address: &str, hostname: &str)
         .join("\n")
 }
 
-pub(crate) fn shape_icmp_output(
+pub(crate) fn shape_ping_output(
     raw_output: &str,
     address: &str,
     hostname: &str,
@@ -253,7 +253,7 @@ async fn run_icmp(
         completed??;
     }
 
-    Ok(shape_icmp_output(
+    Ok(shape_ping_output(
         &raw_output,
         &address,
         &target.hostname,
@@ -309,14 +309,12 @@ async fn run_tcp(
         "PING {} ({address}) on port {}.",
         target.hostname, opts.port
     )];
-    let mut timings = Vec::new();
 
     for (index, task) in tasks.into_iter().enumerate() {
         let probe = task.await.unwrap_or(TcpPingProbe { rtt_ms: None });
         let number = index + 1;
         match probe.rtt_ms {
             Some(rtt) => {
-                timings.push(PingTiming { rtt, ttl: None });
                 raw_lines.push(format!(
                     "Reply from {} ({address}) on port {}: tcp_conn={number} time={} ms",
                     target.hostname,
@@ -356,23 +354,12 @@ async fn run_tcp(
         ));
     }
 
-    Ok(ParsedPing {
-        status: PingStatus::Finished,
-        failure_source: None,
-        raw_output: raw_lines.join("\n"),
-        resolved_address: Some(address),
-        resolved_hostname: Some(target.hostname.clone()),
-        timings,
-        stats: PingStats {
-            min: stats.min,
-            max: stats.max,
-            avg: stats.avg,
-            total: Some(stats.total),
-            loss: Some(stats.loss),
-            rcv: Some(stats.rcv),
-            drop: Some(stats.drop),
-        },
-    })
+    Ok(shape_ping_output(
+        &raw_lines.join("\n"),
+        &address,
+        &target.hostname,
+        false,
+    ))
 }
 
 // ── Public helper for integration tests / status manager ─────────────────────

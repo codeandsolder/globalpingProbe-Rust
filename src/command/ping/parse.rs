@@ -59,6 +59,10 @@ static PACKET_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     )
 });
 
+// Matches the synthetic TCP ping reply emitted by the native supervisor.
+static TCP_PACKET_RE: LazyLock<Option<Regex>> =
+    LazyLock::new(|| compile_regex(r"^Reply from .*: tcp_conn=\d+ time=(\d+(?:\.\d+)?) ms$"));
+
 // Captures the hostname from the first reply line: "from <host> (" or "from <host>: "
 static HOSTNAME_RE: LazyLock<Option<Regex>> =
     LazyLock::new(|| compile_regex(r"from\s(.*?)(?:\s\(|:\s)"));
@@ -137,13 +141,18 @@ pub fn parse(raw_output: &str) -> ParsedPing {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn parse_packet_line(line: &str) -> Option<PingTiming> {
-    let caps = PACKET_RE.as_ref()?.captures(line)?;
-    let ttl = caps.get(2)?.as_str().parse::<u32>().ok()?;
-    let rtt = caps.get(3)?.as_str().parse::<f64>().ok()?;
-    Some(PingTiming {
-        rtt,
-        ttl: Some(ttl),
-    })
+    if let Some(caps) = PACKET_RE.as_ref()?.captures(line) {
+        let ttl = caps.get(2)?.as_str().parse::<u32>().ok()?;
+        let rtt = caps.get(3)?.as_str().parse::<f64>().ok()?;
+        return Some(PingTiming {
+            rtt,
+            ttl: Some(ttl),
+        });
+    }
+
+    let caps = TCP_PACKET_RE.as_ref()?.captures(line)?;
+    let rtt = caps.get(1)?.as_str().parse::<f64>().ok()?;
+    Some(PingTiming { rtt, ttl: None })
 }
 
 fn parse_summary(lines: &[&str]) -> PingStats {
@@ -278,6 +287,44 @@ From eth2-1109-fsn-lf-e03.productsup.int (10.254.254.17) icmp_seq=1 Destination 
         assert_eq!(r.stats.rcv, Some(3));
         assert_eq!(r.stats.drop, Some(0));
         assert_eq!(r.stats.loss, Some(0.0));
+    }
+
+    #[test]
+    fn parses_tcp_synthetic_output() {
+        let raw = "PING one.one.one.one (1.1.1.1) on port 443.\n\
+Reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=1 time=12.34 ms\n\
+No reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=2\n\
+Reply from one.one.one.one (1.1.1.1) on port 443: tcp_conn=3 time=13 ms\n\
+\n\
+--- one.one.one.one (1.1.1.1) ping statistics ---\n\
+3 packets transmitted, 2 received, 33.33% packet loss, time 1000 ms\n\
+rtt min/avg/max/mdev = 12.340/12.670/13.000/0.330 ms";
+        let parsed = parse(raw);
+        assert_eq!(parsed.status, PingStatus::Finished);
+        assert_eq!(parsed.resolved_address.as_deref(), Some("1.1.1.1"));
+        assert_eq!(parsed.resolved_hostname.as_deref(), Some("one.one.one.one"));
+        assert_eq!(parsed.timings.len(), 2);
+        assert_eq!(
+            parsed.timings[0],
+            PingTiming {
+                rtt: 12.34,
+                ttl: None
+            }
+        );
+        assert_eq!(
+            parsed.timings[1],
+            PingTiming {
+                rtt: 13.0,
+                ttl: None
+            }
+        );
+        assert_eq!(parsed.stats.total, Some(3));
+        assert_eq!(parsed.stats.rcv, Some(2));
+        assert_eq!(parsed.stats.drop, Some(1));
+        assert_eq!(parsed.stats.loss, Some(33.33));
+        assert_eq!(parsed.stats.min, Some(12.34));
+        assert_eq!(parsed.stats.avg, Some(12.67));
+        assert_eq!(parsed.stats.max, Some(13.0));
     }
 
     #[test]
