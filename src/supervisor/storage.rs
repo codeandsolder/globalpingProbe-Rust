@@ -152,8 +152,7 @@ impl PersistentBehaviorSlots {
         if state.accepted_sequence < state.active_sequence
             || state
                 .previous_sequence
-                .is_some_and(|sequence| sequence > state.accepted_sequence)
-            || state.previous_sequence == Some(state.active_sequence)
+                .is_some_and(|sequence| sequence >= state.active_sequence)
         {
             return Err(StorageError::InvalidState);
         }
@@ -427,6 +426,30 @@ mod tests {
         );
         assert_eq!(reloaded.accepted_sequence(), 3);
         assert!(!bundle_path(dir.path(), 1).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restart_rejects_rollback_pointer_newer_than_active() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut store = PersistentBehaviorSlots::initialize(dir.path(), verified(1, b"one", &key))?;
+        store.activate(verified(2, b"two", &key))?;
+
+        write_state(
+            dir.path(),
+            PersistedState {
+                accepted_sequence: 2,
+                active_sequence: 1,
+                previous_sequence: Some(2),
+            },
+        )?;
+        let result = PersistentBehaviorSlots::load(
+            dir.path(),
+            &key.verifying_key(),
+            &Version::new(0, 48, 0),
+        );
+        assert!(matches!(result, Err(StorageError::InvalidState)));
         Ok(())
     }
 

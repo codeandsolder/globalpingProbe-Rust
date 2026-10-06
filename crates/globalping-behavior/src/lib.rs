@@ -21,7 +21,10 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 // `wit-bindgen` generates the canonical ABI shims, which necessarily contain
 // unsafe exports/blocks. Keep that exemption confined to generated glue; the
 // rest of this crate remains under the workspace `unsafe_code = "deny"` lint.
-#[allow(unsafe_code)]
+#[allow(
+    unsafe_code,
+    reason = "wit-bindgen and the canonical ABI allocator require generated unsafe glue"
+)]
 mod component {
     use alloc::alloc::{Layout, alloc, dealloc, realloc};
     use alloc::string::{String, ToString as _};
