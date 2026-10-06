@@ -57,7 +57,7 @@ jobs:
       - name: Differential-test WASIp2 ping/traceroute behavior against native shaping
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
-        run: cargo +1.99.0 test --locked --lib differential_ -- --ignored
+        run: cargo +1.99.0 test --locked --lib differential_tests::differential_ -- --ignored
       - name: Clippy production targets
         run: cargo +1.99.0 clippy --locked --lib --bins -- -D warnings -D clippy::pedantic -D clippy::nursery
       - name: Clippy WASIp2 behavior component
