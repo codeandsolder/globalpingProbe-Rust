@@ -117,7 +117,9 @@ mod component {
     use codeandsolder::globalping_behavior::host::MeasurementKind;
     use exports::codeandsolder::globalping_behavior::guest::{BehaviorError, Guest, Job};
 
+    mod dns;
     mod execution;
+    mod ip;
     mod ping;
     mod traceroute;
 
@@ -129,6 +131,8 @@ mod component {
         protocol: Option<String>,
         #[serde(default)]
         in_progress_updates: bool,
+        #[serde(default)]
+        trace: bool,
     }
 
     struct Behavior;
@@ -149,6 +153,11 @@ mod component {
             }
 
             match job.kind {
+                MeasurementKind::Dns => dns::run(
+                    &job.token,
+                    measurement.trace,
+                    measurement.in_progress_updates,
+                ),
                 MeasurementKind::Ping => ping::run(
                     &job.token,
                     measurement.in_progress_updates,
@@ -167,6 +176,7 @@ mod component {
         }
 
         fn self_test() -> Result<(), String> {
+            dns::self_test()?;
             ping::self_test()?;
             traceroute::self_test()?;
             Ok(())

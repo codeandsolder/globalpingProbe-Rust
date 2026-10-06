@@ -234,6 +234,8 @@ pub fn self_test() -> Result<(), String> {
     let native = NativeExecution {
         resolved_address: "1.1.1.1".to_string(),
         resolved_hostname: "one.one.one.one".to_string(),
+        target_is_icann: true,
+        local_addresses: Vec::new(),
         stdout: "PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.\n64 bytes from 1.1.1.1: icmp_seq=1 ttl=58 time=41.7 ms\n\n--- 1.1.1.1 ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 1003ms\nrtt min/avg/max/mdev = 41.700/41.700/41.700/0.000 ms\n".to_string(),
         stderr: String::new(),
         exit_code: Some(0),

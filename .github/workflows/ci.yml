@@ -54,7 +54,7 @@ jobs:
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
         run: cargo +1.99.0 test --locked --test behavior_component signed_component_instantiates_without_ambient_wasi -- --ignored --exact
-      - name: Differential-test WASIp2 ping/traceroute behavior against native shaping
+      - name: Differential-test WASIp2 ping/DNS/traceroute behavior against native shaping
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
         run: cargo +1.99.0 test --locked --lib differential_tests::differential_ -- --ignored

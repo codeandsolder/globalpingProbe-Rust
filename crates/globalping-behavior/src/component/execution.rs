@@ -9,6 +9,8 @@ use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 pub struct NativeExecution {
     pub resolved_address: String,
     pub resolved_hostname: String,
+    pub target_is_icann: bool,
+    pub local_addresses: Vec<String>,
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
@@ -113,6 +115,8 @@ where
     Ok(NativeExecution {
         resolved_address: start.resolved_address,
         resolved_hostname: start.resolved_hostname,
+        target_is_icann: start.target_is_icann,
+        local_addresses: start.local_addresses,
         stdout,
         stderr,
         exit_code,

@@ -1,4 +1,4 @@
-package codeandsolder:globalping-behavior@0.2.0;
+package codeandsolder:globalping-behavior@0.3.0;
 
 interface host {
     record capability-token {
@@ -36,6 +36,8 @@ interface host {
         deadline-ms: u32,
         resolved-address: string,
         resolved-hostname: string,
+        target-is-icann: bool,
+        local-addresses: list<string>,
     }
 
     variant execution-event {

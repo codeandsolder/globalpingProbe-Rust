@@ -220,6 +220,9 @@ mod differential_tests {
     use wasmtime::component::{Component, HasSelf, Linker};
 
     use super::*;
+    use crate::command::dns::{
+        DnsOptions, DnsProgress, dns_progress_output, shape_classic_output, shape_trace_output,
+    };
     use crate::command::ping::{PingCommand, normalize_ping_output, shape_ping_output};
     use crate::command::traceroute::{
         TracerouteOptions, build_args as build_traceroute_args, enrich_hostnames,
@@ -233,6 +236,7 @@ mod differential_tests {
     #[derive(Clone, Copy)]
     enum FixtureKind {
         Ping,
+        Dns,
         Traceroute,
     }
 
@@ -240,6 +244,7 @@ mod differential_tests {
         const fn wit(self) -> wit_host::MeasurementKind {
             match self {
                 Self::Ping => wit_host::MeasurementKind::Ping,
+                Self::Dns => wit_host::MeasurementKind::Dns,
                 Self::Traceroute => wit_host::MeasurementKind::Traceroute,
             }
         }
@@ -254,6 +259,7 @@ mod differential_tests {
         reverse: HashMap<String, String>,
         resolved_address: String,
         resolved_hostname: String,
+        target_is_icann: bool,
         progress: Vec<(String, bool)>,
         reverse_requests: Vec<String>,
         started: bool,
@@ -267,6 +273,7 @@ mod differential_tests {
             reverse: HashMap<String, String>,
             resolved_address: impl Into<String>,
             resolved_hostname: impl Into<String>,
+            target_is_icann: bool,
         ) -> Self {
             Self {
                 limits: BehaviorRuntime::store_limits(),
@@ -277,6 +284,7 @@ mod differential_tests {
                 reverse,
                 resolved_address: resolved_address.into(),
                 resolved_hostname: resolved_hostname.into(),
+                target_is_icann,
                 progress: Vec::new(),
                 reverse_requests: Vec::new(),
                 started: false,
@@ -319,6 +327,8 @@ mod differential_tests {
                     deadline_ms: 30_000,
                     resolved_address: self.resolved_address.clone(),
                     resolved_hostname: self.resolved_hostname.clone(),
+                    target_is_icann: self.target_is_icann,
+                    local_addresses: Vec::new(),
                 })
             };
             ready(result)
@@ -465,6 +475,13 @@ mod differential_tests {
             hi: 0x0123_4567_89ab_cdef,
             lo: 0xfedc_ba98_7654_3210,
         };
+        let target_is_icann = measurement
+            .get("target")
+            .and_then(Value::as_str)
+            .is_some_and(|target| {
+                psl::suffix(target.trim_end_matches('.').as_bytes())
+                    .is_some_and(|suffix| suffix.typ() == Some(psl::Type::Icann))
+            });
         let state = FixtureState::new(
             &token,
             kind,
@@ -472,6 +489,7 @@ mod differential_tests {
             reverse,
             resolved_address,
             resolved_hostname,
+            target_is_icann,
         );
         let mut store = Store::new(runtime.engine(), state);
         store.limiter(|state| &mut state.limits);
@@ -517,6 +535,23 @@ mod differential_tests {
         }
     }
 
+    fn dns_progress(raw: &str, opts: &DnsOptions) -> Vec<(Value, bool)> {
+        let mut cumulative = String::new();
+        let mut progress = Vec::new();
+        for line in raw.lines() {
+            cumulative.push_str(line);
+            cumulative.push('\n');
+            match dns_progress_output(&cumulative, opts) {
+                DnsProgress::Ignore => {}
+                DnsProgress::Private => break,
+                DnsProgress::Emit(output) => {
+                    progress.push((json!({ "rawOutput": output }), false));
+                }
+            }
+        }
+        progress
+    }
+
     fn ping_progress(raw: &str, address: &str, hostname: &str) -> Vec<(Value, bool)> {
         raw.lines().map(|line| (
             json!({"rawOutput": format!("{}\n", normalize_ping_output(line, address, hostname))}),
@@ -547,6 +582,158 @@ mod differential_tests {
             let current = lines[..count].join("\n");
             (json!({"rawOutput": normalize_numeric_output(&current, target, &HashMap::new())}), false)
         }).collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_dns_classic_matches_native_with_progress() {
+        const RAW: &str = "; <<>> DiG 9.20 <<>> example.com A\n\
+;; global options: +cmd\n\
+;; Got answer:\n\
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 123\n\
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 1\n\
+\n\
+;; QUESTION SECTION:\n\
+;example.com. IN A\n\
+\n\
+;; ANSWER SECTION:\n\
+example.com. 300 IN A 93.184.216.34\n\
+\n\
+;; Query time: 12 msec\n\
+;; SERVER: 8.8.8.8#53(8.8.8.8) (UDP)\n\
+;; WHEN: Tue Oct 06 19:00:00 CEST 2026\n\
+;; MSG SIZE  rcvd: 56\n";
+        let measurement = json!({
+            "type":"dns",
+            "target":"example.com",
+            "protocol":"UDP",
+            "port":53,
+            "trace":false,
+            "query":{"type":"A"},
+            "ipVersion":4,
+            "timeout":10,
+            "inProgressUpdates":true
+        });
+        let opts: DnsOptions = serde_json::from_value(measurement.clone())
+            .unwrap_or_else(|error| panic!("DNS options fixture failed: {error}"));
+        let mut events = chunked_stdout(RAW, &[3, 29, 61, 117, 193, 251]);
+        events.push(wit_host::ExecutionEvent::Exited(0));
+        let actual = run_fixture(FixtureKind::Dns, measurement, events, HashMap::new()).await;
+        let expected = serde_json::to_value(shape_classic_output(
+            RAW,
+            "",
+            false,
+            false,
+            false,
+            "example.com",
+        ))
+        .unwrap_or_else(|error| panic!("native DNS serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert_eq!(actual.progress, dns_progress(RAW, &opts));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_dns_private_non_icann_answer_matches_native() {
+        const RAW: &str = "; <<>> DiG 9.20 <<>> router.home A\n\
+;; global options: +cmd\n\
+;; Got answer:\n\
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 44\n\
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0\n\
+;; ANSWER SECTION:\n\
+router.home. 60 IN A 192.168.1.1\n\
+\n\
+;; Query time: 1 msec\n\
+;; SERVER: 192.168.1.1#53(192.168.1.1) (UDP)\n";
+        let events = vec![stdout(RAW), wit_host::ExecutionEvent::Exited(0)];
+        let actual = run_fixture(
+            FixtureKind::Dns,
+            json!({
+                "type":"dns",
+                "target":"router.home",
+                "trace":false,
+                "timeout":10,
+                "inProgressUpdates":false
+            }),
+            events,
+            HashMap::new(),
+        )
+        .await;
+        let expected = serde_json::to_value(shape_classic_output(
+            RAW,
+            "",
+            false,
+            false,
+            false,
+            "router.home",
+        ))
+        .unwrap_or_else(|error| panic!("native private DNS serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert!(actual.progress.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_dns_trace_matches_native() {
+        const RAW: &str = ". 518400 IN NS a.root-servers.net.\n\
+. 518400 IN NS b.root-servers.net.\n\
+;; Received 239 bytes from 8.8.8.8#53(8.8.8.8) in 12 ms\n\
+\n\
+com. 172800 IN NS a.gtld-servers.net.\n\
+;; Received 1170 bytes from 198.41.0.4#53(a.root-servers.net) in 24 ms\n";
+        let measurement = json!({
+            "type":"dns",
+            "target":"example.com",
+            "trace":true,
+            "timeout":10,
+            "inProgressUpdates":true
+        });
+        let opts: DnsOptions = serde_json::from_value(measurement.clone())
+            .unwrap_or_else(|error| panic!("DNS trace options fixture failed: {error}"));
+        let mut events = chunked_stdout(RAW, &[7, 48, 93, 137]);
+        events.push(wit_host::ExecutionEvent::Exited(0));
+        let actual = run_fixture(FixtureKind::Dns, measurement, events, HashMap::new()).await;
+        let expected = serde_json::to_value(shape_trace_output(
+            RAW,
+            "",
+            false,
+            false,
+            false,
+            "example.com",
+        ))
+        .unwrap_or_else(|error| panic!("native trace DNS serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert_eq!(actual.progress, dns_progress(RAW, &opts));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_dns_timeout_matches_native() {
+        const RAW: &str = "; <<>> DiG 9.20 <<>> example.com A\n;; global options: +cmd\n";
+        let events = vec![stdout(RAW), wit_host::ExecutionEvent::TimedOut];
+        let actual = run_fixture(
+            FixtureKind::Dns,
+            json!({
+                "type":"dns",
+                "target":"example.com",
+                "trace":false,
+                "timeout":10,
+                "inProgressUpdates":false
+            }),
+            events,
+            HashMap::new(),
+        )
+        .await;
+        let expected = serde_json::to_value(shape_classic_output(
+            RAW,
+            "",
+            true,
+            false,
+            false,
+            "example.com",
+        ))
+        .unwrap_or_else(|error| panic!("native timeout DNS serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
     }
 
     #[tokio::test]

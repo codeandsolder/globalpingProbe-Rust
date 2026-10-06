@@ -140,27 +140,27 @@ impl DnsCommand {
         let opts: DnsOptions = serde_json::from_value(options)?;
         validate(&opts)?;
         let native = run_dig(&opts, progress.as_ref()).await?;
-        if opts.trace {
-            let mut result = parse_trace(&native.raw);
-            let is_private =
-                native.private_result || trace_has_private_answer(&result, &opts.target);
-            if is_private {
-                apply_private_trace_failure(&mut result);
-            } else {
-                apply_trace_failure(&mut result, &native);
-            }
-            Ok(serde_json::to_value(result)?)
+        let process_failed = native.status.is_some_and(|status| !status.success());
+        let result = if opts.trace {
+            serde_json::to_value(shape_trace_output(
+                &native.raw,
+                &native.stderr,
+                native.timed_out,
+                process_failed,
+                native.private_result,
+                &opts.target,
+            ))?
         } else {
-            let mut result = parse_classic(&native.raw);
-            let is_private =
-                native.private_result || classic_has_private_answer(&result, &opts.target);
-            if is_private {
-                apply_private_classic_failure(&mut result);
-            } else {
-                apply_classic_failure(&mut result, &native);
-            }
-            Ok(serde_json::to_value(result)?)
-        }
+            serde_json::to_value(shape_classic_output(
+                &native.raw,
+                &native.stderr,
+                native.timed_out,
+                process_failed,
+                native.private_result,
+                &opts.target,
+            ))?
+        };
+        Ok(result)
     }
 }
 
@@ -172,7 +172,7 @@ struct NativeDnsOutput {
     private_result: bool,
 }
 
-enum DnsProgress {
+pub(crate) enum DnsProgress {
     Ignore,
     Emit(String),
     Private,
@@ -204,7 +204,7 @@ fn trace_has_private_answer(result: &TraceResult, target: &str) -> bool {
             .any(|answer| answer_is_private(&answer.value))
 }
 
-fn dns_progress_output(raw: &str, opts: &DnsOptions) -> DnsProgress {
+pub(crate) fn dns_progress_output(raw: &str, opts: &DnsOptions) -> DnsProgress {
     if opts.trace {
         let result = parse_trace(raw);
         if result.status == DnsStatus::Finished && trace_has_private_answer(&result, &opts.target) {
@@ -306,8 +306,8 @@ fn resolver_failure(output: &str) -> bool {
     .any(|pattern| lower.contains(pattern))
 }
 
-fn failure_source(native: &NativeDnsOutput, raw_output: &str) -> &'static str {
-    if native.timed_out || resolver_failure(raw_output) {
+fn failure_source(timed_out: bool, raw_output: &str) -> &'static str {
+    if timed_out || resolver_failure(raw_output) {
         "resolver"
     } else {
         "internal"
@@ -340,32 +340,74 @@ fn apply_private_trace_failure(result: &mut TraceResult) {
     result.raw_output = "Private IP ranges are not allowed.".to_string();
 }
 
-fn apply_classic_failure(result: &mut ClassicResult, native: &NativeDnsOutput) {
-    let process_failed = native.status.is_some_and(|status| !status.success());
-    if native.timed_out {
+fn apply_classic_failure(
+    result: &mut ClassicResult,
+    stderr: &str,
+    timed_out: bool,
+    process_failed: bool,
+) {
+    if timed_out {
         result.status = DnsStatus::Failed;
         append_timeout(&mut result.raw_output);
     }
-    if native.timed_out || process_failed || result.status == DnsStatus::Failed {
-        result.failure_source = Some(failure_source(native, &result.raw_output).to_string());
-        if result.raw_output.trim().is_empty() && !native.stderr.trim().is_empty() {
-            result.raw_output.clone_from(&native.stderr);
+    if timed_out || process_failed || result.status == DnsStatus::Failed {
+        result.failure_source = Some(failure_source(timed_out, &result.raw_output).to_string());
+        if result.raw_output.trim().is_empty() && !stderr.trim().is_empty() {
+            result.raw_output = stderr.to_string();
         }
     }
 }
 
-fn apply_trace_failure(result: &mut TraceResult, native: &NativeDnsOutput) {
-    let process_failed = native.status.is_some_and(|status| !status.success());
-    if native.timed_out {
+fn apply_trace_failure(
+    result: &mut TraceResult,
+    stderr: &str,
+    timed_out: bool,
+    process_failed: bool,
+) {
+    if timed_out {
         result.status = DnsStatus::Failed;
         append_timeout(&mut result.raw_output);
     }
-    if native.timed_out || process_failed || result.status == DnsStatus::Failed {
-        result.failure_source = Some(failure_source(native, &result.raw_output).to_string());
-        if result.raw_output.trim().is_empty() && !native.stderr.trim().is_empty() {
-            result.raw_output.clone_from(&native.stderr);
+    if timed_out || process_failed || result.status == DnsStatus::Failed {
+        result.failure_source = Some(failure_source(timed_out, &result.raw_output).to_string());
+        if result.raw_output.trim().is_empty() && !stderr.trim().is_empty() {
+            result.raw_output = stderr.to_string();
         }
     }
+}
+
+pub(crate) fn shape_classic_output(
+    raw: &str,
+    stderr: &str,
+    timed_out: bool,
+    process_failed: bool,
+    private_result: bool,
+    target: &str,
+) -> ClassicResult {
+    let mut result = parse_classic(raw);
+    if private_result || classic_has_private_answer(&result, target) {
+        apply_private_classic_failure(&mut result);
+    } else {
+        apply_classic_failure(&mut result, stderr, timed_out, process_failed);
+    }
+    result
+}
+
+pub(crate) fn shape_trace_output(
+    raw: &str,
+    stderr: &str,
+    timed_out: bool,
+    process_failed: bool,
+    private_result: bool,
+    target: &str,
+) -> TraceResult {
+    let mut result = parse_trace(raw);
+    if private_result || trace_has_private_answer(&result, target) {
+        apply_private_trace_failure(&mut result);
+    } else {
+        apply_trace_failure(&mut result, stderr, timed_out, process_failed);
+    }
+    result
 }
 
 /// # Errors
@@ -389,13 +431,15 @@ pub async fn query_classic(
         timeout: 10,
     };
     let native = run_dig(&opts, None).await?;
-    let mut result = parse_classic(&native.raw);
-    if native.private_result || classic_has_private_answer(&result, target) {
-        apply_private_classic_failure(&mut result);
-    } else {
-        apply_classic_failure(&mut result, &native);
-    }
-    Ok(result)
+    let process_failed = native.status.is_some_and(|status| !status.success());
+    Ok(shape_classic_output(
+        &native.raw,
+        &native.stderr,
+        native.timed_out,
+        process_failed,
+        native.private_result,
+        target,
+    ))
 }
 
 /// # Errors
@@ -415,13 +459,15 @@ pub async fn query_trace(target: &str, resolver: Option<&str>) -> Result<TraceRe
         timeout: 10,
     };
     let native = run_dig(&opts, None).await?;
-    let mut result = parse_trace(&native.raw);
-    if native.private_result || trace_has_private_answer(&result, target) {
-        apply_private_trace_failure(&mut result);
-    } else {
-        apply_trace_failure(&mut result, &native);
-    }
-    Ok(result)
+    let process_failed = native.status.is_some_and(|status| !status.success());
+    Ok(shape_trace_output(
+        &native.raw,
+        &native.stderr,
+        native.timed_out,
+        process_failed,
+        native.private_result,
+        target,
+    ))
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
