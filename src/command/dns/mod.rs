@@ -60,7 +60,7 @@ const ALLOWED_TYPES: &[&str] = &[
 ];
 const ALLOWED_PROTOCOLS: &[&str] = &["UDP", "TCP"];
 
-fn validate(opts: &DnsOptions) -> Result<()> {
+pub(crate) fn validate(opts: &DnsOptions) -> Result<()> {
     if !ALLOWED_TYPES.contains(&opts.query.record_type.as_str()) {
         bail!("unsupported query type: {}", opts.query.record_type);
     }
@@ -164,12 +164,12 @@ impl DnsCommand {
     }
 }
 
-struct NativeDnsOutput {
-    raw: String,
-    stderr: String,
-    timed_out: bool,
-    status: Option<std::process::ExitStatus>,
-    private_result: bool,
+pub(crate) struct NativeDnsOutput {
+    pub(crate) raw: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) private_result: bool,
 }
 
 pub(crate) enum DnsProgress {
@@ -232,7 +232,10 @@ pub(crate) fn dns_progress_output(raw: &str, opts: &DnsOptions) -> DnsProgress {
     }
 }
 
-async fn run_dig(opts: &DnsOptions, progress: Option<&ProgressTx>) -> Result<NativeDnsOutput> {
+pub(crate) async fn run_dig(
+    opts: &DnsOptions,
+    progress: Option<&ProgressTx>,
+) -> Result<NativeDnsOutput> {
     let mut child = Command::new("dig")
         .args(build_args(opts))
         .kill_on_drop(true)

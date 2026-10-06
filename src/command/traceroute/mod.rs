@@ -47,7 +47,7 @@ const fn default_ip_version() -> u8 {
     4
 }
 
-fn validate(opts: &TracerouteOptions) -> Result<()> {
+pub(crate) fn validate(opts: &TracerouteOptions) -> Result<()> {
     if !is_safe_host(&opts.target) {
         bail!("Invalid target.");
     }

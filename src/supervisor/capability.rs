@@ -42,7 +42,7 @@ impl MeasurementKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyError {
     UnknownMeasurement,
     MissingTarget,
@@ -307,6 +307,11 @@ impl CapabilityLease {
             return Err(PolicyError::EnrichmentQuota);
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn remaining(&self, now: Instant) -> Duration {
+        self.expires_at.saturating_duration_since(now)
     }
 
     fn ensure_live(&self, now: Instant) -> Result<(), PolicyError> {

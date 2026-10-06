@@ -58,7 +58,7 @@ const fn default_ip_version() -> u8 {
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-fn validate(opts: &MtrOptions) -> Result<()> {
+pub(crate) fn validate(opts: &MtrOptions) -> Result<()> {
     if !is_safe_host(&opts.target) {
         bail!("Invalid target.");
     }
@@ -149,10 +149,10 @@ fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
     }
 }
 
-struct NativeMtrOutput {
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
+pub(crate) struct NativeMtrOutput {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
 }
 
 #[derive(Clone, Default)]
@@ -295,6 +295,55 @@ fn hop_address_from_raw_line(line: &str) -> Option<IpAddr> {
     }
     let _index = parts.next()?;
     normalize_ip_text(parts.next()?).parse().ok()
+}
+
+pub(crate) async fn run_native_mtr_raw(
+    args: &[String],
+    process_timeout: Duration,
+) -> Result<NativeMtrOutput> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+    let mut child = Command::new("mtr")
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("mtr stdout pipe unavailable"))?;
+    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("mtr stderr pipe unavailable"))?;
+    let stderr_task = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text).await;
+        text
+    });
+    let mut raw = String::new();
+    let completed = timeout(process_timeout, async {
+        while let Some(line) = stdout_lines.next_line().await? {
+            raw.push_str(&line);
+            raw.push('\n');
+        }
+        child.wait().await.map(|_| ())
+    })
+    .await;
+    let timed_out = completed.is_err();
+    if timed_out {
+        child.kill().await.ok();
+        child.wait().await.ok();
+    } else {
+        completed??;
+    }
+    Ok(NativeMtrOutput {
+        stdout: raw,
+        stderr: stderr_task.await.unwrap_or_default(),
+        timed_out,
+    })
 }
 
 async fn run_native_mtr(
@@ -444,7 +493,7 @@ fn parse_cymru_asns(stdout: &str) -> Vec<u32> {
     Vec::new()
 }
 
-async fn lookup_asn(address: IpAddr, budget: Duration) -> Vec<u32> {
+pub(crate) async fn lookup_asn(address: IpAddr, budget: Duration) -> Vec<u32> {
     if budget.is_zero() || is_ip_private(address) {
         return Vec::new();
     }

@@ -28,6 +28,7 @@ pub enum RuntimeError {
     Instantiate(wasmtime::Error),
     Call(wasmtime::Error),
     GuestSelfTest(String),
+    Job(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -42,6 +43,7 @@ impl std::fmt::Display for RuntimeError {
             }
             Self::Call(error) => write!(f, "behavior component call failed: {error}"),
             Self::GuestSelfTest(error) => write!(f, "behavior component self-test failed: {error}"),
+            Self::Job(error) => write!(f, "behavior component job failed: {error}"),
         }
     }
 }
@@ -208,6 +210,9 @@ wasmtime::component::bindgen!({
     exports: { default: async },
 });
 
+mod production;
+pub use production::BehaviorShadowResult;
+
 #[cfg(test)]
 mod differential_tests {
     use std::collections::{HashMap, VecDeque};
@@ -300,7 +305,7 @@ mod differential_tests {
             }
         }
 
-        fn valid_token(&self, token: &wit_host::CapabilityToken) -> bool {
+        const fn valid_token(&self, token: &wit_host::CapabilityToken) -> bool {
             token.hi == self.token_hi && token.lo == self.token_lo
         }
 
@@ -1036,6 +1041,113 @@ no answer yet for icmp_seq=1\n\
                 .unwrap_or_else(|error| panic!("native ping serialization failed: {error}"));
         assert_eq!(actual.final_json, expected);
         assert!(actual.progress.is_empty());
+    }
+
+    async fn run_real_host_shadow(measurement: Value) -> BehaviorShadowResult {
+        let runtime = BehaviorRuntime::new()
+            .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+        let path = component_path();
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let component = Component::from_binary(runtime.engine(), &bytes)
+            .unwrap_or_else(|error| panic!("component compilation failed: {error}"));
+        runtime
+            .shadow_component(&component, measurement, None)
+            .await
+            .unwrap_or_else(|error| panic!("real host shadow failed: {error}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_shadow_real_host_adapter_matches_native_oracles() {
+        let cases = [
+            (
+                json!({
+                    "type": "ping",
+                    "target": "1.1.1.1",
+                    "protocol": "ICMP",
+                    "packets": 2,
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": true
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "type": "ping",
+                    "target": "1.1.1.1",
+                    "protocol": "TCP",
+                    "port": 443,
+                    "packets": 2,
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": true
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "type": "dns",
+                    "target": "example.com",
+                    "protocol": "UDP",
+                    "port": 53,
+                    "resolver": null,
+                    "trace": false,
+                    "query": {"type": "A"},
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": true
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "type": "traceroute",
+                    "target": "1.1.1.1",
+                    "protocol": "ICMP",
+                    "port": 80,
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": true
+                }),
+                false,
+            ),
+            (
+                json!({
+                    "type": "mtr",
+                    "target": "1.1.1.1",
+                    "protocol": "ICMP",
+                    "port": 80,
+                    "packets": 2,
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": true
+                }),
+                true,
+            ),
+        ];
+
+        for (measurement, overwrite) in cases {
+            let kind = measurement["type"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let shadow = run_real_host_shadow(measurement).await;
+            assert_eq!(shadow.component, shadow.native, "{kind} shadow mismatch");
+            assert!(
+                !shadow.progress.is_empty(),
+                "{kind} should emit progress through the real host adapter"
+            );
+            assert!(
+                shadow
+                    .progress
+                    .iter()
+                    .all(|(_, actual)| *actual == overwrite),
+                "{kind} emitted the wrong overwrite mode"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
