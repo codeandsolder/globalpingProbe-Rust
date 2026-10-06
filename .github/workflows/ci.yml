@@ -23,6 +23,7 @@ jobs:
     name: rust-skills2 strict nightly gate
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@main
     with:
+      cargo-args: --locked --workspace --exclude globalping-behavior --all-targets
       allow-test-panics: true
 
   stable:
