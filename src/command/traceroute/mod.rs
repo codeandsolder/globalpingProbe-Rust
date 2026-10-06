@@ -165,7 +165,7 @@ pub(crate) fn normalize_numeric_output(
     output.join("\n")
 }
 
-async fn enrich_hostnames(
+pub(crate) async fn enrich_hostnames(
     raw: &str,
     target: &ResolvedTarget,
     budget: Duration,
@@ -222,14 +222,14 @@ fn has_upstream_unreachable(output: &str) -> bool {
     })
 }
 
-struct NativeTraceOutput {
-    raw: String,
-    stderr: String,
-    timed_out: bool,
-    status: Option<std::process::ExitStatus>,
+pub(crate) struct NativeTraceOutput {
+    pub(crate) raw: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
+    pub(crate) status: Option<std::process::ExitStatus>,
 }
 
-async fn run_native_traceroute(
+pub(crate) async fn run_native_traceroute(
     args: &[String],
     process_timeout: Duration,
     target: &ResolvedTarget,

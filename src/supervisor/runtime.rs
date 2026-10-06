@@ -220,9 +220,13 @@ mod differential_tests {
     use wasmtime::component::{Component, HasSelf, Linker};
 
     use super::*;
-    use crate::command::ping::{normalize_ping_output, shape_ping_output};
-    use crate::command::traceroute::{normalize_numeric_output, shape_traceroute_output};
-    use crate::util::resolve_target::ResolvedTarget;
+    use crate::command::ping::{PingCommand, normalize_ping_output, shape_ping_output};
+    use crate::command::traceroute::{
+        TracerouteOptions, build_args as build_traceroute_args, enrich_hostnames,
+        normalize_numeric_output, run_native_traceroute, shape_traceroute_output,
+    };
+    use crate::util::measurement_timeout::MeasurementDeadline;
+    use crate::util::resolve_target::{ResolvedTarget, resolve_command_target};
 
     const COMPONENT_ENV: &str = "GLOBALPING_BEHAVIOR_COMPONENT";
 
@@ -261,6 +265,8 @@ mod differential_tests {
             kind: FixtureKind,
             events: Vec<wit_host::ExecutionEvent>,
             reverse: HashMap<String, String>,
+            resolved_address: impl Into<String>,
+            resolved_hostname: impl Into<String>,
         ) -> Self {
             Self {
                 limits: BehaviorRuntime::store_limits(),
@@ -269,8 +275,8 @@ mod differential_tests {
                 kind,
                 events: events.into(),
                 reverse,
-                resolved_address: "1.1.1.1".to_string(),
-                resolved_hostname: "one.one.one.one".to_string(),
+                resolved_address: resolved_address.into(),
+                resolved_hostname: resolved_hostname.into(),
                 progress: Vec::new(),
                 reverse_requests: Vec::new(),
                 started: false,
@@ -425,6 +431,25 @@ mod differential_tests {
         events: Vec<wit_host::ExecutionEvent>,
         reverse: HashMap<String, String>,
     ) -> FixtureResult {
+        run_fixture_with_identity(
+            kind,
+            measurement,
+            events,
+            reverse,
+            "1.1.1.1",
+            "one.one.one.one",
+        )
+        .await
+    }
+
+    async fn run_fixture_with_identity(
+        kind: FixtureKind,
+        measurement: Value,
+        events: Vec<wit_host::ExecutionEvent>,
+        reverse: HashMap<String, String>,
+        resolved_address: &str,
+        resolved_hostname: &str,
+    ) -> FixtureResult {
         let runtime = BehaviorRuntime::new()
             .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
         let path = component_path();
@@ -440,7 +465,14 @@ mod differential_tests {
             hi: 0x0123_4567_89ab_cdef,
             lo: 0xfedc_ba98_7654_3210,
         };
-        let state = FixtureState::new(&token, kind, events, reverse);
+        let state = FixtureState::new(
+            &token,
+            kind,
+            events,
+            reverse,
+            resolved_address,
+            resolved_hostname,
+        );
         let mut store = Store::new(runtime.engine(), state);
         store.limiter(|state| &mut state.limits);
         store
@@ -659,6 +691,156 @@ no answer yet for icmp_seq=1\n\
                 .unwrap_or_else(|error| panic!("native ping serialization failed: {error}"));
         assert_eq!(actual.final_json, expected);
         assert!(actual.progress.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_shadow_icmp_ping_matches_native_result() {
+        let measurement = json!({
+            "type": "ping",
+            "target": "1.1.1.1",
+            "protocol": "ICMP",
+            "packets": 2,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": false
+        });
+        let native = PingCommand
+            .run(measurement.clone())
+            .await
+            .unwrap_or_else(|error| panic!("native live ping failed: {error}"));
+        let raw = native["rawOutput"]
+            .as_str()
+            .unwrap_or_else(|| panic!("native live ping omitted rawOutput"));
+        let address = native["resolvedAddress"]
+            .as_str()
+            .unwrap_or_else(|| panic!("native live ping omitted resolvedAddress"));
+        let hostname = native["resolvedHostname"]
+            .as_str()
+            .unwrap_or_else(|| panic!("native live ping omitted resolvedHostname"));
+        let actual = run_fixture_with_identity(
+            FixtureKind::Ping,
+            measurement,
+            vec![stdout(raw), wit_host::ExecutionEvent::Exited(0)],
+            HashMap::new(),
+            address,
+            hostname,
+        )
+        .await;
+        assert_eq!(actual.final_json, native);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_shadow_tcp_ping_matches_native_result() {
+        let measurement = json!({
+            "type": "ping",
+            "target": "1.1.1.1",
+            "protocol": "TCP",
+            "port": 443,
+            "packets": 2,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": false
+        });
+        let native = PingCommand
+            .run(measurement.clone())
+            .await
+            .unwrap_or_else(|error| panic!("native live TCP ping failed: {error}"));
+        let raw = native["rawOutput"]
+            .as_str()
+            .unwrap_or_else(|| panic!("native live TCP ping omitted rawOutput"));
+        let address = native["resolvedAddress"]
+            .as_str()
+            .unwrap_or_else(|| panic!("native live TCP ping omitted resolvedAddress"));
+        let hostname = native["resolvedHostname"]
+            .as_str()
+            .unwrap_or_else(|| panic!("native live TCP ping omitted resolvedHostname"));
+        let actual = run_fixture_with_identity(
+            FixtureKind::Ping,
+            measurement,
+            vec![stdout(raw), wit_host::ExecutionEvent::Exited(0)],
+            HashMap::new(),
+            address,
+            hostname,
+        )
+        .await;
+        assert_eq!(actual.final_json, native);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_shadow_traceroute_matches_native_raw_pipeline() {
+        let measurement = json!({
+            "type": "traceroute",
+            "target": "1.1.1.1",
+            "protocol": "ICMP",
+            "port": 80,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": false
+        });
+        let opts: TracerouteOptions = serde_json::from_value(measurement.clone())
+            .unwrap_or_else(|error| panic!("live traceroute options failed: {error}"));
+        let deadline = MeasurementDeadline::new(opts.timeout);
+        let target = resolve_command_target(
+            &opts.target,
+            opts.ip_version,
+            std::time::Duration::from_secs(4),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("live traceroute target resolution failed: {error}"));
+        let mut resolved_options = opts.clone();
+        resolved_options.target = target.address.to_string();
+        let native = run_native_traceroute(
+            &build_traceroute_args(&resolved_options),
+            deadline.process_timeout(),
+            &target,
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("native raw traceroute failed: {error}"));
+        let hostnames = enrich_hostnames(&native.raw, &target, deadline.remaining()).await;
+        let expected = serde_json::to_value(shape_traceroute_output(
+            &native.raw,
+            &native.stderr,
+            native.timed_out,
+            native.status.map(|status| status.success()),
+            &target,
+            &hostnames,
+        ))
+        .unwrap_or_else(|error| panic!("native traceroute serialization failed: {error}"));
+
+        let reverse = hostnames
+            .into_iter()
+            .map(|(address, hostname)| (address.to_string(), hostname))
+            .collect();
+        let mut events = chunked_stdout(&native.raw, &[13, 47, 101, 173]);
+        if !native.stderr.is_empty() {
+            events.push(wit_host::ExecutionEvent::Stderr(
+                native.stderr.as_bytes().to_vec(),
+            ));
+        }
+        if native.timed_out {
+            events.push(wit_host::ExecutionEvent::TimedOut);
+        } else {
+            events.push(wit_host::ExecutionEvent::Exited(
+                native.status.and_then(|status| status.code()).unwrap_or(1),
+            ));
+        }
+        let actual = run_fixture_with_identity(
+            FixtureKind::Traceroute,
+            measurement,
+            events,
+            reverse,
+            &target.address.to_string(),
+            &target.hostname,
+        )
+        .await;
+        assert_eq!(actual.final_json, expected);
     }
 
     #[tokio::test]
