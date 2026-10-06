@@ -1,3 +1,4 @@
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -240,13 +241,23 @@ pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String,
     })?;
 
     let local_addresses = native.local_addresses.clone();
-    let payload = shape(native, |address| {
-        let parsed = address.parse::<IpAddr>().ok()?;
-        if is_private_or_reserved(parsed, &local_addresses) {
-            return None;
+    let mut seen = BTreeSet::new();
+    let mut hostnames = BTreeMap::new();
+    for address in native.stdout.lines().skip(1).flat_map(ip_tokens) {
+        if address == native.resolved_address || !seen.insert(address.clone()) {
+            continue;
         }
-        execution::reverse_lookup(token, address)
-    });
+        let Ok(parsed) = address.parse::<IpAddr>() else {
+            continue;
+        };
+        if is_private_or_reserved(parsed, &local_addresses) {
+            continue;
+        }
+        if let Some(hostname) = execution::reverse_lookup(token, &address)? {
+            hostnames.insert(address, hostname);
+        }
+    }
+    let payload = shape(native, |address| hostnames.get(address).cloned());
     serde_json::to_string(&payload).map_err(|error| BehaviorError::Internal(error.to_string()))
 }
 

@@ -949,9 +949,18 @@ name = "globalping-behavior"
 version = "0.1.0"
 dependencies = [
  "dlmalloc",
+ "globalping-behavior-core",
  "serde",
  "serde_json",
  "wit-bindgen 0.61.1",
+]
+
+[[package]]
+name = "globalping-behavior-core"
+version = "0.1.0"
+dependencies = [
+ "libm",
+ "serde",
 ]
 
 [[package]]
@@ -967,6 +976,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "futures-util",
+ "globalping-behavior-core",
  "hex",
  "if-addrs",
  "ipnet",

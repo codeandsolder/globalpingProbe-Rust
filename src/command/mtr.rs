@@ -19,7 +19,10 @@ use crate::util::resolve_target::{
     ResolveTargetError, ResolvedTarget, resolve_command_target, reverse_lookup,
 };
 use crate::util::validate::is_safe_host;
-use parse::{MtrHop, MtrStatus, ParsedMtr, build_output, normalize_ip_text, parse_raw};
+use parse::{
+    MtrEnrichmentEntry, MtrEnrichmentMap, MtrStatus, ParsedMtr, normalize_ip_text, render_progress,
+    shape_result,
+};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -152,15 +155,9 @@ struct NativeMtrOutput {
     timed_out: bool,
 }
 
-#[derive(Debug, Clone, Default)]
-struct HopEnrichment {
-    hostname: Option<String>,
-    asn: Vec<u32>,
-}
-
 #[derive(Clone, Default)]
 struct EnrichmentCache {
-    entries: Arc<RwLock<HashMap<IpAddr, HopEnrichment>>>,
+    entries: Arc<RwLock<HashMap<IpAddr, MtrEnrichmentEntry>>>,
 }
 
 impl EnrichmentCache {
@@ -196,30 +193,13 @@ impl EnrichmentCache {
         drop(entries);
     }
 
-    fn apply(&self, hops: &mut [MtrHop]) {
-        let entries = self
-            .entries
+    fn snapshot(&self) -> MtrEnrichmentMap {
+        self.entries
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        for hop in hops {
-            let Some(address) = hop
-                .resolved_address
-                .as_deref()
-                .and_then(|address| address.parse::<IpAddr>().ok())
-            else {
-                continue;
-            };
-            let Some(entry) = entries.get(&address) else {
-                continue;
-            };
-            if let Some(hostname) = &entry.hostname {
-                hop.resolved_hostname = Some(hostname.clone());
-            }
-            if !entry.asn.is_empty() {
-                hop.asn.clone_from(&entry.asn);
-            }
-        }
+            .iter()
+            .map(|(address, entry)| (address.to_string(), entry.clone()))
+            .collect()
     }
 }
 
@@ -274,16 +254,27 @@ impl MtrEnrichment {
     async fn wait(&mut self) {
         while self.tasks.join_next().await.is_some() {}
     }
-
-    fn apply(&self, hops: &mut [MtrHop]) {
-        self.cache.apply(hops);
-    }
 }
 
 fn render_mtr_progress(raw: &str, cache: &EnrichmentCache) -> Value {
-    let mut hops = parse_raw(raw, false);
-    cache.apply(&mut hops);
-    json!({ "rawOutput": build_output(&hops) })
+    json!({ "rawOutput": render_progress(raw, &cache.snapshot()) })
+}
+
+pub(crate) fn shape_mtr_output(
+    stdout: &str,
+    stderr: &str,
+    timed_out: bool,
+    target: &ResolvedTarget,
+    enrichment: &MtrEnrichmentMap,
+) -> ParsedMtr {
+    shape_result(
+        stdout,
+        stderr,
+        timed_out,
+        &target.address.to_string(),
+        &target.hostname,
+        enrichment,
+    )
 }
 
 fn queue_mtr_progress(tx: &ProgressTx, raw: Arc<RwLock<String>>, cache: EnrichmentCache) {
@@ -400,60 +391,13 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     .await?;
     enrichment.wait().await;
 
-    if native.stdout.trim().is_empty() {
-        return Ok(ParsedMtr {
-            status: MtrStatus::Failed,
-            failure_source: Some("internal".to_string()),
-            raw_output: if native.stderr.trim().is_empty() {
-                "Test failed. Please try again.".into()
-            } else {
-                native.stderr
-            },
-            resolved_address: None,
-            resolved_hostname: None,
-            hops: vec![],
-        });
-    }
-
-    let mut hops = parse_raw(&native.stdout, true);
-    enrichment.apply(&mut hops);
-    let target_address = target.address.to_string();
-    let target_responded = hops.last().is_some_and(|hop| {
-        hop.resolved_address.as_deref() == Some(target_address.as_str())
-            && hop.timings.iter().any(|timing| timing.rtt.is_some())
-    });
-    let has_drop = hops.iter().any(|hop| hop.stats.drop > 0);
-    let mut raw_output = build_output(&hops);
-    if let Some(first_hop) = hops.first_mut()
-        && first_hop.resolved_address.is_some()
-    {
-        first_hop.resolved_hostname = Some("_gateway".to_string());
-    }
-    let mut status = MtrStatus::Finished;
-    let mut failure_source = None;
-    if native.timed_out {
-        status = MtrStatus::Failed;
-        failure_source = Some(
-            if !target_responded && has_drop {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-        if !raw_output.is_empty() {
-            raw_output.push('\n');
-        }
-        raw_output.push_str("The measurement command timed out.");
-    }
-    Ok(ParsedMtr {
-        status,
-        failure_source,
-        raw_output,
-        resolved_address: Some(target_address),
-        resolved_hostname: Some(target.hostname),
-        hops,
-    })
+    Ok(shape_mtr_output(
+        &native.stdout,
+        &native.stderr,
+        native.timed_out,
+        &target,
+        &enrichment.cache.snapshot(),
+    ))
 }
 
 fn cymru_query_name(address: IpAddr) -> String {
@@ -546,6 +490,7 @@ pub async fn run_measurement(target: &str, protocol: &str, ip_version: u8) -> Re
 mod tests {
     use super::*;
     use parse::{HopTiming, compute_stats};
+    use parse::{build_output, parse_raw};
 
     const RAW_3HOP: &str = "\
 h 0 192.168.1.1

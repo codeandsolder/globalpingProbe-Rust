@@ -94,6 +94,7 @@ hex = { version = "0.4", optional = true }
 semver = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 wasmtime = { version = "49", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std"], optional = true }
+globalping-behavior-core = { path = "crates/globalping-behavior-core" }
 
 [dev-dependencies]
 bytes         = "1"
@@ -117,6 +118,6 @@ opt-level = 0
 debug = true
 
 [workspace]
-members = [".", "crates/globalping-behavior"]
+members = [".", "crates/globalping-behavior", "crates/globalping-behavior-core"]
 default-members = ["."]
 resolver = "2"

@@ -1,11 +1,8 @@
 [package]
-name = "globalping-behavior"
+name = "globalping-behavior-core"
 version = "0.1.0"
 edition = "2024"
 publish = false
-
-[lib]
-crate-type = ["cdylib"]
 
 [lints.rust]
 unsafe_code = "deny"
@@ -22,7 +19,4 @@ unimplemented = "deny"
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-dlmalloc = { version = "0.2", features = ["global"] }
-wit-bindgen = { version = "0.61", default-features = false, features = ["macros", "realloc"] }
-globalping-behavior-core = { path = "../globalping-behavior-core" }
+libm = "0.2"

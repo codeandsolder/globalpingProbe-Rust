@@ -223,6 +223,7 @@ mod differential_tests {
     use crate::command::dns::{
         DnsOptions, DnsProgress, dns_progress_output, shape_classic_output, shape_trace_output,
     };
+    use crate::command::mtr::shape_mtr_output;
     use crate::command::ping::{PingCommand, normalize_ping_output, shape_ping_output};
     use crate::command::traceroute::{
         TracerouteOptions, build_args as build_traceroute_args, enrich_hostnames,
@@ -230,6 +231,7 @@ mod differential_tests {
     };
     use crate::util::measurement_timeout::MeasurementDeadline;
     use crate::util::resolve_target::{ResolvedTarget, resolve_command_target};
+    use globalping_behavior_core::mtr::{MtrEnrichmentEntry, MtrEnrichmentMap, render_progress};
 
     const COMPONENT_ENV: &str = "GLOBALPING_BEHAVIOR_COMPONENT";
 
@@ -238,6 +240,7 @@ mod differential_tests {
         Ping,
         Dns,
         Traceroute,
+        Mtr,
     }
 
     impl FixtureKind {
@@ -246,6 +249,7 @@ mod differential_tests {
                 Self::Ping => wit_host::MeasurementKind::Ping,
                 Self::Dns => wit_host::MeasurementKind::Dns,
                 Self::Traceroute => wit_host::MeasurementKind::Traceroute,
+                Self::Mtr => wit_host::MeasurementKind::Mtr,
             }
         }
     }
@@ -257,11 +261,13 @@ mod differential_tests {
         kind: FixtureKind,
         events: VecDeque<wit_host::ExecutionEvent>,
         reverse: HashMap<String, String>,
+        asn: HashMap<String, Vec<u32>>,
         resolved_address: String,
         resolved_hostname: String,
         target_is_icann: bool,
         progress: Vec<(String, bool)>,
         reverse_requests: Vec<String>,
+        asn_requests: Vec<String>,
         started: bool,
     }
 
@@ -271,6 +277,7 @@ mod differential_tests {
             kind: FixtureKind,
             events: Vec<wit_host::ExecutionEvent>,
             reverse: HashMap<String, String>,
+            asn: HashMap<String, Vec<u32>>,
             resolved_address: impl Into<String>,
             resolved_hostname: impl Into<String>,
             target_is_icann: bool,
@@ -282,11 +289,13 @@ mod differential_tests {
                 kind,
                 events: events.into(),
                 reverse,
+                asn,
                 resolved_address: resolved_address.into(),
                 resolved_hostname: resolved_hostname.into(),
                 target_is_icann,
                 progress: Vec::new(),
                 reverse_requests: Vec::new(),
+                asn_requests: Vec::new(),
                 started: false,
             }
         }
@@ -369,16 +378,18 @@ mod differential_tests {
         fn lookup_asn(
             &mut self,
             token: wit_host::CapabilityToken,
-            _address: String,
+            address: String,
         ) -> impl Future<Output = Result<Vec<u32>, wit_host::HostError>> + Send {
-            ready(if self.valid_token(&token) {
-                Ok(Vec::new())
+            let result = if self.valid_token(&token) {
+                self.asn_requests.push(address.clone());
+                Ok(self.asn.get(&address).cloned().unwrap_or_default())
             } else {
                 Err(Self::error(
                     wit_host::HostErrorCode::InvalidToken,
                     "fixture token mismatch",
                 ))
-            })
+            };
+            ready(result)
         }
 
         fn emit_progress(
@@ -404,6 +415,7 @@ mod differential_tests {
         final_json: Value,
         progress: Vec<(Value, bool)>,
         reverse_requests: Vec<String>,
+        asn_requests: Vec<String>,
     }
 
     fn component_path() -> PathBuf {
@@ -460,6 +472,27 @@ mod differential_tests {
         resolved_address: &str,
         resolved_hostname: &str,
     ) -> FixtureResult {
+        run_fixture_with_enrichment(
+            kind,
+            measurement,
+            events,
+            reverse,
+            HashMap::new(),
+            resolved_address,
+            resolved_hostname,
+        )
+        .await
+    }
+
+    async fn run_fixture_with_enrichment(
+        kind: FixtureKind,
+        measurement: Value,
+        events: Vec<wit_host::ExecutionEvent>,
+        reverse: HashMap<String, String>,
+        asn: HashMap<String, Vec<u32>>,
+        resolved_address: &str,
+        resolved_hostname: &str,
+    ) -> FixtureResult {
         let runtime = BehaviorRuntime::new()
             .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
         let path = component_path();
@@ -487,6 +520,7 @@ mod differential_tests {
             kind,
             events,
             reverse,
+            asn,
             resolved_address,
             resolved_hostname,
             target_is_icann,
@@ -532,6 +566,7 @@ mod differential_tests {
             final_json,
             progress,
             reverse_requests: store.data().reverse_requests.clone(),
+            asn_requests: store.data().asn_requests.clone(),
         }
     }
 
@@ -582,6 +617,129 @@ mod differential_tests {
             let current = lines[..count].join("\n");
             (json!({"rawOutput": normalize_numeric_output(&current, target, &HashMap::new())}), false)
         }).collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_mtr_enrichment_and_overwrite_progress_match_native() {
+        const RAW: &str = "h 0 192.168.1.1\nx 0 0\np 0 1200 0\nh 1 8.8.8.8\nx 1 0\np 1 5000 0\nh 2 1.1.1.1\nx 2 0\np 2 8000 0\n";
+        let measurement = json!({
+            "type":"mtr",
+            "target":"one.one.one.one",
+            "protocol":"ICMP",
+            "packets":1,
+            "ipVersion":4,
+            "timeout":10,
+            "inProgressUpdates":true
+        });
+        let lines = [
+            "h 0 192.168.1.1\n",
+            "x 0 0\n",
+            "p 0 1200 0\n",
+            "h 1 8.8.8.8\n",
+            "x 1 0\n",
+            "p 1 5000 0\n",
+            "h 2 1.1.1.1\n",
+            "x 2 0\n",
+            "p 2 8000 0\n",
+        ];
+        let mut events = Vec::new();
+        for line in lines {
+            events.push(stdout(line));
+            if let Some(address) = line
+                .strip_prefix("h ")
+                .and_then(|tail| tail.split_whitespace().nth(1))
+            {
+                events.push(wit_host::ExecutionEvent::ObservedAddress(
+                    address.to_string(),
+                ));
+            }
+        }
+        events.push(wit_host::ExecutionEvent::Exited(0));
+        let reverse = HashMap::from([("8.8.8.8".to_string(), "dns.google".to_string())]);
+        let asn = HashMap::from([
+            ("8.8.8.8".to_string(), vec![15169]),
+            ("1.1.1.1".to_string(), vec![13335]),
+        ]);
+        let actual = run_fixture_with_enrichment(
+            FixtureKind::Mtr,
+            measurement,
+            events,
+            reverse,
+            asn,
+            "1.1.1.1",
+            "one.one.one.one",
+        )
+        .await;
+        let target = ResolvedTarget {
+            address: "1.1.1.1"
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture IP failed: {error}")),
+            hostname: "one.one.one.one".to_string(),
+        };
+        let enrichment = MtrEnrichmentMap::from([
+            (
+                "8.8.8.8".to_string(),
+                MtrEnrichmentEntry {
+                    hostname: Some("dns.google".to_string()),
+                    asn: vec![15169],
+                },
+            ),
+            (
+                "1.1.1.1".to_string(),
+                MtrEnrichmentEntry {
+                    hostname: Some("one.one.one.one".to_string()),
+                    asn: vec![13335],
+                },
+            ),
+        ]);
+        let expected = serde_json::to_value(shape_mtr_output(RAW, "", false, &target, &enrichment))
+            .unwrap_or_else(|error| panic!("native MTR serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert!(actual.progress.iter().all(|(_, overwrite)| *overwrite));
+        assert_eq!(
+            actual.progress.last().map(|(value, _)| value),
+            Some(&json!({ "rawOutput": render_progress(RAW, &enrichment) }))
+        );
+        assert_eq!(actual.reverse_requests, vec!["8.8.8.8".to_string()]);
+        assert_eq!(
+            actual.asn_requests,
+            vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_mtr_timeout_target_failure_matches_native() {
+        const RAW: &str = "h 0 192.168.1.1\nx 0 0\np 0 1200 0\nh 1 8.8.8.8\nx 1 0\n";
+        let events = vec![stdout(RAW), wit_host::ExecutionEvent::TimedOut];
+        let actual = run_fixture_with_enrichment(
+            FixtureKind::Mtr,
+            json!({"type":"mtr","target":"1.1.1.1","timeout":2,"inProgressUpdates":false}),
+            events,
+            HashMap::new(),
+            HashMap::new(),
+            "1.1.1.1",
+            "1.1.1.1",
+        )
+        .await;
+        let target = ResolvedTarget {
+            address: "1.1.1.1"
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture IP failed: {error}")),
+            hostname: "1.1.1.1".to_string(),
+        };
+        let expected = serde_json::to_value(shape_mtr_output(
+            RAW,
+            "",
+            true,
+            &target,
+            &MtrEnrichmentMap::new(),
+        ))
+        .unwrap_or_else(|error| panic!("native timeout MTR serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert_eq!(actual.final_json["failureSource"], "target");
+        assert!(actual.progress.is_empty());
     }
 
     #[tokio::test]

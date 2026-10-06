@@ -120,6 +120,7 @@ mod component {
     mod dns;
     mod execution;
     mod ip;
+    mod mtr;
     mod ping;
     mod traceroute;
 
@@ -169,7 +170,8 @@ mod component {
                 MeasurementKind::Traceroute => {
                     traceroute::run(&job.token, measurement.in_progress_updates)
                 }
-                _ => Err(BehaviorError::Internal(
+                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
+                MeasurementKind::Http => Err(BehaviorError::Internal(
                     "measurement behavior has not migrated to the component yet".to_string(),
                 )),
             }
@@ -178,6 +180,7 @@ mod component {
         fn self_test() -> Result<(), String> {
             dns::self_test()?;
             ping::self_test()?;
+            mtr::self_test()?;
             traceroute::self_test()?;
             Ok(())
         }

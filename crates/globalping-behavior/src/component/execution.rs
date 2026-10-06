@@ -53,10 +53,25 @@ fn decode_utf8(bytes: &[u8]) -> Result<&str, BehaviorError> {
 pub fn collect<F>(
     token: &CapabilityToken,
     expected_kind: MeasurementKind,
-    mut on_stdout: F,
+    on_stdout: F,
 ) -> Result<NativeExecution, BehaviorError>
 where
     F: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
+{
+    collect_with_observed(token, expected_kind, on_stdout, |_address, _raw, _start| {
+        Ok(())
+    })
+}
+
+pub fn collect_with_observed<F, G>(
+    token: &CapabilityToken,
+    expected_kind: MeasurementKind,
+    mut on_stdout: F,
+    mut on_observed: G,
+) -> Result<NativeExecution, BehaviorError>
+where
+    F: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
+    G: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
 {
     let start = host::start(copy_token(token)).map_err(map_host_error)?;
     if !same_kind(start.kind, expected_kind) {
@@ -92,7 +107,10 @@ where
             ExecutionEvent::Stderr(bytes) => {
                 stderr_bytes.extend_from_slice(&bytes);
             }
-            ExecutionEvent::ObservedAddress(_) => {}
+            ExecutionEvent::ObservedAddress(address) => {
+                let cumulative = decode_utf8(&stdout_bytes)?;
+                on_observed(&address, cumulative, &start)?;
+            }
             ExecutionEvent::Exited(code) => {
                 exit_code = Some(code);
                 break;
@@ -132,8 +150,13 @@ pub fn emit_progress(
     host::emit_progress(copy_token(token), result_json, overwrite).map_err(map_host_error)
 }
 
-pub fn reverse_lookup(token: &CapabilityToken, address: &str) -> Option<String> {
-    host::reverse_lookup(copy_token(token), address)
-        .ok()
-        .flatten()
+pub fn reverse_lookup(
+    token: &CapabilityToken,
+    address: &str,
+) -> Result<Option<String>, BehaviorError> {
+    host::reverse_lookup(copy_token(token), address).map_err(map_host_error)
+}
+
+pub fn lookup_asn(token: &CapabilityToken, address: &str) -> Result<Vec<u32>, BehaviorError> {
+    host::lookup_asn(copy_token(token), address).map_err(map_host_error)
 }
