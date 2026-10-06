@@ -21,5 +21,7 @@ todo = "deny"
 unimplemented = "deny"
 
 [dependencies]
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 dlmalloc = { version = "0.2", features = ["global"] }
 wit-bindgen = { version = "0.61", default-features = false, features = ["macros", "realloc"] }

@@ -949,6 +949,8 @@ name = "globalping-behavior"
 version = "0.1.0"
 dependencies = [
  "dlmalloc",
+ "serde",
+ "serde_json",
  "wit-bindgen 0.61.1",
 ]
 

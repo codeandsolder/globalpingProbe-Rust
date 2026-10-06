@@ -33,6 +33,37 @@ mod component {
     use alloc::alloc::{Layout, alloc, dealloc, realloc};
     use alloc::string::{String, ToString as _};
 
+    use core::ffi::c_void;
+
+    use serde::Deserialize;
+
+    // The freestanding custom-world component deliberately links no WASI libc.
+    // LLVM/core may still lower byte-slice equality to the conventional C ABI
+    // `memcmp` symbol, so provide that one runtime primitive locally.
+    //
+    // SAFETY: callers must provide readable `len`-byte regions when `len > 0`;
+    // the zero-length case performs no pointer access and therefore also accepts
+    // null pointers, matching the C `memcmp` contract.
+    #[unsafe(export_name = "memcmp")]
+    unsafe extern "C" fn runtime_memcmp(
+        left: *const c_void,
+        right: *const c_void,
+        len: usize,
+    ) -> i32 {
+        let left = left.cast::<u8>();
+        let right = right.cast::<u8>();
+        for index in 0..len {
+            // SAFETY: guaranteed by the function's C ABI caller contract above.
+            let left_byte = unsafe { *left.add(index) };
+            // SAFETY: guaranteed by the function's C ABI caller contract above.
+            let right_byte = unsafe { *right.add(index) };
+            if left_byte != right_byte {
+                return i32::from(left_byte) - i32::from(right_byte);
+            }
+        }
+        0
+    }
+
     // `wasm-component-ld` requires this canonical ABI allocator export. The
     // implementation deliberately lives beside wit-bindgen's generated unsafe
     // glue, and all size/alignment arithmetic is validated before touching the
@@ -83,26 +114,58 @@ mod component {
         world: "probe-behavior",
     });
 
+    use codeandsolder::globalping_behavior::host::MeasurementKind;
     use exports::codeandsolder::globalping_behavior::guest::{BehaviorError, Guest, Job};
+
+    mod execution;
+    mod ping;
+    mod traceroute;
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct MeasurementRequest {
+        target: String,
+        #[serde(default)]
+        in_progress_updates: bool,
+    }
 
     struct Behavior;
 
     impl Guest for Behavior {
         fn handle(job: Job) -> Result<String, BehaviorError> {
-            // The first migration checkpoint only proves the custom component ABI.
-            // Measurement execution moves here one command at a time; until then,
-            // the native implementation remains authoritative.
             if job.measurement_json.is_empty() {
                 return Err(BehaviorError::InvalidJob(
                     "measurement request is empty".to_string(),
                 ));
             }
-            Err(BehaviorError::Internal(
-                "measurement behavior has not migrated to the component yet".to_string(),
-            ))
+            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
+                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
+            if measurement.target.is_empty() {
+                return Err(BehaviorError::InvalidJob(
+                    "measurement target is empty".to_string(),
+                ));
+            }
+
+            match job.kind {
+                MeasurementKind::Ping => ping::run(
+                    &job.token,
+                    &measurement.target,
+                    measurement.in_progress_updates,
+                ),
+                MeasurementKind::Traceroute => traceroute::run(
+                    &job.token,
+                    &measurement.target,
+                    measurement.in_progress_updates,
+                ),
+                _ => Err(BehaviorError::Internal(
+                    "measurement behavior has not migrated to the component yet".to_string(),
+                )),
+            }
         }
 
         fn self_test() -> Result<(), String> {
+            ping::self_test()?;
+            traceroute::self_test()?;
             Ok(())
         }
     }
