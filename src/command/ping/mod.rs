@@ -146,7 +146,7 @@ async fn run_ping(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
     }
 }
 
-fn normalize_ping_output(output: &str, address: &str, hostname: &str) -> String {
+pub(crate) fn normalize_ping_output(output: &str, address: &str, hostname: &str) -> String {
     if address == hostname {
         return output.to_string();
     }
@@ -179,6 +179,35 @@ fn normalize_ping_output(output: &str, address: &str, hostname: &str) -> String 
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub(crate) fn shape_icmp_output(
+    raw_output: &str,
+    address: &str,
+    hostname: &str,
+    timed_out: bool,
+) -> ParsedPing {
+    let normalized = normalize_ping_output(raw_output, address, hostname);
+    let mut parsed = parse(&normalized);
+    parsed.resolved_address = Some(address.to_string());
+    parsed.resolved_hostname = Some(hostname.to_string());
+    if timed_out {
+        parsed.status = PingStatus::Failed;
+        parsed.failure_source = Some(
+            if parsed.timings.is_empty()
+                && (normalized.contains("no answer yet for ")
+                    || normalized.contains("100% packet loss"))
+            {
+                "target"
+            } else {
+                "internal"
+            }
+            .to_string(),
+        );
+    } else if parsed.status == PingStatus::Failed {
+        parsed.failure_source = Some("internal".to_string());
+    }
+    parsed
 }
 
 async fn run_icmp(
@@ -224,27 +253,12 @@ async fn run_icmp(
         completed??;
     }
 
-    let normalized = normalize_ping_output(&raw_output, &address, &target.hostname);
-    let mut parsed = parse(&normalized);
-    parsed.resolved_address = Some(address);
-    parsed.resolved_hostname = Some(target.hostname.clone());
-    if timed_out {
-        parsed.status = PingStatus::Failed;
-        parsed.failure_source = Some(
-            if parsed.timings.is_empty()
-                && (normalized.contains("no answer yet for ")
-                    || normalized.contains("100% packet loss"))
-            {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-    } else if parsed.status == PingStatus::Failed {
-        parsed.failure_source = Some("internal".to_string());
-    }
-    Ok(parsed)
+    Ok(shape_icmp_output(
+        &raw_output,
+        &address,
+        &target.hostname,
+        timed_out,
+    ))
 }
 
 fn format_compact(value: f64, decimals: usize) -> String {

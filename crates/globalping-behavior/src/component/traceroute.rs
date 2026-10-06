@@ -65,6 +65,96 @@ fn ip_tokens(line: &str) -> Vec<String> {
         .collect()
 }
 
+fn prefix_matches(bytes: &[u8], network: &[u8], prefix_bits: u8) -> bool {
+    let full_bytes = usize::from(prefix_bits / 8);
+    let remaining_bits = prefix_bits % 8;
+    if bytes[..full_bytes] != network[..full_bytes] {
+        return false;
+    }
+    if remaining_bits == 0 {
+        return true;
+    }
+    let mask = u8::MAX << (8 - remaining_bits);
+    bytes[full_bytes] & mask == network[full_bytes] & mask
+}
+
+fn canonical_address(address: IpAddr) -> IpAddr {
+    let IpAddr::V6(v6) = address else {
+        return address;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
+    }
+    let octets = v6.octets();
+    if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return IpAddr::V4(core::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    address
+}
+
+fn is_private_or_reserved(address: IpAddr) -> bool {
+    let address = canonical_address(address);
+    match address {
+        IpAddr::V4(v4) => {
+            let bytes = v4.octets();
+            [
+                ([0, 0, 0, 0], 8),
+                ([10, 0, 0, 0], 8),
+                ([100, 64, 0, 0], 10),
+                ([127, 0, 0, 0], 8),
+                ([169, 254, 0, 0], 16),
+                ([172, 16, 0, 0], 12),
+                ([192, 0, 0, 0], 24),
+                ([192, 0, 2, 0], 24),
+                ([192, 88, 99, 0], 24),
+                ([192, 168, 0, 0], 16),
+                ([198, 18, 0, 0], 15),
+                ([198, 51, 100, 0], 24),
+                ([203, 0, 113, 0], 24),
+                ([224, 0, 0, 0], 4),
+                ([240, 0, 0, 0], 4),
+            ]
+            .iter()
+            .any(|(network, prefix)| prefix_matches(&bytes, network, *prefix))
+        }
+        IpAddr::V6(v6) => {
+            let bytes = v6.octets();
+            [
+                ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 128),
+                ([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 128),
+                (
+                    [
+                        0x00, 0x64, 0xff, 0x9b, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
+                    48,
+                ),
+                ([0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 64),
+                ([0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32),
+                (
+                    [0x20, 0x01, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    28,
+                ),
+                (
+                    [0x20, 0x01, 0x00, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    28,
+                ),
+                (
+                    [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    32,
+                ),
+                ([0x20, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 16),
+                ([0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 7),
+                ([0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 10),
+                ([0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 8),
+            ]
+            .iter()
+            .any(|(network, prefix)| prefix_matches(&bytes, network, *prefix))
+        }
+    }
+}
+
 fn normalize_with<F>(raw: &str, target: &str, mut lookup: F) -> String
 where
     F: FnMut(&str) -> Option<String>,
@@ -155,18 +245,17 @@ fn has_upstream_unreachable(output: &str) -> bool {
     })
 }
 
-fn shape<F>(target: &str, native: NativeExecution, lookup: F) -> ResultPayload
+fn shape<F>(native: NativeExecution, lookup: F) -> ResultPayload
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let address = header_address(&native.stdout);
-    let normalized = normalize_with(&native.stdout, target, lookup);
+    let parsed_header_address = header_address(&native.stdout);
+    let normalized = normalize_with(&native.stdout, &native.resolved_hostname, lookup);
     let mut hops = parse_hops(&normalized);
-    let parsed = !normalized.is_empty() && address.is_some();
-    let target_responded = address.as_deref().is_some_and(|target_address| {
-        hops.last().is_some_and(|hop| {
-            hop.resolved_address.as_deref() == Some(target_address) && !hop.timings.is_empty()
-        })
+    let parsed = !normalized.is_empty() && parsed_header_address.is_some();
+    let target_responded = hops.last().is_some_and(|hop| {
+        hop.resolved_address.as_deref() == Some(native.resolved_address.as_str())
+            && !hop.timings.is_empty()
     });
 
     let mut raw_output = normalized;
@@ -219,22 +308,18 @@ where
         },
         failure_source,
         raw_output,
-        resolved_address: address,
-        resolved_hostname: Some(target.to_string()),
+        resolved_address: Some(native.resolved_address),
+        resolved_hostname: Some(native.resolved_hostname),
         hops,
     }
 }
 
-pub fn run(
-    token: &CapabilityToken,
-    target: &str,
-    in_progress_updates: bool,
-) -> Result<String, BehaviorError> {
-    let native = execution::collect(token, MeasurementKind::Traceroute, |_chunk, all| {
+pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String, BehaviorError> {
+    let native = execution::collect(token, MeasurementKind::Traceroute, |_chunk, all, start| {
         if !in_progress_updates {
             return Ok(());
         }
-        let progress = normalize_with(all, target, |_| None);
+        let progress = normalize_with(all, &start.resolved_hostname, |_| None);
         if progress.is_empty() {
             return Ok(());
         }
@@ -243,7 +328,11 @@ pub fn run(
         execution::emit_progress(token, &payload, false)
     })?;
 
-    let payload = shape(target, native, |address| {
+    let payload = shape(native, |address| {
+        let parsed = address.parse::<IpAddr>().ok()?;
+        if is_private_or_reserved(parsed) {
+            return None;
+        }
         execution::reverse_lookup(token, address)
     });
     serde_json::to_string(&payload).map_err(|error| BehaviorError::Internal(error.to_string()))
@@ -251,12 +340,14 @@ pub fn run(
 
 pub fn self_test() -> Result<(), String> {
     let native = NativeExecution {
+        resolved_address: "1.1.1.1".to_string(),
+        resolved_hostname: "one.one.one.one".to_string(),
         stdout: "traceroute to 1.1.1.1 (1.1.1.1), 20 hops max, 60 byte packets\n 1  192.168.1.1  1.234 ms  1.156 ms\n 2  10.0.0.1  5.678 ms  5.432 ms\n 3  * * *\n 4  1.1.1.1  8.123 ms  7.956 ms".to_string(),
         stderr: String::new(),
         exit_code: Some(0),
         timed_out: false,
     };
-    let parsed = shape("one.one.one.one", native, |_| None);
+    let parsed = shape(native, |_| None);
     if !matches!(parsed.status, Status::Finished)
         || parsed.resolved_address.as_deref() != Some("1.1.1.1")
         || parsed.resolved_hostname.as_deref() != Some("one.one.one.one")

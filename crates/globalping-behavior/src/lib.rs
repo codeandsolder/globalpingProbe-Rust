@@ -147,16 +147,10 @@ mod component {
             }
 
             match job.kind {
-                MeasurementKind::Ping => ping::run(
-                    &job.token,
-                    &measurement.target,
-                    measurement.in_progress_updates,
-                ),
-                MeasurementKind::Traceroute => traceroute::run(
-                    &job.token,
-                    &measurement.target,
-                    measurement.in_progress_updates,
-                ),
+                MeasurementKind::Ping => ping::run(&job.token, measurement.in_progress_updates),
+                MeasurementKind::Traceroute => {
+                    traceroute::run(&job.token, measurement.in_progress_updates)
+                }
                 _ => Err(BehaviorError::Internal(
                     "measurement behavior has not migrated to the component yet".to_string(),
                 )),

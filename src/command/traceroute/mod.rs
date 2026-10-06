@@ -127,7 +127,7 @@ fn line_ip_tokens(line: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-fn normalize_numeric_output(
+pub(crate) fn normalize_numeric_output(
     raw: &str,
     target: &ResolvedTarget,
     hostnames: &HashMap<IpAddr, String>,
@@ -286,6 +286,54 @@ async fn run_native_traceroute(
     })
 }
 
+pub(crate) fn shape_traceroute_output(
+    raw: &str,
+    stderr: &str,
+    timed_out: bool,
+    succeeded: Option<bool>,
+    target: &ResolvedTarget,
+    hostnames: &HashMap<IpAddr, String>,
+) -> ParsedTraceroute {
+    let normalized = normalize_numeric_output(raw, target, hostnames);
+    let mut parsed = parse(&normalized);
+    parsed.resolved_address = Some(target.address.to_string());
+    parsed.resolved_hostname = Some(target.hostname.clone());
+
+    if timed_out {
+        parsed.status = TracerouteStatus::Failed;
+        parsed.failure_source = Some(timeout_failure_source(raw, &parsed, target).to_string());
+        let mut timeout_raw = raw.to_string();
+        if !timeout_raw.is_empty() {
+            timeout_raw.push_str("\n\n");
+        }
+        timeout_raw.push_str("The measurement command timed out.");
+        parsed.raw_output = normalize_numeric_output(&timeout_raw, target, hostnames);
+    } else if succeeded == Some(false) {
+        parsed.status = TracerouteStatus::Failed;
+        parsed.failure_source = Some(
+            if has_upstream_unreachable(&normalized) {
+                "target"
+            } else {
+                "internal"
+            }
+            .to_string(),
+        );
+        if parsed.raw_output.trim().is_empty() {
+            parsed.raw_output = if stderr.trim().is_empty() {
+                "Test failed. Please try again.".to_string()
+            } else {
+                stderr.to_string()
+            };
+        }
+    } else if parsed.status == TracerouteStatus::Failed {
+        parsed.failure_source = Some("internal".to_string());
+        if parsed.raw_output.trim().is_empty() {
+            parsed.raw_output = "Test failed. Please try again.".to_string();
+        }
+    }
+    parsed
+}
+
 async fn run_traceroute(
     opts: &TracerouteOptions,
     progress: Option<ProgressTx>,
@@ -308,49 +356,14 @@ async fn run_traceroute(
     )
     .await?;
     let hostnames = enrich_hostnames(&native.raw, &target, deadline.remaining()).await;
-    let normalized = normalize_numeric_output(&native.raw, &target, &hostnames);
-    let mut parsed = parse(&normalized);
-    parsed.resolved_address = Some(target.address.to_string());
-    parsed.resolved_hostname = Some(target.hostname.clone());
-
-    if native.timed_out {
-        parsed.status = TracerouteStatus::Failed;
-        parsed.failure_source =
-            Some(timeout_failure_source(&native.raw, &parsed, &target).to_string());
-        let mut raw = native.raw;
-        if !raw.is_empty() {
-            raw.push_str(
-                "
-
-",
-            );
-        }
-        raw.push_str("The measurement command timed out.");
-        parsed.raw_output = normalize_numeric_output(&raw, &target, &hostnames);
-    } else if native.status.is_some_and(|status| !status.success()) {
-        parsed.status = TracerouteStatus::Failed;
-        parsed.failure_source = Some(
-            if has_upstream_unreachable(&normalized) {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-        if parsed.raw_output.trim().is_empty() {
-            parsed.raw_output = if native.stderr.trim().is_empty() {
-                "Test failed. Please try again.".to_string()
-            } else {
-                native.stderr
-            };
-        }
-    } else if parsed.status == TracerouteStatus::Failed {
-        parsed.failure_source = Some("internal".to_string());
-        if parsed.raw_output.trim().is_empty() {
-            parsed.raw_output = "Test failed. Please try again.".to_string();
-        }
-    }
-    Ok(parsed)
+    Ok(shape_traceroute_output(
+        &native.raw,
+        &native.stderr,
+        native.timed_out,
+        native.status.map(|status| status.success()),
+        &target,
+        &hostnames,
+    ))
 }
 
 /// Run one traceroute measurement without the socket layer.

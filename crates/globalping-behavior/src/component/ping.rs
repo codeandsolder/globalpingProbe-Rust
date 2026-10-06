@@ -153,15 +153,19 @@ fn parse_stats(raw: &str) -> Stats {
     stats
 }
 
-fn shape(target: &str, native: &NativeExecution) -> ResultPayload {
-    let address = header_address(&native.stdout);
-    let normalized = normalize(&native.stdout, target, address.as_deref());
+fn shape(native: &NativeExecution) -> ResultPayload {
+    let header_address = header_address(&native.stdout);
+    let normalized = normalize(
+        &native.stdout,
+        &native.resolved_hostname,
+        Some(&native.resolved_address),
+    );
     let timings = normalized
         .lines()
         .filter_map(parse_timing)
         .collect::<Vec<_>>();
     let stats = parse_stats(&normalized);
-    let parsed = !normalized.is_empty() && address.is_some();
+    let parsed = !normalized.is_empty() && header_address.is_some();
     let failure_source = if native.timed_out {
         Some(
             if timings.is_empty()
@@ -188,43 +192,42 @@ fn shape(target: &str, native: &NativeExecution) -> ResultPayload {
         },
         failure_source,
         raw_output: normalized.trim_end_matches('\n').to_string(),
-        resolved_address: address,
-        resolved_hostname: Some(target.to_string()),
+        resolved_address: Some(native.resolved_address.clone()),
+        resolved_hostname: Some(native.resolved_hostname.clone()),
         timings,
         stats,
     }
 }
 
-pub fn run(
-    token: &CapabilityToken,
-    target: &str,
-    in_progress_updates: bool,
-) -> Result<String, BehaviorError> {
-    let native = execution::collect(token, MeasurementKind::Ping, |chunk, all| {
+pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String, BehaviorError> {
+    let native = execution::collect(token, MeasurementKind::Ping, |line, _all, start| {
         if !in_progress_updates {
             return Ok(());
         }
-        let address = header_address(all);
-        let progress = normalize(chunk, target, address.as_deref());
-        if progress.is_empty() {
-            return Ok(());
-        }
+        let mut progress = normalize(
+            line,
+            &start.resolved_hostname,
+            Some(&start.resolved_address),
+        );
+        progress.push('\n');
         let payload = serde_json::to_string(&serde_json::json!({ "rawOutput": progress }))
             .map_err(|error| BehaviorError::Internal(error.to_string()))?;
         execution::emit_progress(token, &payload, false)
     })?;
-    let payload = shape(target, &native);
+    let payload = shape(&native);
     serde_json::to_string(&payload).map_err(|error| BehaviorError::Internal(error.to_string()))
 }
 
 pub fn self_test() -> Result<(), String> {
     let native = NativeExecution {
+        resolved_address: "1.1.1.1".to_string(),
+        resolved_hostname: "one.one.one.one".to_string(),
         stdout: "PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.\n64 bytes from 1.1.1.1: icmp_seq=1 ttl=58 time=41.7 ms\n\n--- 1.1.1.1 ping statistics ---\n1 packets transmitted, 1 received, 0% packet loss, time 1003ms\nrtt min/avg/max/mdev = 41.700/41.700/41.700/0.000 ms\n".to_string(),
         stderr: String::new(),
         exit_code: Some(0),
         timed_out: false,
     };
-    let parsed = shape("one.one.one.one", &native);
+    let parsed = shape(&native);
     if !matches!(parsed.status, Status::Finished)
         || parsed.resolved_address.as_deref() != Some("1.1.1.1")
         || parsed.resolved_hostname.as_deref() != Some("one.one.one.one")

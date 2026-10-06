@@ -1,4 +1,4 @@
-package codeandsolder:globalping-behavior@0.1.0;
+package codeandsolder:globalping-behavior@0.2.0;
 
 interface host {
     record capability-token {
@@ -34,6 +34,8 @@ interface host {
         kind: measurement-kind,
         raw-byte-limit: u32,
         deadline-ms: u32,
+        resolved-address: string,
+        resolved-hostname: string,
     }
 
     variant execution-event {

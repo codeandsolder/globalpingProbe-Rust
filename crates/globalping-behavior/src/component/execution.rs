@@ -1,4 +1,5 @@
 use alloc::string::{String, ToString as _};
+use alloc::vec::Vec;
 
 use super::codeandsolder::globalping_behavior::host::{
     self, CapabilityToken, ExecutionEvent, HostError, HostErrorCode, MeasurementKind,
@@ -6,6 +7,8 @@ use super::codeandsolder::globalping_behavior::host::{
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 
 pub struct NativeExecution {
+    pub resolved_address: String,
+    pub resolved_hostname: String,
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
@@ -39,12 +42,10 @@ fn map_host_error(error: HostError) -> BehaviorError {
     }
 }
 
-fn append_utf8(target: &mut String, bytes: &[u8]) -> Result<String, BehaviorError> {
-    let chunk = core::str::from_utf8(bytes).map_err(|_| {
+fn decode_utf8(bytes: &[u8]) -> Result<&str, BehaviorError> {
+    core::str::from_utf8(bytes).map_err(|_| {
         BehaviorError::Internal("native execution emitted non-UTF-8 output".to_string())
-    })?;
-    target.push_str(chunk);
-    Ok(chunk.to_string())
+    })
 }
 
 pub fn collect<F>(
@@ -53,7 +54,7 @@ pub fn collect<F>(
     mut on_stdout: F,
 ) -> Result<NativeExecution, BehaviorError>
 where
-    F: FnMut(&str, &str) -> Result<(), BehaviorError>,
+    F: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
 {
     let start = host::start(copy_token(token)).map_err(map_host_error)?;
     if !same_kind(start.kind, expected_kind) {
@@ -62,8 +63,9 @@ where
         ));
     }
 
-    let mut stdout = String::new();
-    let mut stderr = String::new();
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    let mut stdout_line_start = 0;
     let mut exit_code = None;
     let mut timed_out = false;
 
@@ -73,11 +75,20 @@ where
         };
         match event {
             ExecutionEvent::Stdout(bytes) => {
-                let chunk = append_utf8(&mut stdout, &bytes)?;
-                on_stdout(&chunk, &stdout)?;
+                stdout_bytes.extend_from_slice(&bytes);
+                while let Some(relative_end) = stdout_bytes[stdout_line_start..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                {
+                    let line_end = stdout_line_start + relative_end;
+                    let line = decode_utf8(&stdout_bytes[stdout_line_start..line_end])?;
+                    let cumulative = decode_utf8(&stdout_bytes[..line_end])?;
+                    on_stdout(line, cumulative, &start)?;
+                    stdout_line_start = line_end + 1;
+                }
             }
             ExecutionEvent::Stderr(bytes) => {
-                let _ = append_utf8(&mut stderr, &bytes)?;
+                stderr_bytes.extend_from_slice(&bytes);
             }
             ExecutionEvent::ObservedAddress(_) => {}
             ExecutionEvent::Exited(code) => {
@@ -91,7 +102,17 @@ where
         }
     }
 
+    if stdout_line_start < stdout_bytes.len() {
+        let line = decode_utf8(&stdout_bytes[stdout_line_start..])?;
+        let cumulative = decode_utf8(&stdout_bytes)?;
+        on_stdout(line, cumulative, &start)?;
+    }
+
+    let stdout = decode_utf8(&stdout_bytes)?.to_string();
+    let stderr = decode_utf8(&stderr_bytes)?.to_string();
     Ok(NativeExecution {
+        resolved_address: start.resolved_address,
+        resolved_hostname: start.resolved_hostname,
         stdout,
         stderr,
         exit_code,
