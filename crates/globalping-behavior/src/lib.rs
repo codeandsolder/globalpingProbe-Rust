@@ -23,8 +23,11 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 // rest of this crate remains under the workspace `unsafe_code = "deny"` lint.
 #[allow(
     unsafe_code,
+    reason = "wit-bindgen generates canonical ABI glue that requires unsafe exports and blocks"
+)]
+#[allow(
     clippy::same_length_and_capacity,
-    reason = "wit-bindgen generates canonical ABI glue that reconstructs exact-length buffers and requires unsafe exports"
+    reason = "wit-bindgen reconstructs exact-length canonical ABI buffers"
 )]
 mod component {
     use alloc::alloc::{Layout, alloc, dealloc, realloc};
