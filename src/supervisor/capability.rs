@@ -94,6 +94,11 @@ pub struct MeasurementScope {
 }
 
 impl MeasurementScope {
+    /// Freeze a server-issued measurement into the capability scope.
+    ///
+    /// # Errors
+    /// Returns a policy error when the measurement type or target is missing,
+    /// or when its requested timeout is outside the supervisor's hard bounds.
     pub fn from_server_measurement(measurement: Value) -> Result<Self, PolicyError> {
         let kind = measurement
             .get("type")
@@ -152,6 +157,10 @@ impl CapabilityLease {
         }
     }
 
+    /// Authorize the single native execution owned by this capability.
+    ///
+    /// # Errors
+    /// Returns an error when the lease expired or execution already started.
     pub fn authorize_start(&mut self, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
         if self.started {
@@ -161,6 +170,10 @@ impl CapabilityLease {
         Ok(())
     }
 
+    /// Account and authorize one poll of the native execution.
+    ///
+    /// # Errors
+    /// Returns an error when the lease is unusable or the poll quota is exhausted.
     pub fn authorize_poll(&mut self, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
         if !self.started {
@@ -176,6 +189,11 @@ impl CapabilityLease {
         Ok(())
     }
 
+    /// Account raw native output before exposing it to the behavior component.
+    ///
+    /// # Errors
+    /// Returns an error when the lease is unusable or the cumulative byte quota
+    /// would be exceeded.
     pub fn account_raw_bytes(&mut self, bytes: usize, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
         if !self.started {
@@ -191,6 +209,10 @@ impl CapabilityLease {
         Ok(())
     }
 
+    /// Record an address actually observed by the authorized native execution.
+    ///
+    /// # Errors
+    /// Returns an error when the lease is expired or execution has not started.
     pub fn observe_address(&mut self, address: IpAddr, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
         if !self.started {
@@ -200,6 +222,11 @@ impl CapabilityLease {
         Ok(())
     }
 
+    /// Authorize PTR enrichment for an address observed by this measurement.
+    ///
+    /// # Errors
+    /// Returns an error when the lease is unusable, the address was not observed,
+    /// or the enrichment quota is exhausted.
     pub fn authorize_reverse_lookup(
         &mut self,
         address: IpAddr,
@@ -209,6 +236,11 @@ impl CapabilityLease {
         self.account_enrichment_lookup()
     }
 
+    /// Authorize ASN enrichment for an observed public address.
+    ///
+    /// # Errors
+    /// Returns an error when the lease is unusable, the address was not observed,
+    /// the address is private, or the enrichment quota is exhausted.
     pub fn authorize_asn_lookup(
         &mut self,
         address: IpAddr,
@@ -221,8 +253,17 @@ impl CapabilityLease {
         self.account_enrichment_lookup()
     }
 
+    /// Authorize one bounded progress payload emitted by the behavior component.
+    ///
+    /// # Errors
+    /// Returns an error when the lease expired, the payload is too large, or the
+    /// progress-event quota is exhausted. Rejected oversized payloads do not
+    /// consume an event slot.
     pub fn authorize_progress(&mut self, json: &str, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
+        if json.len() > MAX_PROGRESS_JSON_BYTES {
+            return Err(PolicyError::ProgressQuota);
+        }
         self.progress_events = self
             .progress_events
             .checked_add(1)
@@ -230,12 +271,14 @@ impl CapabilityLease {
         if self.progress_events > MAX_PROGRESS_EVENTS {
             return Err(PolicyError::ProgressEventQuota);
         }
-        if json.len() > MAX_PROGRESS_JSON_BYTES {
-            return Err(PolicyError::ProgressQuota);
-        }
         Ok(())
     }
 
+    /// Authorize the final serialized result returned by the behavior component.
+    ///
+    /// # Errors
+    /// Returns an error when the lease expired or the result exceeds the hard
+    /// final-payload limit.
     pub fn authorize_final_result(&self, json: &str, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
         if json.len() > MAX_FINAL_JSON_BYTES {
@@ -387,6 +430,26 @@ mod tests {
         assert_eq!(
             lease.authorize_final_result(&"x".repeat(MAX_FINAL_JSON_BYTES + 1), now),
             Err(PolicyError::FinalResultQuota)
+        );
+    }
+
+    #[test]
+    fn rejected_progress_payload_does_not_consume_event_quota() {
+        let now = Instant::now();
+        let mut lease = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, ping_scope(10), now);
+        assert_eq!(lease.authorize_start(now), Ok(()));
+
+        assert_eq!(
+            lease.authorize_progress(&"x".repeat(MAX_PROGRESS_JSON_BYTES + 1), now),
+            Err(PolicyError::ProgressQuota)
+        );
+        assert_eq!(lease.progress_events, 0);
+        for _ in 0..MAX_PROGRESS_EVENTS {
+            assert_eq!(lease.authorize_progress("{}", now), Ok(()));
+        }
+        assert_eq!(
+            lease.authorize_progress("{}", now),
+            Err(PolicyError::ProgressEventQuota)
         );
     }
 

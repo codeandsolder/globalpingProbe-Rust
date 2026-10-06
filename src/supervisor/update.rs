@@ -89,6 +89,12 @@ pub struct VerifiedBehavior {
     pub component: Arc<[u8]>,
 }
 
+/// Verify an update artifact before it can enter an activation slot.
+///
+/// # Errors
+/// Returns an error for oversized or mismatched bytes, malformed or invalid
+/// cryptographic metadata, rollback attempts, unsupported ABI versions, or a
+/// component requiring a newer supervisor.
 pub fn verify_candidate(
     manifest: BehaviorManifest,
     component: Vec<u8>,
@@ -147,7 +153,7 @@ pub struct BehaviorSlots {
 
 impl BehaviorSlots {
     #[must_use]
-    pub fn new(active: VerifiedBehavior) -> Self {
+    pub const fn new(active: VerifiedBehavior) -> Self {
         let accepted_sequence = active.manifest.sequence;
         Self {
             active,
@@ -171,6 +177,11 @@ impl BehaviorSlots {
         self.previous = Some(std::mem::replace(&mut self.active, candidate));
     }
 
+    /// Restore the immediately previous verified slot without lowering the
+    /// highest network update sequence ever accepted.
+    ///
+    /// # Errors
+    /// Returns [`UpdateError::NoPreviousVersion`] when there is no rollback slot.
     pub fn rollback(&mut self) -> Result<(), UpdateError> {
         let previous = self.previous.take().ok_or(UpdateError::NoPreviousVersion)?;
         self.active = previous;
@@ -269,6 +280,24 @@ mod tests {
             &Version::new(0, 48, 0),
         );
         assert!(matches!(result, Err(UpdateError::RollbackSequence)));
+    }
+
+    #[test]
+    fn activation_replaces_rollback_slot_with_immediate_previous_version() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let first = verified(1, b"component-v1", &key);
+        let second = verified(2, b"component-v2", &key);
+        let third = verified(3, b"component-v3", &key);
+        let mut slots = BehaviorSlots::new(first);
+        slots.activate(second);
+        slots.activate(third);
+
+        assert_eq!(slots.active().manifest.sequence, 3);
+        assert_eq!(slots.accepted_sequence(), 3);
+        assert_eq!(slots.rollback(), Ok(()));
+        assert_eq!(slots.active().manifest.sequence, 2);
+        assert_eq!(slots.accepted_sequence(), 3);
+        assert_eq!(slots.rollback(), Err(UpdateError::NoPreviousVersion));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! separately bounded by memory, fuel, and epoch deadlines. The linker exposes
 //! only the versioned Globalping host interface; ambient WASI is never linked.
 
+use std::future::{Future, ready};
 use std::sync::Arc;
 
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -156,50 +157,47 @@ impl SelfTestState {
     }
 }
 
-impl codeandsolder::globalping_behavior::host::Host for SelfTestState {
-    async fn start(
+use codeandsolder::globalping_behavior::host as wit_host;
+
+impl wit_host::Host for SelfTestState {
+    fn start(
         &mut self,
-        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
-    ) -> Result<
-        codeandsolder::globalping_behavior::host::ExecutionStart,
-        codeandsolder::globalping_behavior::host::HostError,
-    > {
-        Self::denied()
+        _token: wit_host::CapabilityToken,
+    ) -> impl Future<Output = Result<wit_host::ExecutionStart, wit_host::HostError>> + Send {
+        ready(Self::denied())
     }
 
-    async fn poll(
+    fn poll(
         &mut self,
-        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
-    ) -> Result<
-        Option<codeandsolder::globalping_behavior::host::ExecutionEvent>,
-        codeandsolder::globalping_behavior::host::HostError,
-    > {
-        Self::denied()
+        _token: wit_host::CapabilityToken,
+    ) -> impl Future<Output = Result<Option<wit_host::ExecutionEvent>, wit_host::HostError>> + Send
+    {
+        ready(Self::denied())
     }
 
-    async fn reverse_lookup(
+    fn reverse_lookup(
         &mut self,
-        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+        _token: wit_host::CapabilityToken,
         _address: String,
-    ) -> Result<Option<String>, codeandsolder::globalping_behavior::host::HostError> {
-        Self::denied()
+    ) -> impl Future<Output = Result<Option<String>, wit_host::HostError>> + Send {
+        ready(Self::denied())
     }
 
-    async fn lookup_asn(
+    fn lookup_asn(
         &mut self,
-        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+        _token: wit_host::CapabilityToken,
         _address: String,
-    ) -> Result<Vec<u32>, codeandsolder::globalping_behavior::host::HostError> {
-        Self::denied()
+    ) -> impl Future<Output = Result<Vec<u32>, wit_host::HostError>> + Send {
+        ready(Self::denied())
     }
 
-    async fn emit_progress(
+    fn emit_progress(
         &mut self,
-        _token: codeandsolder::globalping_behavior::host::CapabilityToken,
+        _token: wit_host::CapabilityToken,
         _result_json: String,
         _overwrite: bool,
-    ) -> Result<(), codeandsolder::globalping_behavior::host::HostError> {
-        Self::denied()
+    ) -> impl Future<Output = Result<(), wit_host::HostError>> + Send {
+        ready(Self::denied())
     }
 }
 
