@@ -7,4 +7,5 @@
 
 pub mod capability;
 pub mod runtime;
+pub mod storage;
 pub mod update;

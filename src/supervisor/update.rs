@@ -89,17 +89,19 @@ pub struct VerifiedBehavior {
     pub component: Arc<[u8]>,
 }
 
-/// Verify an update artifact before it can enter an activation slot.
+/// Verify a signed behavior artifact without applying network anti-rollback policy.
+///
+/// This is used when reloading an already accepted on-disk slot after restart.
+/// The caller must separately restore the persisted highest accepted sequence.
 ///
 /// # Errors
 /// Returns an error for oversized or mismatched bytes, malformed or invalid
-/// cryptographic metadata, rollback attempts, unsupported ABI versions, or a
-/// component requiring a newer supervisor.
-pub fn verify_candidate(
+/// cryptographic metadata, unsupported ABI versions, or a component requiring
+/// a newer supervisor.
+pub fn verify_artifact(
     manifest: BehaviorManifest,
     component: Vec<u8>,
     verifying_key: &VerifyingKey,
-    accepted_sequence: u64,
     supervisor_version: &Version,
 ) -> Result<VerifiedBehavior, UpdateError> {
     if component.len() > MAX_COMPONENT_BYTES {
@@ -107,9 +109,6 @@ pub fn verify_candidate(
     }
     if manifest.size != component.len() as u64 {
         return Err(UpdateError::SizeMismatch);
-    }
-    if manifest.sequence <= accepted_sequence {
-        return Err(UpdateError::RollbackSequence);
     }
     if manifest.abi_major != SUPPORTED_ABI_MAJOR || manifest.abi_minor > SUPPORTED_ABI_MINOR {
         return Err(UpdateError::UnsupportedAbi);
@@ -142,6 +141,24 @@ pub fn verify_candidate(
         manifest,
         component: component.into(),
     })
+}
+
+/// Verify a network update artifact before it can enter an activation slot.
+///
+/// # Errors
+/// Returns an error for rollback attempts or any artifact-integrity,
+/// compatibility, or signature failure reported by [`verify_artifact`].
+pub fn verify_candidate(
+    manifest: BehaviorManifest,
+    component: Vec<u8>,
+    verifying_key: &VerifyingKey,
+    accepted_sequence: u64,
+    supervisor_version: &Version,
+) -> Result<VerifiedBehavior, UpdateError> {
+    if manifest.sequence <= accepted_sequence {
+        return Err(UpdateError::RollbackSequence);
+    }
+    verify_artifact(manifest, component, verifying_key, supervisor_version)
 }
 
 #[derive(Debug)]
