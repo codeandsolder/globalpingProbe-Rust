@@ -14,6 +14,10 @@ use ed25519_dalek::VerifyingKey;
 use semver::Version;
 use tokio::sync::{Mutex, RwLock};
 
+use super::health::{
+    BehaviorHealthPolicy, BehaviorHealthSnapshot, BehaviorHealthState, HealthDecision,
+    ShadowHealthEvent,
+};
 use super::runtime::{BehaviorShadowExecutor, RuntimeError};
 use super::storage::{PersistentBehaviorSlots, StorageError};
 use super::update::{BehaviorManifest, UpdateError, verify_candidate};
@@ -24,6 +28,7 @@ type SharedSlots = Arc<StdMutex<Option<PersistentBehaviorSlots>>>;
 pub struct BehaviorBootstrapConfig {
     root: PathBuf,
     verifying_key: VerifyingKey,
+    health_policy: BehaviorHealthPolicy,
 }
 
 impl BehaviorBootstrapConfig {
@@ -37,6 +42,7 @@ impl BehaviorBootstrapConfig {
         Self {
             root: root.into(),
             verifying_key,
+            health_policy: BehaviorHealthPolicy::default(),
         }
     }
 
@@ -48,6 +54,17 @@ impl BehaviorBootstrapConfig {
     #[must_use]
     pub const fn verifying_key(&self) -> &VerifyingKey {
         &self.verifying_key
+    }
+
+    #[must_use]
+    pub const fn with_health_policy(mut self, health_policy: BehaviorHealthPolicy) -> Self {
+        self.health_policy = health_policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn health_policy(&self) -> BehaviorHealthPolicy {
+        self.health_policy
     }
 }
 
@@ -98,6 +115,17 @@ impl From<RuntimeError> for BootstrapError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BehaviorHealthAction {
+    None,
+    IgnoredStaleSequence,
+    ThresholdReachedNoPrevious,
+    RolledBack {
+        from_sequence: u64,
+        to_sequence: u64,
+    },
+}
+
 struct ExecutorSlots {
     active: Option<Arc<BehaviorShadowExecutor>>,
     previous: Option<Arc<BehaviorShadowExecutor>>,
@@ -110,6 +138,7 @@ pub struct BehaviorController {
     update_lock: Mutex<()>,
     slots: SharedSlots,
     executors: RwLock<ExecutorSlots>,
+    health: Mutex<BehaviorHealthState>,
 }
 
 impl BehaviorController {
@@ -128,6 +157,7 @@ impl BehaviorController {
         if !config.root.is_absolute() {
             return Err(BootstrapError::RelativeRoot);
         }
+        let health_policy = config.health_policy;
         let supervisor_version = Version::parse(env!("CARGO_PKG_VERSION"))
             .map_err(BootstrapError::InvalidSupervisorVersion)?;
         let load_root = config.root.clone();
@@ -168,6 +198,10 @@ impl BehaviorController {
             supervisor_version,
             update_lock: Mutex::new(()),
             slots: Arc::new(StdMutex::new(slots)),
+            health: Mutex::new(BehaviorHealthState::new(
+                health_policy,
+                active_executor.as_ref().map(|executor| executor.sequence()),
+            )),
             executors: RwLock::new(ExecutorSlots {
                 active: active_executor,
                 previous: previous_executor,
@@ -179,6 +213,56 @@ impl BehaviorController {
     #[must_use]
     pub async fn executor(&self) -> Option<Arc<BehaviorShadowExecutor>> {
         self.executors.read().await.active.clone()
+    }
+
+    #[must_use]
+    pub async fn health_snapshot(&self) -> BehaviorHealthSnapshot {
+        self.health.lock().await.snapshot()
+    }
+
+    /// Record one diagnostic shadow outcome and roll back when the configured
+    /// consecutive hard-fault threshold is reached for the still-active slot.
+    ///
+    /// # Errors
+    /// Returns an error only when a recommended rollback cannot be persisted.
+    pub async fn observe_shadow_health(
+        &self,
+        sequence: u64,
+        event: ShadowHealthEvent,
+    ) -> Result<BehaviorHealthAction, BootstrapError> {
+        let decision = {
+            let mut health = self.health.lock().await;
+            health.observe(sequence, event)
+        };
+        match decision {
+            HealthDecision::None => return Ok(BehaviorHealthAction::None),
+            HealthDecision::IgnoredStaleSequence => {
+                return Ok(BehaviorHealthAction::IgnoredStaleSequence);
+            }
+            HealthDecision::RollbackRecommended => {}
+        }
+
+        let _update = self.update_lock.lock().await;
+        if self.active_sequence()? != Some(sequence) {
+            return Ok(BehaviorHealthAction::IgnoredStaleSequence);
+        }
+        if !self.has_previous()? {
+            return Ok(BehaviorHealthAction::ThresholdReachedNoPrevious);
+        }
+
+        let next_executor = match self.rollback_locked().await {
+            Ok(executor) => executor,
+            Err(error) => {
+                self.health.lock().await.clear_rollback_recommendation();
+                return Err(error);
+            }
+        };
+        let to_sequence = next_executor.sequence();
+        self.health.lock().await.reset(Some(to_sequence));
+        Ok(BehaviorHealthAction::RolledBack {
+            from_sequence: sequence,
+            to_sequence,
+        })
     }
 
     /// Highest network sequence ever accepted, including after local rollback.
@@ -252,6 +336,10 @@ impl BehaviorController {
         let old_active = executors.active.replace(Arc::clone(&next_executor));
         executors.previous = old_active;
         drop(executors);
+        self.health
+            .lock()
+            .await
+            .reset(Some(next_executor.sequence()));
         Ok(next_executor)
     }
 
@@ -267,6 +355,15 @@ impl BehaviorController {
     /// storage lock is poisoned.
     pub async fn rollback(&self) -> Result<Arc<BehaviorShadowExecutor>, BootstrapError> {
         let _update = self.update_lock.lock().await;
+        let next_executor = self.rollback_locked().await?;
+        self.health
+            .lock()
+            .await
+            .reset(Some(next_executor.sequence()));
+        Ok(next_executor)
+    }
+
+    async fn rollback_locked(&self) -> Result<Arc<BehaviorShadowExecutor>, BootstrapError> {
         if !self.has_previous()? {
             return Err(UpdateError::NoPreviousVersion.into());
         }

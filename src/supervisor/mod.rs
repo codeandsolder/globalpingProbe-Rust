@@ -7,6 +7,7 @@
 
 pub mod bootstrap;
 pub mod capability;
+pub mod health;
 pub mod runtime;
 pub mod storage;
 pub mod update;

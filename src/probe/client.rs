@@ -32,7 +32,8 @@ use crate::status::{
     ping_test::PingTest,
     status_manager::StatusManager,
 };
-use crate::supervisor::bootstrap::BehaviorController;
+use crate::supervisor::bootstrap::{BehaviorController, BehaviorHealthAction};
+use crate::supervisor::health::ShadowHealthEvent;
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -227,6 +228,49 @@ fn make_command(mtype: &str) -> Option<CommandKind> {
     }
 }
 
+async fn apply_behavior_health(
+    controller: &BehaviorController,
+    sequence: u64,
+    event: ShadowHealthEvent,
+) {
+    match controller.observe_shadow_health(sequence, event).await {
+        Ok(BehaviorHealthAction::None) => {}
+        Ok(BehaviorHealthAction::IgnoredStaleSequence) => {
+            debug!(
+                target: "behavior-shadow",
+                behavior_sequence = sequence,
+                "Ignored health result from a behavior slot that is no longer active."
+            );
+        }
+        Ok(BehaviorHealthAction::ThresholdReachedNoPrevious) => {
+            warn!(
+                target: "behavior-shadow",
+                behavior_sequence = sequence,
+                "Behavior health threshold reached, but no previous verified slot exists for rollback."
+            );
+        }
+        Ok(BehaviorHealthAction::RolledBack {
+            from_sequence,
+            to_sequence,
+        }) => {
+            warn!(
+                target: "behavior-shadow",
+                from_sequence,
+                to_sequence,
+                "Behavior health threshold triggered automatic local rollback."
+            );
+        }
+        Err(error) => {
+            warn!(
+                target: "behavior-shadow",
+                behavior_sequence = sequence,
+                %error,
+                "Behavior health accounting could not complete rollback."
+            );
+        }
+    }
+}
+
 fn spawn_behavior_shadow(
     behavior_controller: Option<Arc<BehaviorController>>,
     measurement: &Value,
@@ -251,7 +295,7 @@ fn spawn_behavior_shadow(
         };
         let sequence = shadow.sequence();
         let build_id = shadow.build_id().to_string();
-        match shadow.run(shadow_measurement).await {
+        let health_event = match shadow.run(shadow_measurement).await {
             Ok(result) if result.component == result.native => {
                 debug!(
                     target: "behavior-shadow",
@@ -263,6 +307,7 @@ fn spawn_behavior_shadow(
                     streamed_progress = result.progress_during_native_execution,
                     "Behavior shadow matched its native oracle."
                 );
+                ShadowHealthEvent::Match
             }
             Ok(result) => {
                 warn!(
@@ -275,19 +320,28 @@ fn spawn_behavior_shadow(
                     streamed_progress = result.progress_during_native_execution,
                     "Behavior shadow diverged from its native oracle."
                 );
+                ShadowHealthEvent::Divergence
             }
             Err(error) => {
+                let health_event = if error.is_component_health_fault() {
+                    ShadowHealthEvent::RuntimeFault
+                } else {
+                    ShadowHealthEvent::Inconclusive
+                };
                 warn!(
                     target: "behavior-shadow",
                     measurement_id = %shadow_mid,
                     measurement_type = %shadow_type,
                     behavior_sequence = sequence,
                     behavior_build_id = %build_id,
+                    component_health_fault = error.is_component_health_fault(),
                     %error,
                     "Behavior shadow execution failed."
                 );
+                health_event
             }
-        }
+        };
+        apply_behavior_health(&controller, sequence, health_event).await;
     });
 }
 

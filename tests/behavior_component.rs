@@ -1,9 +1,11 @@
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use globalping_probe::supervisor::bootstrap::{
-    BehaviorBootstrapConfig, BehaviorController, BootstrapError,
+    BehaviorBootstrapConfig, BehaviorController, BehaviorHealthAction, BootstrapError,
 };
+use globalping_probe::supervisor::health::{BehaviorHealthPolicy, ShadowHealthEvent};
 use globalping_probe::supervisor::runtime::{BehaviorRuntime, BehaviorShadowExecutor};
 use globalping_probe::supervisor::storage::{PersistentBehaviorSlots, StorageError};
 use globalping_probe::supervisor::update::{
@@ -185,6 +187,63 @@ async fn behavior_controller_activates_signed_updates_and_preserves_high_water()
     assert_eq!(reloaded.active().manifest.sequence, 1);
     assert_eq!(reloaded.accepted_sequence(), 2);
     assert!(reloaded.previous().is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+async fn behavior_controller_auto_rolls_back_after_hard_fault_threshold() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    let policy = BehaviorHealthPolicy::new(
+        NonZeroU32::new(2).unwrap_or_else(|| panic!("threshold must be non-zero")),
+    );
+    let config = BehaviorBootstrapConfig::new(dir.path(), behavior_signing_key().verifying_key())
+        .with_health_policy(policy);
+    let controller = BehaviorController::load(config)
+        .await
+        .unwrap_or_else(|error| panic!("empty behavior controller failed: {error}"));
+
+    let (first_manifest, first_component) = signed_component(1, "healthy-previous");
+    controller
+        .activate_candidate(first_manifest, first_component)
+        .await
+        .unwrap_or_else(|error| panic!("first activation failed: {error}"));
+    let (second_manifest, second_component) = signed_component(2, "unhealthy-active");
+    controller
+        .activate_candidate(second_manifest, second_component)
+        .await
+        .unwrap_or_else(|error| panic!("second activation failed: {error}"));
+
+    assert_eq!(
+        controller
+            .observe_shadow_health(2, ShadowHealthEvent::Divergence)
+            .await
+            .unwrap_or_else(|error| panic!("health accounting failed: {error}")),
+        BehaviorHealthAction::None
+    );
+    assert_eq!(controller.health_snapshot().await.consecutive_faults, 1);
+
+    assert_eq!(
+        controller
+            .observe_shadow_health(2, ShadowHealthEvent::RuntimeFault)
+            .await
+            .unwrap_or_else(|error| panic!("health rollback failed: {error}")),
+        BehaviorHealthAction::RolledBack {
+            from_sequence: 2,
+            to_sequence: 1,
+        }
+    );
+    assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+    assert!(!controller.has_previous().unwrap_or(true));
+    let executor = controller
+        .executor()
+        .await
+        .unwrap_or_else(|| panic!("rollback executor must be available"));
+    assert_eq!(executor.sequence(), 1);
+    let health = controller.health_snapshot().await;
+    assert_eq!(health.active_sequence, Some(1));
+    assert_eq!(health.consecutive_faults, 0);
+    assert_eq!(health.matches, 0);
 }
 
 #[tokio::test]

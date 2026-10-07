@@ -28,6 +28,10 @@ pub enum RuntimeError {
     Instantiate(wasmtime::Error),
     Call(wasmtime::Error),
     GuestSelfTest(String),
+    GuestInvalidJob(String),
+    GuestInternal(String),
+    GuestInvalidOutput(String),
+    Policy(String),
     Job(String),
 }
 
@@ -43,12 +47,38 @@ impl std::fmt::Display for RuntimeError {
             }
             Self::Call(error) => write!(f, "behavior component call failed: {error}"),
             Self::GuestSelfTest(error) => write!(f, "behavior component self-test failed: {error}"),
+            Self::GuestInvalidJob(error) => {
+                write!(f, "behavior component rejected its authorized job: {error}")
+            }
+            Self::GuestInternal(error) => write!(
+                f,
+                "behavior component reported an internal failure: {error}"
+            ),
+            Self::GuestInvalidOutput(error) => {
+                write!(f, "behavior component returned invalid JSON: {error}")
+            }
+            Self::Policy(error) => write!(f, "behavior component violated host policy: {error}"),
             Self::Job(error) => write!(f, "behavior component job failed: {error}"),
         }
     }
 }
 
 impl std::error::Error for RuntimeError {}
+
+impl RuntimeError {
+    /// Whether this execution failure is attributable to the behavior component
+    /// strongly enough to advance automatic rollback health accounting.
+    #[must_use]
+    pub const fn is_component_health_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::Call(_)
+                | Self::GuestInvalidJob(_)
+                | Self::GuestInvalidOutput(_)
+                | Self::Policy(_)
+        )
+    }
+}
 
 #[derive(Clone)]
 pub struct BehaviorRuntime {

@@ -800,15 +800,23 @@ impl BehaviorRuntime {
             .codeandsolder_globalping_behavior_guest()
             .call_handle(&mut store, &job)
             .await
-            .map_err(RuntimeError::Call)?
-            .map_err(|error| RuntimeError::Job(format!("{error:?}")))?;
+            .map_err(RuntimeError::Call)?;
+        let result = match result {
+            Ok(result) => result,
+            Err(exports::codeandsolder::globalping_behavior::guest::BehaviorError::InvalidJob(
+                message,
+            )) => return Err(RuntimeError::GuestInvalidJob(message)),
+            Err(exports::codeandsolder::globalping_behavior::guest::BehaviorError::Internal(
+                message,
+            )) => return Err(RuntimeError::GuestInternal(message)),
+        };
         store
             .data()
             .lease
             .authorize_final_result(&result, std::time::Instant::now())
-            .map_err(|error| RuntimeError::Job(error.to_string()))?;
-        let component_result =
-            serde_json::from_str(&result).map_err(|error| RuntimeError::Job(error.to_string()))?;
+            .map_err(|error| RuntimeError::Policy(error.to_string()))?;
+        let component_result = serde_json::from_str(&result)
+            .map_err(|error| RuntimeError::GuestInvalidOutput(error.to_string()))?;
         let native = store.data().oracle_result().map_err(RuntimeError::Job)?;
         Ok(BehaviorShadowResult {
             native,
