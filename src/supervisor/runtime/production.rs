@@ -835,3 +835,50 @@ impl BehaviorRuntime {
             .await
     }
 }
+
+#[derive(Clone)]
+pub struct BehaviorShadowExecutor {
+    runtime: BehaviorRuntime,
+    compiled: CompiledBehavior,
+}
+
+impl BehaviorShadowExecutor {
+    /// Build a diagnostic shadow executor from an artifact that has already
+    /// passed signature, digest, ABI, supervisor-version, and rollback checks.
+    ///
+    /// # Errors
+    /// Returns an error if the runtime cannot be configured, the verified
+    /// component cannot be compiled, or its built-in self-test fails.
+    pub async fn from_verified(
+        verified: crate::supervisor::update::VerifiedBehavior,
+    ) -> Result<Self, RuntimeError> {
+        let runtime = BehaviorRuntime::new()?;
+        let compiled = runtime.compile(verified)?;
+        runtime.self_test(&compiled).await?;
+        Ok(Self { runtime, compiled })
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.compiled.sequence
+    }
+
+    #[must_use]
+    pub fn build_id(&self) -> &str {
+        &self.compiled.build_id
+    }
+
+    /// Run one diagnostic-only behavior shadow. No guest progress is forwarded
+    /// outside the executor; callers decide what to do with the parity result.
+    ///
+    /// # Errors
+    /// Returns any bounded host, Wasmtime, guest, or serialization failure.
+    pub async fn run(
+        &self,
+        measurement: serde_json::Value,
+    ) -> Result<BehaviorShadowResult, RuntimeError> {
+        self.runtime
+            .shadow_measurement(&self.compiled, measurement, None)
+            .await
+    }
+}

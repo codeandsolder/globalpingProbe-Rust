@@ -50,10 +50,10 @@ jobs:
         run: cargo +1.99.0 build --locked --release --no-default-features --features wasm-core --bin globalping-sandbox --target wasm32-wasip2
       - name: Build WASIp2 behavior component
         run: cargo +1.99.0 build --locked --release -p globalping-behavior --target wasm32-wasip2
-      - name: Self-test signed behavior component without ambient WASI
+      - name: Verify signed behavior runtime and shadow executor
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
-        run: cargo +1.99.0 test --locked --test behavior_component signed_component_instantiates_without_ambient_wasi -- --ignored --exact
+        run: cargo +1.99.0 test --locked --test behavior_component -- --ignored
       - name: Differential-test WASIp2 ping/DNS/traceroute/MTR behavior against native shaping
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm

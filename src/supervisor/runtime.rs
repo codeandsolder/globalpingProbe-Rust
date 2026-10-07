@@ -212,7 +212,7 @@ wasmtime::component::bindgen!({
 });
 
 mod production;
-pub use production::BehaviorShadowResult;
+pub use production::{BehaviorShadowExecutor, BehaviorShadowResult};
 
 #[cfg(test)]
 mod differential_tests {

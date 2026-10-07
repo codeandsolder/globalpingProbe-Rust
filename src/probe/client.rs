@@ -32,6 +32,7 @@ use crate::status::{
     ping_test::PingTest,
     status_manager::StatusManager,
 };
+use crate::supervisor::runtime::BehaviorShadowExecutor;
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -226,6 +227,67 @@ fn make_command(mtype: &str) -> Option<CommandKind> {
     }
 }
 
+fn spawn_behavior_shadow(
+    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    measurement: &Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    shadow_jobs: &ActiveJobs,
+) {
+    if measurement_type == "http" {
+        return;
+    }
+    let Some(shadow) = behavior_shadow else {
+        return;
+    };
+    let shadow_measurement = measurement.clone();
+    let shadow_mid = measurement_id.to_string();
+    let shadow_type = measurement_type.to_string();
+    let shadow_job = shadow_jobs.start();
+    tokio::spawn(async move {
+        let _shadow_job = shadow_job;
+        let sequence = shadow.sequence();
+        let build_id = shadow.build_id().to_string();
+        match shadow.run(shadow_measurement).await {
+            Ok(result) if result.component == result.native => {
+                debug!(
+                    target: "behavior-shadow",
+                    measurement_id = %shadow_mid,
+                    measurement_type = %shadow_type,
+                    behavior_sequence = sequence,
+                    behavior_build_id = %build_id,
+                    progress_events = result.progress.len(),
+                    streamed_progress = result.progress_during_native_execution,
+                    "Behavior shadow matched its native oracle."
+                );
+            }
+            Ok(result) => {
+                warn!(
+                    target: "behavior-shadow",
+                    measurement_id = %shadow_mid,
+                    measurement_type = %shadow_type,
+                    behavior_sequence = sequence,
+                    behavior_build_id = %build_id,
+                    progress_events = result.progress.len(),
+                    streamed_progress = result.progress_during_native_execution,
+                    "Behavior shadow diverged from its native oracle."
+                );
+            }
+            Err(error) => {
+                warn!(
+                    target: "behavior-shadow",
+                    measurement_id = %shadow_mid,
+                    measurement_type = %shadow_type,
+                    behavior_sequence = sequence,
+                    behavior_build_id = %build_id,
+                    %error,
+                    "Behavior shadow execution failed."
+                );
+            }
+        }
+    });
+}
+
 /// Run one measurement job and emit the result back to the API.
 ///
 /// `limiter` guards the concurrency cap; the acquired slot is held for the
@@ -236,6 +298,8 @@ pub async fn dispatch(
     client: Client,
     status_manager: Arc<Mutex<StatusManager>>,
     jobs: ActiveJobs,
+    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    shadow_jobs: ActiveJobs,
 ) {
     let mid = req.measurement_id.clone();
     let tid = req.test_id.clone();
@@ -257,6 +321,8 @@ pub async fn dispatch(
         return;
     };
     let _job = jobs.start();
+
+    spawn_behavior_shadow(behavior_shadow, &req.measurement, &mid, mtype, &shadow_jobs);
 
     let in_progress = req
         .measurement
@@ -470,6 +536,8 @@ struct ConnectionHandlers {
     adoption: Arc<AdoptionServer>,
     is_hardware: bool,
     jobs: ActiveJobs,
+    shadow_jobs: ActiveJobs,
+    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
     signal: OutcomeSignal,
     already_connected: Arc<AtomicBool>,
 }
@@ -480,6 +548,7 @@ impl ConnectionHandlers {
         settings: Arc<ProbeSettingsStore>,
         adoption: Arc<AdoptionServer>,
         is_hardware: bool,
+        behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
     ) -> Self {
         Self {
             status_manager,
@@ -487,6 +556,8 @@ impl ConnectionHandlers {
             adoption,
             is_hardware,
             jobs: ActiveJobs::new(),
+            shadow_jobs: ActiveJobs::new(),
+            behavior_shadow,
             signal: OutcomeSignal::new(),
             already_connected: Arc::new(AtomicBool::new(false)),
         }
@@ -712,7 +783,14 @@ fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Clie
     };
     match serde_json::from_value::<MeasurementRequest>(data) {
         Ok(request) => {
-            tokio::spawn(dispatch(request, client, state.status_manager, state.jobs));
+            tokio::spawn(dispatch(
+                request,
+                client,
+                state.status_manager,
+                state.jobs,
+                state.behavior_shadow,
+                state.shadow_jobs,
+            ));
         }
         Err(error) => warn!("Bad measurement request: {error}"),
     }
@@ -824,15 +902,20 @@ async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_ti
         .emit("probe:status:update", json!("sigterm"))
         .await
         .ok();
-    if state.jobs.count() > 0
-        && tokio::time::timeout(drain_timeout, state.jobs.wait_idle())
-            .await
-            .is_err()
+    let active_jobs = state.jobs.count();
+    let active_shadows = state.shadow_jobs.count();
+    if active_jobs + active_shadows > 0
+        && tokio::time::timeout(drain_timeout, async {
+            tokio::join!(state.jobs.wait_idle(), state.shadow_jobs.wait_idle());
+        })
+        .await
+        .is_err()
     {
         warn!(
-            "Shutdown timeout after {}s with {} active jobs. Force closing.",
+            "Shutdown timeout after {}s with {} active jobs and {} behavior shadows. Force closing.",
             drain_timeout.as_secs(),
-            state.jobs.count()
+            state.jobs.count(),
+            state.shadow_jobs.count()
         );
     }
     flush_logs(socket).await;
@@ -844,6 +927,7 @@ async fn connect_once(
     status_manager: Arc<Mutex<StatusManager>>,
     settings: Arc<ProbeSettingsStore>,
     adoption: Arc<AdoptionServer>,
+    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> ConnectOutcome {
     let state = ConnectionHandlers::new(
@@ -851,6 +935,7 @@ async fn connect_once(
         settings,
         adoption,
         cfg.is_hardware.is_some(),
+        behavior_shadow,
     );
     let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
@@ -890,6 +975,20 @@ async fn connect_once(
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
 pub async fn run(cfg: ClientConfig) -> Result<()> {
+    run_with_behavior_shadow(cfg, None).await
+}
+
+/// Connect to the Globalping API with an optional verified diagnostic behavior shadow.
+///
+/// The shadow never replaces the native result or progress path. It runs as an
+/// internal diagnostic measurement and is drained separately during shutdown.
+///
+/// # Errors
+/// Returns an error if process-signal setup or a fatal client operation fails.
+pub async fn run_with_behavior_shadow(
+    cfg: ClientConfig,
+    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+) -> Result<()> {
     let status = Arc::new(Mutex::new(StatusManager::with_api_host(&cfg.ping_target)));
     let settings = Arc::new(ProbeSettingsStore::production());
     let adoption = Arc::new(AdoptionServer::production());
@@ -932,6 +1031,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
             Arc::clone(&status),
             Arc::clone(&settings),
             Arc::clone(&adoption),
+            behavior_shadow.clone(),
             shutdown_rx.clone(),
         )
         .await;
