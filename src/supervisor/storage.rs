@@ -15,11 +15,12 @@ use ed25519_dalek::VerifyingKey;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use super::update::{BehaviorManifest, UpdateError, VerifiedBehavior, verify_artifact};
+use super::update::{
+    BehaviorManifest, MAX_MANIFEST_BYTES, UpdateError, VerifiedBehavior, verify_artifact,
+};
 
 const STATE_FILE: &str = "state.json";
 const BUNDLE_MAGIC: &[u8; 4] = b"GPB1";
-const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]

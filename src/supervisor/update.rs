@@ -9,6 +9,7 @@ use sha2::{Digest as _, Sha256};
 pub const SUPPORTED_ABI_MAJOR: u16 = 5;
 pub const SUPPORTED_ABI_MINOR: u16 = 0;
 pub const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +90,58 @@ pub struct VerifiedBehavior {
     pub component: Arc<[u8]>,
 }
 
+fn validate_manifest_metadata(
+    manifest: &BehaviorManifest,
+    supervisor_version: &Version,
+) -> Result<[u8; 32], UpdateError> {
+    if manifest.size > MAX_COMPONENT_BYTES as u64 {
+        return Err(UpdateError::ComponentTooLarge);
+    }
+    if manifest.abi_major != SUPPORTED_ABI_MAJOR || manifest.abi_minor > SUPPORTED_ABI_MINOR {
+        return Err(UpdateError::UnsupportedAbi);
+    }
+    let min_supervisor = Version::parse(&manifest.min_supervisor_version)
+        .map_err(|_| UpdateError::InvalidSupervisorVersion)?;
+    if &min_supervisor > supervisor_version {
+        return Err(UpdateError::SupervisorTooOld);
+    }
+    let expected_digest = hex::decode(&manifest.sha256).map_err(|_| UpdateError::InvalidDigest)?;
+    expected_digest
+        .try_into()
+        .map_err(|_| UpdateError::InvalidDigest)
+}
+
+fn verify_manifest_signature(
+    manifest: &BehaviorManifest,
+    verifying_key: &VerifyingKey,
+) -> Result<(), UpdateError> {
+    let signature_bytes =
+        hex::decode(&manifest.signature).map_err(|_| UpdateError::InvalidSignature)?;
+    let signature =
+        Signature::from_slice(&signature_bytes).map_err(|_| UpdateError::InvalidSignature)?;
+    verifying_key
+        .verify_strict(&manifest.signing_payload(), &signature)
+        .map_err(|_| UpdateError::SignatureMismatch)
+}
+
+/// Verify signed manifest metadata before downloading its component payload.
+///
+/// This authenticates the sequence/ABI/minimum-supervisor/size/digest metadata,
+/// but deliberately cannot prove that remote component bytes match the digest.
+/// [`verify_artifact`] repeats these checks and verifies the bytes before use.
+///
+/// # Errors
+/// Returns an error for oversized or malformed metadata, unsupported ABI or
+/// supervisor requirements, or an invalid Ed25519 signature.
+pub fn verify_manifest(
+    manifest: &BehaviorManifest,
+    verifying_key: &VerifyingKey,
+    supervisor_version: &Version,
+) -> Result<(), UpdateError> {
+    let _ = validate_manifest_metadata(manifest, supervisor_version)?;
+    verify_manifest_signature(manifest, verifying_key)
+}
+
 /// Verify a signed behavior artifact without applying network anti-rollback policy.
 ///
 /// This is used when reloading an already accepted on-disk slot after restart.
@@ -110,32 +163,12 @@ pub fn verify_artifact(
     if manifest.size != component.len() as u64 {
         return Err(UpdateError::SizeMismatch);
     }
-    if manifest.abi_major != SUPPORTED_ABI_MAJOR || manifest.abi_minor > SUPPORTED_ABI_MINOR {
-        return Err(UpdateError::UnsupportedAbi);
-    }
-
-    let min_supervisor = Version::parse(&manifest.min_supervisor_version)
-        .map_err(|_| UpdateError::InvalidSupervisorVersion)?;
-    if &min_supervisor > supervisor_version {
-        return Err(UpdateError::SupervisorTooOld);
-    }
-
-    let expected_digest = hex::decode(&manifest.sha256).map_err(|_| UpdateError::InvalidDigest)?;
-    if expected_digest.len() != 32 {
-        return Err(UpdateError::InvalidDigest);
-    }
+    let expected_digest = validate_manifest_metadata(&manifest, supervisor_version)?;
     let actual_digest = Sha256::digest(&component);
-    if actual_digest.as_slice() != expected_digest.as_slice() {
+    if actual_digest.as_slice() != expected_digest {
         return Err(UpdateError::DigestMismatch);
     }
-
-    let signature_bytes =
-        hex::decode(&manifest.signature).map_err(|_| UpdateError::InvalidSignature)?;
-    let signature =
-        Signature::from_slice(&signature_bytes).map_err(|_| UpdateError::InvalidSignature)?;
-    verifying_key
-        .verify_strict(&manifest.signing_payload(), &signature)
-        .map_err(|_| UpdateError::SignatureMismatch)?;
+    verify_manifest_signature(&manifest, verifying_key)?;
 
     Ok(VerifiedBehavior {
         manifest,
@@ -237,6 +270,27 @@ mod tests {
             &Version::new(0, 48, 0),
         )
         .unwrap_or_else(|error| panic!("candidate should verify: {error}"))
+    }
+
+    #[test]
+    fn signed_manifest_preflight_does_not_require_component_bytes() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let manifest = signed_candidate(2, b"component-v2", &key);
+        assert_eq!(
+            verify_manifest(&manifest, &key.verifying_key(), &Version::new(0, 48, 0)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn manifest_preflight_rejects_wrong_signer_before_component_download() {
+        let trusted = SigningKey::from_bytes(&[7; 32]);
+        let attacker = SigningKey::from_bytes(&[9; 32]);
+        let manifest = signed_candidate(2, b"component-v2", &attacker);
+        assert_eq!(
+            verify_manifest(&manifest, &trusted.verifying_key(), &Version::new(0, 48, 0),),
+            Err(UpdateError::SignatureMismatch)
+        );
     }
 
     #[test]

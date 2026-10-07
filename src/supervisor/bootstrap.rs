@@ -20,7 +20,7 @@ use super::health::{
 };
 use super::runtime::{BehaviorShadowExecutor, RuntimeError};
 use super::storage::{PersistentBehaviorSlots, StorageError};
-use super::update::{BehaviorManifest, UpdateError, verify_candidate};
+use super::update::{BehaviorManifest, UpdateError, verify_candidate, verify_manifest};
 
 type SharedSlots = Arc<StdMutex<Option<PersistentBehaviorSlots>>>;
 
@@ -287,6 +287,26 @@ impl BehaviorController {
     /// Returns an error only if the internal persistent-slot lock was poisoned.
     pub fn has_previous(&self) -> Result<bool, BootstrapError> {
         self.with_slots(|slots| slots.is_some_and(|slots| slots.previous().is_some()))
+    }
+
+    /// Authenticate a newer candidate manifest before its component is downloaded.
+    ///
+    /// Full component size/digest/signature verification is repeated by
+    /// [`Self::activate_candidate`] after download, so this method only avoids
+    /// fetching payloads whose signed metadata is already unacceptable.
+    ///
+    /// # Errors
+    /// Returns an error for stale sequence, invalid signature/metadata, unsupported
+    /// ABI, or a manifest requiring a newer native supervisor.
+    pub fn preflight_candidate_manifest(
+        &self,
+        manifest: &BehaviorManifest,
+    ) -> Result<(), BootstrapError> {
+        if manifest.sequence <= self.accepted_sequence()? {
+            return Err(UpdateError::RollbackSequence.into());
+        }
+        verify_manifest(manifest, &self.verifying_key, &self.supervisor_version)?;
+        Ok(())
     }
 
     /// Verify, compile/self-test, durably persist, and atomically admit a newer

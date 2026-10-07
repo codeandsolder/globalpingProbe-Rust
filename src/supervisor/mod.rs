@@ -10,4 +10,5 @@ pub mod capability;
 pub mod health;
 pub mod runtime;
 pub mod storage;
+pub mod transport;
 pub mod update;
