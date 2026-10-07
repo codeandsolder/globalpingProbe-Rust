@@ -5,6 +5,7 @@
 //! update verification, and rollback. The behavior component receives only a
 //! short-lived capability token for a single server-issued measurement.
 
+pub mod bootstrap;
 pub mod capability;
 pub mod runtime;
 pub mod storage;

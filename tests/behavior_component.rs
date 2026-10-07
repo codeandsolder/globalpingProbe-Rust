@@ -1,9 +1,13 @@
 use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signer as _, SigningKey};
+use globalping_probe::supervisor::bootstrap::{
+    BehaviorBootstrapConfig, BehaviorController, BootstrapError,
+};
 use globalping_probe::supervisor::runtime::{BehaviorRuntime, BehaviorShadowExecutor};
+use globalping_probe::supervisor::storage::{PersistentBehaviorSlots, StorageError};
 use globalping_probe::supervisor::update::{
-    BehaviorManifest, SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR, verify_candidate,
+    BehaviorManifest, SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR, UpdateError, verify_candidate,
 };
 use semver::Version;
 use sha2::{Digest as _, Sha256};
@@ -20,14 +24,19 @@ fn component_path() -> PathBuf {
     )
 }
 
-fn verified_component(
-    sequence: u64,
-    build_id: &str,
-) -> globalping_probe::supervisor::update::VerifiedBehavior {
+fn component_bytes() -> Vec<u8> {
     let path = component_path();
-    let component = std::fs::read(&path)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let signing_key = SigningKey::from_bytes(&[0x47; 32]);
+    std::fs::read(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
+fn behavior_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x47; 32])
+}
+
+fn signed_component(sequence: u64, build_id: &str) -> (BehaviorManifest, Vec<u8>) {
+    let component = component_bytes();
+    let signing_key = behavior_signing_key();
     let digest = Sha256::digest(&component);
     let mut manifest = BehaviorManifest {
         sequence,
@@ -40,11 +49,19 @@ fn verified_component(
         signature: String::new(),
     };
     manifest.signature = hex::encode(signing_key.sign(&manifest.signing_payload()).to_bytes());
+    (manifest, component)
+}
+
+fn verified_component(
+    sequence: u64,
+    build_id: &str,
+) -> globalping_probe::supervisor::update::VerifiedBehavior {
+    let (manifest, component) = signed_component(sequence, build_id);
     verify_candidate(
         manifest,
         component,
-        &signing_key.verifying_key(),
-        0,
+        &behavior_signing_key().verifying_key(),
+        sequence.saturating_sub(1),
         &Version::new(0, 48, 0),
     )
     .unwrap_or_else(|error| panic!("component verification failed: {error}"))
@@ -74,4 +91,135 @@ async fn verified_component_builds_shadow_executor() {
         .unwrap_or_else(|error| panic!("shadow executor construction failed: {error}"));
     assert_eq!(executor.sequence(), 7);
     assert_eq!(executor.build_id(), "dispatch-shadow");
+}
+
+#[tokio::test]
+#[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+async fn behavior_controller_loads_persisted_active_and_previous() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    let mut slots =
+        PersistentBehaviorSlots::initialize(dir.path(), verified_component(10, "previous"))
+            .unwrap_or_else(|error| panic!("persistent behavior initialization failed: {error}"));
+    slots
+        .activate(verified_component(11, "persistent-active"))
+        .unwrap_or_else(|error| panic!("persistent behavior activation failed: {error}"));
+    drop(slots);
+
+    let config = BehaviorBootstrapConfig::new(dir.path(), behavior_signing_key().verifying_key());
+    let controller = BehaviorController::load(config)
+        .await
+        .unwrap_or_else(|error| panic!("persistent behavior bootstrap failed: {error}"));
+
+    assert_eq!(controller.active_sequence().unwrap_or(None), Some(11));
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 11);
+    assert!(controller.has_previous().unwrap_or(false));
+    let executor = controller
+        .executor()
+        .await
+        .unwrap_or_else(|| panic!("active executor must be available"));
+    assert_eq!(executor.sequence(), 11);
+    assert_eq!(executor.build_id(), "persistent-active");
+
+    let rolled_back = controller
+        .rollback()
+        .await
+        .unwrap_or_else(|error| panic!("rollback failed: {error}"));
+    assert_eq!(rolled_back.sequence(), 10);
+    assert_eq!(rolled_back.build_id(), "previous");
+    assert_eq!(controller.active_sequence().unwrap_or(None), Some(10));
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 11);
+    assert!(!controller.has_previous().unwrap_or(true));
+}
+
+#[tokio::test]
+#[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+async fn behavior_controller_activates_signed_updates_and_preserves_high_water() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    let config = BehaviorBootstrapConfig::new(dir.path(), behavior_signing_key().verifying_key());
+    let controller = BehaviorController::load(config)
+        .await
+        .unwrap_or_else(|error| panic!("empty behavior controller failed: {error}"));
+    assert!(controller.executor().await.is_none());
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 0);
+
+    let (first_manifest, first_component) = signed_component(1, "first");
+    let first = controller
+        .activate_candidate(first_manifest, first_component)
+        .await
+        .unwrap_or_else(|error| panic!("first activation failed: {error}"));
+    assert_eq!(first.sequence(), 1);
+    assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+    assert!(!controller.has_previous().unwrap_or(true));
+
+    let (second_manifest, second_component) = signed_component(2, "second");
+    let second = controller
+        .activate_candidate(second_manifest, second_component)
+        .await
+        .unwrap_or_else(|error| panic!("second activation failed: {error}"));
+    assert_eq!(second.sequence(), 2);
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+    assert!(controller.has_previous().unwrap_or(false));
+
+    let rolled_back = controller
+        .rollback()
+        .await
+        .unwrap_or_else(|error| panic!("rollback failed: {error}"));
+    assert_eq!(rolled_back.sequence(), 1);
+    assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+
+    let (replay_manifest, replay_component) = signed_component(2, "replay");
+    assert!(matches!(
+        controller
+            .activate_candidate(replay_manifest, replay_component)
+            .await,
+        Err(BootstrapError::Update(UpdateError::RollbackSequence))
+    ));
+
+    let reloaded = PersistentBehaviorSlots::load(
+        dir.path(),
+        &behavior_signing_key().verifying_key(),
+        &Version::new(0, 48, 0),
+    )
+    .unwrap_or_else(|error| panic!("persistent behavior reload failed: {error}"));
+    assert_eq!(reloaded.active().manifest.sequence, 1);
+    assert_eq!(reloaded.accepted_sequence(), 2);
+    assert!(reloaded.previous().is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+async fn behavior_controller_rejects_wrong_trust_root() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    PersistentBehaviorSlots::initialize(dir.path(), verified_component(12, "wrong-key"))
+        .unwrap_or_else(|error| panic!("persistent behavior initialization failed: {error}"));
+
+    let wrong_key = SigningKey::from_bytes(&[0x99; 32]).verifying_key();
+    let config = BehaviorBootstrapConfig::new(dir.path(), wrong_key);
+    let result = BehaviorController::load(config).await;
+    assert!(matches!(
+        result,
+        Err(BootstrapError::Storage(StorageError::Update(
+            UpdateError::SignatureMismatch
+        )))
+    ));
+}
+
+#[tokio::test]
+async fn behavior_controller_distinguishes_empty_store_and_invalid_root() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    let key = behavior_signing_key().verifying_key();
+    let config = BehaviorBootstrapConfig::new(dir.path(), key);
+    let controller = BehaviorController::load(config)
+        .await
+        .unwrap_or_else(|error| panic!("empty controller failed: {error}"));
+    assert!(controller.executor().await.is_none());
+    assert_eq!(controller.active_sequence().unwrap_or(None), None);
+    assert_eq!(controller.accepted_sequence().unwrap_or_default(), 0);
+
+    let relative = BehaviorBootstrapConfig::new("relative-behavior-store", key);
+    assert!(matches!(
+        BehaviorController::load(relative).await,
+        Err(BootstrapError::RelativeRoot)
+    ));
 }

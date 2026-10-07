@@ -32,7 +32,7 @@ use crate::status::{
     ping_test::PingTest,
     status_manager::StatusManager,
 };
-use crate::supervisor::runtime::BehaviorShadowExecutor;
+use crate::supervisor::bootstrap::BehaviorController;
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -228,7 +228,7 @@ fn make_command(mtype: &str) -> Option<CommandKind> {
 }
 
 fn spawn_behavior_shadow(
-    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    behavior_controller: Option<Arc<BehaviorController>>,
     measurement: &Value,
     measurement_id: &str,
     measurement_type: &str,
@@ -237,7 +237,7 @@ fn spawn_behavior_shadow(
     if measurement_type == "http" {
         return;
     }
-    let Some(shadow) = behavior_shadow else {
+    let Some(controller) = behavior_controller else {
         return;
     };
     let shadow_measurement = measurement.clone();
@@ -246,6 +246,9 @@ fn spawn_behavior_shadow(
     let shadow_job = shadow_jobs.start();
     tokio::spawn(async move {
         let _shadow_job = shadow_job;
+        let Some(shadow) = controller.executor().await else {
+            return;
+        };
         let sequence = shadow.sequence();
         let build_id = shadow.build_id().to_string();
         match shadow.run(shadow_measurement).await {
@@ -255,7 +258,7 @@ fn spawn_behavior_shadow(
                     measurement_id = %shadow_mid,
                     measurement_type = %shadow_type,
                     behavior_sequence = sequence,
-                    behavior_build_id = %build_id,
+                    behavior_build_id = build_id,
                     progress_events = result.progress.len(),
                     streamed_progress = result.progress_during_native_execution,
                     "Behavior shadow matched its native oracle."
@@ -298,7 +301,7 @@ pub async fn dispatch(
     client: Client,
     status_manager: Arc<Mutex<StatusManager>>,
     jobs: ActiveJobs,
-    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    behavior_controller: Option<Arc<BehaviorController>>,
     shadow_jobs: ActiveJobs,
 ) {
     let mid = req.measurement_id.clone();
@@ -322,7 +325,13 @@ pub async fn dispatch(
     };
     let _job = jobs.start();
 
-    spawn_behavior_shadow(behavior_shadow, &req.measurement, &mid, mtype, &shadow_jobs);
+    spawn_behavior_shadow(
+        behavior_controller,
+        &req.measurement,
+        &mid,
+        mtype,
+        &shadow_jobs,
+    );
 
     let in_progress = req
         .measurement
@@ -537,7 +546,7 @@ struct ConnectionHandlers {
     is_hardware: bool,
     jobs: ActiveJobs,
     shadow_jobs: ActiveJobs,
-    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    behavior_controller: Option<Arc<BehaviorController>>,
     signal: OutcomeSignal,
     already_connected: Arc<AtomicBool>,
 }
@@ -548,7 +557,7 @@ impl ConnectionHandlers {
         settings: Arc<ProbeSettingsStore>,
         adoption: Arc<AdoptionServer>,
         is_hardware: bool,
-        behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+        behavior_controller: Option<Arc<BehaviorController>>,
     ) -> Self {
         Self {
             status_manager,
@@ -557,7 +566,7 @@ impl ConnectionHandlers {
             is_hardware,
             jobs: ActiveJobs::new(),
             shadow_jobs: ActiveJobs::new(),
-            behavior_shadow,
+            behavior_controller,
             signal: OutcomeSignal::new(),
             already_connected: Arc::new(AtomicBool::new(false)),
         }
@@ -788,7 +797,7 @@ fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Clie
                 client,
                 state.status_manager,
                 state.jobs,
-                state.behavior_shadow,
+                state.behavior_controller,
                 state.shadow_jobs,
             ));
         }
@@ -927,7 +936,7 @@ async fn connect_once(
     status_manager: Arc<Mutex<StatusManager>>,
     settings: Arc<ProbeSettingsStore>,
     adoption: Arc<AdoptionServer>,
-    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    behavior_controller: Option<Arc<BehaviorController>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> ConnectOutcome {
     let state = ConnectionHandlers::new(
@@ -935,7 +944,7 @@ async fn connect_once(
         settings,
         adoption,
         cfg.is_hardware.is_some(),
-        behavior_shadow,
+        behavior_controller,
     );
     let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
@@ -975,19 +984,20 @@ async fn connect_once(
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
 pub async fn run(cfg: ClientConfig) -> Result<()> {
-    run_with_behavior_shadow(cfg, None).await
+    run_with_behavior_controller(cfg, None).await
 }
 
-/// Connect to the Globalping API with an optional verified diagnostic behavior shadow.
+/// Connect to the Globalping API with an optional trusted behavior controller.
 ///
-/// The shadow never replaces the native result or progress path. It runs as an
-/// internal diagnostic measurement and is drained separately during shutdown.
+/// The controller supplies only verified/self-tested behavior executors. Shadows
+/// never replace the native result or progress path and are drained separately
+/// during shutdown.
 ///
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
-pub async fn run_with_behavior_shadow(
+pub async fn run_with_behavior_controller(
     cfg: ClientConfig,
-    behavior_shadow: Option<Arc<BehaviorShadowExecutor>>,
+    behavior_controller: Option<Arc<BehaviorController>>,
 ) -> Result<()> {
     let status = Arc::new(Mutex::new(StatusManager::with_api_host(&cfg.ping_target)));
     let settings = Arc::new(ProbeSettingsStore::production());
@@ -1031,7 +1041,7 @@ pub async fn run_with_behavior_shadow(
             Arc::clone(&status),
             Arc::clone(&settings),
             Arc::clone(&adoption),
-            behavior_shadow.clone(),
+            behavior_controller.clone(),
             shutdown_rx.clone(),
         )
         .await;

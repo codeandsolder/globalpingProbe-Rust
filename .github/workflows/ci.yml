@@ -53,7 +53,7 @@ jobs:
       - name: Verify signed behavior runtime and shadow executor
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
-        run: cargo +1.99.0 test --locked --test behavior_component -- --ignored
+        run: cargo +1.99.0 test --locked --test behavior_component -- --include-ignored
       - name: Differential-test WASIp2 ping/DNS/traceroute/MTR behavior against native shaping
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
