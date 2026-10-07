@@ -8,11 +8,17 @@ pub struct BehaviorShadowResult {
     pub native: serde_json::Value,
     pub component: serde_json::Value,
     pub progress: Vec<(serde_json::Value, bool)>,
+    pub progress_during_native_execution: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum ShadowOracle {
     Ready(serde_json::Value),
+    Ping {
+        raw: String,
+        timed_out: bool,
+        target: crate::util::resolve_target::ResolvedTarget,
+    },
     Traceroute {
         raw: String,
         stderr: String,
@@ -28,21 +34,24 @@ enum ShadowOracle {
     },
 }
 
-struct PreparedExecution {
+type OracleSlot = std::sync::Arc<std::sync::Mutex<Option<Result<ShadowOracle, String>>>>;
+
+struct StartedExecution {
     start: wit_host::ExecutionStart,
-    events: std::collections::VecDeque<wit_host::ExecutionEvent>,
-    oracle: ShadowOracle,
+    events: tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>,
+    oracle: OracleSlot,
 }
 
 struct ProductionHost {
     limits: StoreLimits,
     lease: crate::supervisor::capability::CapabilityLease,
-    events: std::collections::VecDeque<wit_host::ExecutionEvent>,
+    events: Option<tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>>,
     progress_tx: Option<crate::command::ProgressTx>,
     progress: Vec<(serde_json::Value, bool)>,
+    progress_during_native_execution: bool,
     reverse_results: std::collections::HashMap<std::net::IpAddr, String>,
     asn_results: std::collections::HashMap<std::net::IpAddr, Vec<u32>>,
-    oracle: Option<ShadowOracle>,
+    oracle: Option<OracleSlot>,
 }
 
 impl ProductionHost {
@@ -53,9 +62,10 @@ impl ProductionHost {
         Self {
             limits: BehaviorRuntime::store_limits(),
             lease,
-            events: std::collections::VecDeque::new(),
+            events: None,
             progress_tx,
             progress: Vec::new(),
+            progress_during_native_execution: false,
             reverse_results: std::collections::HashMap::new(),
             asn_results: std::collections::HashMap::new(),
             oracle: None,
@@ -78,12 +88,32 @@ impl ProductionHost {
     }
 
     fn oracle_result(&self) -> Result<serde_json::Value, String> {
-        let oracle = self
+        let slot = self
             .oracle
             .as_ref()
             .ok_or_else(|| "native shadow oracle was not initialized".to_string())?;
-        match oracle {
+        let oracle = {
+            let guard = slot
+                .lock()
+                .map_err(|_| "native shadow oracle lock was poisoned".to_string())?;
+            guard
+                .as_ref()
+                .ok_or_else(|| "native shadow oracle was not ready at terminal event".to_string())?
+                .clone()?
+        };
+        match &oracle {
             ShadowOracle::Ready(value) => Ok(value.clone()),
+            ShadowOracle::Ping {
+                raw,
+                timed_out,
+                target,
+            } => serde_json::to_value(crate::command::ping::shape_ping_output(
+                raw,
+                &target.address.to_string(),
+                &target.hostname,
+                *timed_out,
+            ))
+            .map_err(|error| error.to_string()),
             ShadowOracle::Traceroute {
                 raw,
                 stderr,
@@ -192,56 +222,6 @@ fn local_addresses() -> Vec<String> {
     )
 }
 
-fn terminal_event(
-    timed_out: bool,
-    status: Option<std::process::ExitStatus>,
-) -> wit_host::ExecutionEvent {
-    if timed_out {
-        wit_host::ExecutionEvent::TimedOut
-    } else {
-        wit_host::ExecutionEvent::Exited(status.map_or(1, |status| {
-            status
-                .code()
-                .unwrap_or_else(|| i32::from(!status.success()))
-        }))
-    }
-}
-
-fn collect_ip_tokens(raw: &str) -> Vec<std::net::IpAddr> {
-    let mut addresses = Vec::new();
-    for token in raw.split_whitespace() {
-        let token = token.trim_matches(|ch| matches!(ch, '(' | ')' | ',' | '[' | ']'));
-        let token = token.split_once('%').map_or(token, |(address, _)| address);
-        if let Ok(address) = token.parse::<std::net::IpAddr>()
-            && !addresses.contains(&address)
-        {
-            addresses.push(address);
-        }
-    }
-    addresses
-}
-
-fn push_common_events(
-    events: &mut std::collections::VecDeque<wit_host::ExecutionEvent>,
-    stdout: &str,
-    stderr: &str,
-    observed: impl IntoIterator<Item = std::net::IpAddr>,
-    terminal: wit_host::ExecutionEvent,
-) {
-    if !stdout.is_empty() {
-        events.push_back(wit_host::ExecutionEvent::Stdout(stdout.as_bytes().to_vec()));
-    }
-    for address in observed {
-        events.push_back(wit_host::ExecutionEvent::ObservedAddress(
-            address.to_string(),
-        ));
-    }
-    if !stderr.is_empty() {
-        events.push_back(wit_host::ExecutionEvent::Stderr(stderr.as_bytes().to_vec()));
-    }
-    events.push_back(terminal);
-}
-
 fn execution_start(
     kind: wit_host::MeasurementKind,
     scope: &crate::supervisor::capability::MeasurementScope,
@@ -260,96 +240,163 @@ fn execution_start(
     }
 }
 
+fn new_oracle_slot() -> OracleSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(None))
+}
+
+fn store_oracle(slot: &OracleSlot, oracle: Result<ShadowOracle, String>) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(oracle);
+    }
+}
+
+async fn send_terminal(
+    tx: &crate::command::RawExecutionTx,
+    timed_out: bool,
+    exit_code: Option<i32>,
+) {
+    let event = if timed_out {
+        crate::command::RawExecutionEvent::TimedOut
+    } else {
+        crate::command::RawExecutionEvent::Exited(exit_code.unwrap_or(1))
+    };
+    let _ = tx.send(event).await;
+}
+
 async fn prepare_ping(
     scope: &crate::supervisor::capability::MeasurementScope,
-) -> Result<PreparedExecution, wit_host::HostError> {
-    let native = crate::command::ping::PingCommand
-        .run(scope.measurement.clone())
+) -> Result<StartedExecution, wit_host::HostError> {
+    use crate::command::ping;
+    use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
+    use crate::util::resolve_target::resolve_command_target;
+    use std::time::Duration;
+
+    let opts: ping::PingOptions =
+        serde_json::from_value(scope.measurement.clone()).map_err(native_error)?;
+    ping::validate(&opts).map_err(native_error)?;
+    let deadline = MeasurementDeadline::new(opts.timeout);
+    let budget = ping_budget(opts.packets, opts.timeout, None);
+    let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
+    let target = resolve_command_target(&opts.target, opts.ip_version, dns_budget)
         .await
         .map_err(native_error)?;
-    let address = native
-        .get("resolvedAddress")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| native_error("native ping did not resolve a target"))?
-        .to_string();
-    let hostname = native
-        .get("resolvedHostname")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&address)
-        .to_string();
-    let raw = native
-        .get("rawOutput")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let mut events = std::collections::VecDeque::new();
-    if !raw.is_empty() {
-        events.push_back(wit_host::ExecutionEvent::Stdout(raw.as_bytes().to_vec()));
-    }
-    let failed = native.get("status").and_then(serde_json::Value::as_str) == Some("failed");
-    events.push_back(if failed {
-        wit_host::ExecutionEvent::TimedOut
-    } else {
-        wit_host::ExecutionEvent::Exited(0)
+    let mut resolved_options = opts.clone();
+    resolved_options.target = target.address.to_string();
+    let (tx, events) = crate::command::RawExecutionTx::channel();
+    let oracle = new_oracle_slot();
+    let task_oracle = std::sync::Arc::clone(&oracle);
+    let task_target = target.clone();
+    tokio::spawn(async move {
+        let native = if resolved_options.protocol.eq_ignore_ascii_case("TCP") {
+            ping::run_tcp_raw_stream(&resolved_options, &task_target, deadline.remaining(), &tx)
+                .await
+        } else {
+            ping::run_icmp_raw_stream(
+                &resolved_options,
+                &task_target,
+                deadline.process_timeout(),
+                &tx,
+            )
+            .await
+        };
+        match native {
+            Ok(native) => {
+                let timed_out = native.timed_out;
+                store_oracle(
+                    &task_oracle,
+                    Ok(ShadowOracle::Ping {
+                        raw: native.raw,
+                        timed_out,
+                        target: task_target,
+                    }),
+                );
+                send_terminal(&tx, timed_out, native.exit_code).await;
+            }
+            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+        }
     });
-    Ok(PreparedExecution {
-        start: execution_start(wit_host::MeasurementKind::Ping, scope, address, hostname),
+    Ok(StartedExecution {
+        start: execution_start(
+            wit_host::MeasurementKind::Ping,
+            scope,
+            target.address.to_string(),
+            target.hostname,
+        ),
         events,
-        oracle: ShadowOracle::Ready(native),
+        oracle,
     })
 }
 
-async fn prepare_dns(
+fn prepare_dns(
     scope: &crate::supervisor::capability::MeasurementScope,
-) -> Result<PreparedExecution, wit_host::HostError> {
+) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::dns;
+
     let opts: dns::DnsOptions =
         serde_json::from_value(scope.measurement.clone()).map_err(native_error)?;
     dns::validate(&opts).map_err(native_error)?;
-    let native = dns::run_dig(&opts, None).await.map_err(native_error)?;
-    let process_failed = native.status.is_some_and(|status| !status.success());
-    let oracle = if opts.trace {
-        serde_json::to_value(dns::shape_trace_output(
-            &native.raw,
-            &native.stderr,
-            native.timed_out,
-            process_failed,
-            native.private_result,
-            &opts.target,
-        ))
-    } else {
-        serde_json::to_value(dns::shape_classic_output(
-            &native.raw,
-            &native.stderr,
-            native.timed_out,
-            process_failed,
-            native.private_result,
-            &opts.target,
-        ))
-    }
-    .map_err(native_error)?;
-    let mut events = std::collections::VecDeque::new();
-    push_common_events(
-        &mut events,
-        &native.raw,
-        &native.stderr,
-        [],
-        terminal_event(native.timed_out, native.status),
-    );
-    Ok(PreparedExecution {
+    let start_target = opts.target.clone();
+    let (tx, events) = crate::command::RawExecutionTx::channel();
+    let oracle = new_oracle_slot();
+    let task_oracle = std::sync::Arc::clone(&oracle);
+    tokio::spawn(async move {
+        match dns::run_dig_stream(&opts, &tx).await {
+            Ok(native) => {
+                let process_failed = native.status.is_some_and(|status| !status.success());
+                let shaped = if opts.trace {
+                    serde_json::to_value(dns::shape_trace_output(
+                        &native.raw,
+                        &native.stderr,
+                        native.timed_out,
+                        process_failed,
+                        native.private_result,
+                        &opts.target,
+                    ))
+                } else {
+                    serde_json::to_value(dns::shape_classic_output(
+                        &native.raw,
+                        &native.stderr,
+                        native.timed_out,
+                        process_failed,
+                        native.private_result,
+                        &opts.target,
+                    ))
+                };
+                match shaped {
+                    Ok(value) => {
+                        store_oracle(&task_oracle, Ok(ShadowOracle::Ready(value)));
+                        send_terminal(
+                            &tx,
+                            native.timed_out,
+                            native.status.map(|status| {
+                                status
+                                    .code()
+                                    .unwrap_or_else(|| i32::from(!status.success()))
+                            }),
+                        )
+                        .await;
+                    }
+                    Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+                }
+            }
+            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+        }
+    });
+    Ok(StartedExecution {
         start: execution_start(
             wit_host::MeasurementKind::Dns,
             scope,
-            opts.target.clone(),
-            opts.target,
+            start_target.clone(),
+            start_target,
         ),
         events,
-        oracle: ShadowOracle::Ready(oracle),
+        oracle,
     })
 }
 
 async fn prepare_traceroute(
     scope: &crate::supervisor::capability::MeasurementScope,
-) -> Result<PreparedExecution, wit_host::HostError> {
+) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::traceroute;
     use crate::util::measurement_timeout::{MeasurementDeadline, traceroute_budget};
     use crate::util::resolve_target::resolve_command_target;
@@ -358,51 +405,70 @@ async fn prepare_traceroute(
     let opts: traceroute::TracerouteOptions =
         serde_json::from_value(scope.measurement.clone()).map_err(native_error)?;
     traceroute::validate(&opts).map_err(native_error)?;
+    let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = traceroute_budget(opts.timeout, 2);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
     let target = resolve_command_target(&opts.target, opts.ip_version, dns_budget)
         .await
         .map_err(native_error)?;
-    let deadline = MeasurementDeadline::new(opts.timeout);
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
-    let native = traceroute::run_native_traceroute(
-        &traceroute::build_args(&resolved_options),
-        deadline.process_timeout(),
-        &target,
-        None,
-    )
-    .await
-    .map_err(native_error)?;
-    let mut events = std::collections::VecDeque::new();
-    push_common_events(
-        &mut events,
-        &native.raw,
-        &native.stderr,
-        collect_ip_tokens(&native.raw),
-        terminal_event(native.timed_out, native.status),
-    );
-    Ok(PreparedExecution {
+    let args = traceroute::build_args(&resolved_options);
+    let (tx, events) = crate::command::RawExecutionTx::channel();
+    let oracle = new_oracle_slot();
+    let task_oracle = std::sync::Arc::clone(&oracle);
+    let task_target = target.clone();
+    tokio::spawn(async move {
+        match traceroute::run_native_traceroute_stream(
+            &args,
+            deadline.process_timeout(),
+            &task_target,
+            &tx,
+        )
+        .await
+        {
+            Ok(native) => {
+                let timed_out = native.timed_out;
+                let status = native.status;
+                store_oracle(
+                    &task_oracle,
+                    Ok(ShadowOracle::Traceroute {
+                        raw: native.raw,
+                        stderr: native.stderr,
+                        timed_out,
+                        succeeded: status.map(|status| status.success()),
+                        target: task_target,
+                    }),
+                );
+                send_terminal(
+                    &tx,
+                    timed_out,
+                    status.map(|status| {
+                        status
+                            .code()
+                            .unwrap_or_else(|| i32::from(!status.success()))
+                    }),
+                )
+                .await;
+            }
+            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+        }
+    });
+    Ok(StartedExecution {
         start: execution_start(
             wit_host::MeasurementKind::Traceroute,
             scope,
             target.address.to_string(),
-            target.hostname.clone(),
+            target.hostname,
         ),
         events,
-        oracle: ShadowOracle::Traceroute {
-            raw: native.raw,
-            stderr: native.stderr,
-            timed_out: native.timed_out,
-            succeeded: native.status.map(|status| status.success()),
-            target,
-        },
+        oracle,
     })
 }
 
 async fn prepare_mtr(
     scope: &crate::supervisor::capability::MeasurementScope,
-) -> Result<PreparedExecution, wit_host::HostError> {
+) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::mtr;
     use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
     use crate::util::resolve_target::resolve_command_target;
@@ -411,70 +477,55 @@ async fn prepare_mtr(
     let opts: mtr::MtrOptions =
         serde_json::from_value(scope.measurement.clone()).map_err(native_error)?;
     mtr::validate(&opts).map_err(native_error)?;
+    let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = mtr_budget(opts.packets, opts.timeout);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
     let target = resolve_command_target(&opts.target, opts.ip_version, dns_budget)
         .await
         .map_err(native_error)?;
-    let deadline = MeasurementDeadline::new(opts.timeout);
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
-    let native = mtr::run_native_mtr_raw(
-        &mtr::build_args(&resolved_options),
-        deadline.process_timeout(),
-    )
-    .await
-    .map_err(native_error)?;
-    let observed = native
-        .stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            (parts.next()? == "h")
-                .then(|| parts.nth(1))
-                .flatten()
-                .and_then(|address| {
-                    let address = address.split_once('%').map_or(address, |(ip, _)| ip);
-                    address.parse::<std::net::IpAddr>().ok()
-                })
-        })
-        .collect::<Vec<_>>();
-    let terminal = if native.timed_out {
-        wit_host::ExecutionEvent::TimedOut
-    } else {
-        wit_host::ExecutionEvent::Exited(0)
-    };
-    let mut events = std::collections::VecDeque::new();
-    push_common_events(
-        &mut events,
-        &native.stdout,
-        &native.stderr,
-        observed,
-        terminal,
-    );
-    Ok(PreparedExecution {
+    let args = mtr::build_args(&resolved_options);
+    let (tx, events) = crate::command::RawExecutionTx::channel();
+    let oracle = new_oracle_slot();
+    let task_oracle = std::sync::Arc::clone(&oracle);
+    let task_target = target.clone();
+    tokio::spawn(async move {
+        match mtr::run_native_mtr_stream(&args, deadline.process_timeout(), &tx).await {
+            Ok(native) => {
+                let timed_out = native.timed_out;
+                store_oracle(
+                    &task_oracle,
+                    Ok(ShadowOracle::Mtr {
+                        raw: native.stdout,
+                        stderr: native.stderr,
+                        timed_out,
+                        target: task_target,
+                    }),
+                );
+                send_terminal(&tx, timed_out, native.exit_code).await;
+            }
+            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+        }
+    });
+    Ok(StartedExecution {
         start: execution_start(
             wit_host::MeasurementKind::Mtr,
             scope,
             target.address.to_string(),
-            target.hostname.clone(),
+            target.hostname,
         ),
         events,
-        oracle: ShadowOracle::Mtr {
-            raw: native.stdout,
-            stderr: native.stderr,
-            timed_out: native.timed_out,
-            target,
-        },
+        oracle,
     })
 }
 
 async fn prepare_native_execution(
     scope: &crate::supervisor::capability::MeasurementScope,
-) -> Result<PreparedExecution, wit_host::HostError> {
+) -> Result<StartedExecution, wit_host::HostError> {
     match scope.kind {
         crate::supervisor::capability::MeasurementKind::Ping => prepare_ping(scope).await,
-        crate::supervisor::capability::MeasurementKind::Dns => prepare_dns(scope).await,
+        crate::supervisor::capability::MeasurementKind::Dns => prepare_dns(scope),
         crate::supervisor::capability::MeasurementKind::Traceroute => {
             prepare_traceroute(scope).await
         }
@@ -496,46 +547,81 @@ impl wit_host::Host for ProductionHost {
             .authorize_start(std::time::Instant::now())
             .map_err(policy_error)?;
         let scope = self.lease.scope.clone();
-        let prepared = prepare_native_execution(&scope).await?;
-        self.events = prepared.events;
-        self.oracle = Some(prepared.oracle);
-        Ok(prepared.start)
+        let started = prepare_native_execution(&scope).await?;
+        self.events = Some(started.events);
+        self.oracle = Some(started.oracle);
+        Ok(started.start)
     }
 
-    fn poll(
+    async fn poll(
         &mut self,
         token: wit_host::CapabilityToken,
-    ) -> impl Future<Output = Result<Option<wit_host::ExecutionEvent>, wit_host::HostError>> + Send
-    {
-        let result = (|| {
-            self.check_token(&token)?;
-            let now = std::time::Instant::now();
-            self.lease.authorize_poll(now).map_err(policy_error)?;
-            let Some(event) = self.events.pop_front() else {
-                return Ok(None);
-            };
-            match &event {
-                wit_host::ExecutionEvent::Stdout(bytes)
-                | wit_host::ExecutionEvent::Stderr(bytes) => self
-                    .lease
-                    .account_raw_bytes(bytes.len(), now)
-                    .map_err(policy_error)?,
-                wit_host::ExecutionEvent::ObservedAddress(address) => {
-                    let address = address.parse().map_err(|_| {
-                        host_error(
-                            wit_host::HostErrorCode::NativeFailure,
-                            "native execution reported an invalid observed address",
-                        )
-                    })?;
-                    self.lease
-                        .observe_address(address, now)
-                        .map_err(policy_error)?;
+    ) -> Result<Option<wit_host::ExecutionEvent>, wit_host::HostError> {
+        self.check_token(&token)?;
+        let remaining = self.lease.remaining(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(policy_error(
+                crate::supervisor::capability::PolicyError::Expired,
+            ));
+        }
+        let event = {
+            let receiver = self.events.as_mut().ok_or_else(|| {
+                host_error(
+                    wit_host::HostErrorCode::PolicyDenied,
+                    "native execution has not been started",
+                )
+            })?;
+            match tokio::time::timeout(remaining, receiver.recv()).await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    let message = self
+                        .oracle
+                        .as_ref()
+                        .and_then(|slot| slot.lock().ok())
+                        .and_then(|guard| match guard.as_ref() {
+                            Some(Err(error)) => Some(error.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            "native execution event stream closed before a terminal event"
+                                .to_string()
+                        });
+                    return Err(host_error(wit_host::HostErrorCode::NativeFailure, message));
                 }
-                wit_host::ExecutionEvent::Exited(_) | wit_host::ExecutionEvent::TimedOut => {}
+                Err(_) => {
+                    return Err(policy_error(
+                        crate::supervisor::capability::PolicyError::Expired,
+                    ));
+                }
             }
-            Ok(Some(event))
-        })();
-        ready(result)
+        };
+        let now = std::time::Instant::now();
+        self.lease.authorize_poll(now).map_err(policy_error)?;
+        let event = match event {
+            crate::command::RawExecutionEvent::Stdout(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                wit_host::ExecutionEvent::Stdout(bytes)
+            }
+            crate::command::RawExecutionEvent::Stderr(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                wit_host::ExecutionEvent::Stderr(bytes)
+            }
+            crate::command::RawExecutionEvent::ObservedAddress(address) => {
+                self.lease
+                    .observe_address(address, now)
+                    .map_err(policy_error)?;
+                wit_host::ExecutionEvent::ObservedAddress(address.to_string())
+            }
+            crate::command::RawExecutionEvent::Exited(code) => {
+                wit_host::ExecutionEvent::Exited(code)
+            }
+            crate::command::RawExecutionEvent::TimedOut => wit_host::ExecutionEvent::TimedOut,
+        };
+        Ok(Some(event))
     }
 
     async fn reverse_lookup(
@@ -602,6 +688,13 @@ impl wit_host::Host for ProductionHost {
                 tx.send(value.clone()).map_err(|error| {
                     host_error(wit_host::HostErrorCode::NativeFailure, error.to_string())
                 })?;
+            }
+            if self
+                .oracle
+                .as_ref()
+                .is_some_and(|slot| slot.lock().is_ok_and(|guard| guard.is_none()))
+            {
+                self.progress_during_native_execution = true;
             }
             self.progress.push((value, overwrite));
             Ok(())
@@ -677,6 +770,7 @@ impl BehaviorRuntime {
             native,
             component: component_result,
             progress: store.data().progress.clone(),
+            progress_during_native_execution: store.data().progress_during_native_execution,
         })
     }
 

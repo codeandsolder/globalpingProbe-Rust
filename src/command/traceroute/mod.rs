@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::ProgressTx;
+use super::{ProgressTx, RawExecutionTx};
 use crate::util::measurement_timeout::{MeasurementDeadline, traceroute_budget};
 use crate::util::private_ip::is_ip_private;
 use crate::util::resolve_target::{
@@ -235,6 +235,25 @@ pub(crate) async fn run_native_traceroute(
     target: &ResolvedTarget,
     progress: Option<&ProgressTx>,
 ) -> Result<NativeTraceOutput> {
+    run_native_traceroute_inner(args, process_timeout, target, progress, None).await
+}
+
+pub(crate) async fn run_native_traceroute_stream(
+    args: &[String],
+    process_timeout: Duration,
+    target: &ResolvedTarget,
+    raw_events: &RawExecutionTx,
+) -> Result<NativeTraceOutput> {
+    run_native_traceroute_inner(args, process_timeout, target, None, Some(raw_events)).await
+}
+
+async fn run_native_traceroute_inner(
+    args: &[String],
+    process_timeout: Duration,
+    target: &ResolvedTarget,
+    progress: Option<&ProgressTx>,
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<NativeTraceOutput> {
     let mut child = Command::new("traceroute")
         .args(args)
         .kill_on_drop(true)
@@ -245,21 +264,44 @@ pub(crate) async fn run_native_traceroute(
         .stdout
         .take()
         .context("child stdout pipe was unavailable")?;
-    let stderr = child
+    let mut stderr = child
         .stderr
         .take()
         .context("child stderr pipe was unavailable")?;
+    let raw_stderr = raw_events.cloned();
     let stderr_task = tokio::spawn(async move {
-        let mut stderr = stderr;
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text).await;
-        text
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(tx) = &raw_stderr
+                        && tx.stderr_chunk(&chunk[..read]).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     });
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let mut raw_lines = Vec::new();
     let completed = timeout(process_timeout, async {
         while let Some(line) = lines.next_line().await? {
-            raw_lines.push(line);
+            raw_lines.push(line.clone());
+            if let Some(tx) = raw_events {
+                tx.stdout_line(&line)
+                    .await
+                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                for address in line_ip_tokens(&line) {
+                    tx.observe(address)
+                        .await
+                        .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                }
+            }
             if let Some(tx) = progress {
                 let raw = raw_lines.join("\n");
                 let normalized = normalize_numeric_output(&raw, target, &HashMap::new());
@@ -276,10 +318,7 @@ pub(crate) async fn run_native_traceroute(
         (true, child.wait().await.ok())
     };
     Ok(NativeTraceOutput {
-        raw: raw_lines.join(
-            "
-",
-        ),
+        raw: raw_lines.join("\n"),
         stderr: stderr_task.await.unwrap_or_default(),
         timed_out,
         status,

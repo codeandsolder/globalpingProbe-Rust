@@ -2,7 +2,7 @@ pub mod parse;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-use super::ProgressTx;
+use super::{ProgressTx, RawExecutionTx};
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -153,6 +153,7 @@ pub(crate) struct NativeMtrOutput {
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) timed_out: bool,
+    pub(crate) exit_code: Option<i32>,
 }
 
 #[derive(Clone, Default)]
@@ -297,53 +298,12 @@ fn hop_address_from_raw_line(line: &str) -> Option<IpAddr> {
     normalize_ip_text(parts.next()?).parse().ok()
 }
 
-pub(crate) async fn run_native_mtr_raw(
+pub(crate) async fn run_native_mtr_stream(
     args: &[String],
     process_timeout: Duration,
+    raw_events: &RawExecutionTx,
 ) -> Result<NativeMtrOutput> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
-
-    let mut child = Command::new("mtr")
-        .args(args)
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("mtr stdout pipe unavailable"))?;
-    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("mtr stderr pipe unavailable"))?;
-    let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text).await;
-        text
-    });
-    let mut raw = String::new();
-    let completed = timeout(process_timeout, async {
-        while let Some(line) = stdout_lines.next_line().await? {
-            raw.push_str(&line);
-            raw.push('\n');
-        }
-        child.wait().await.map(|_| ())
-    })
-    .await;
-    let timed_out = completed.is_err();
-    if timed_out {
-        child.kill().await.ok();
-        child.wait().await.ok();
-    } else {
-        completed??;
-    }
-    Ok(NativeMtrOutput {
-        stdout: raw,
-        stderr: stderr_task.await.unwrap_or_default(),
-        timed_out,
-    })
+    run_native_mtr_inner(args, process_timeout, None, None, None, Some(raw_events)).await
 }
 
 async fn run_native_mtr(
@@ -353,6 +313,25 @@ async fn run_native_mtr(
     enrichment: &mut MtrEnrichment,
     deadline: &MeasurementDeadline,
 ) -> Result<NativeMtrOutput> {
+    run_native_mtr_inner(
+        args,
+        process_timeout,
+        progress,
+        Some(enrichment),
+        Some(deadline),
+        None,
+    )
+    .await
+}
+
+async fn run_native_mtr_inner(
+    args: &[String],
+    process_timeout: Duration,
+    progress: Option<&ProgressTx>,
+    mut enrichment: Option<&mut MtrEnrichment>,
+    deadline: Option<&MeasurementDeadline>,
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<NativeMtrOutput> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
     let mut child = Command::new("mtr")
@@ -370,10 +349,24 @@ async fn run_native_mtr(
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("mtr stderr pipe unavailable"))?;
+    let raw_stderr = raw_events.cloned();
     let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text).await;
-        text
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(tx) = &raw_stderr
+                        && tx.stderr_chunk(&chunk[..read]).await.is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     });
     let raw_stdout = Arc::new(RwLock::new(String::new()));
     let completed = timeout(process_timeout, async {
@@ -385,7 +378,20 @@ async fn run_native_mtr(
                 raw.push_str(&line);
                 raw.push('\n');
             }
-            if let Some(address) = hop_address_from_raw_line(&line) {
+            let observed = hop_address_from_raw_line(&line);
+            if let Some(tx) = raw_events {
+                tx.stdout_line(&line)
+                    .await
+                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                if let Some(address) = observed {
+                    tx.observe(address)
+                        .await
+                        .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                }
+            }
+            if let (Some(address), Some(enrichment), Some(deadline)) =
+                (observed, enrichment.as_deref_mut(), deadline)
+            {
                 enrichment.add(
                     address,
                     deadline.remaining(),
@@ -393,20 +399,28 @@ async fn run_native_mtr(
                     Arc::clone(&raw_stdout),
                 );
             }
-            if let Some(tx) = progress {
+            if let (Some(tx), Some(enrichment)) = (progress, enrichment.as_deref()) {
                 queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.cache.clone());
             }
         }
-        child.wait().await.map(|_| ())
+        child.wait().await
     })
     .await;
-    let timed_out = completed.is_err();
-    if timed_out {
+    let (timed_out, exit_code) = if let Ok(result) = completed {
+        let status = result?;
+        (
+            false,
+            Some(
+                status
+                    .code()
+                    .unwrap_or_else(|| i32::from(!status.success())),
+            ),
+        )
+    } else {
         child.kill().await.ok();
         child.wait().await.ok();
-    } else {
-        completed??;
-    }
+        (true, None)
+    };
     let stdout = raw_stdout
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -415,6 +429,7 @@ async fn run_native_mtr(
         stdout,
         stderr: stderr_task.await.unwrap_or_default(),
         timed_out,
+        exit_code,
     })
 }
 

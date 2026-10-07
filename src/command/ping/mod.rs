@@ -9,7 +9,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::ProgressTx;
+use super::{ProgressTx, RawExecutionTx};
 use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
 use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, resolve_command_target};
 use crate::util::tcp_ping::{TcpPingProbe, compute_tcp_stats, tcp_ping_single};
@@ -50,7 +50,7 @@ const fn default_ip_version() -> u8 {
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
-fn validate(opts: &PingOptions) -> Result<()> {
+pub(crate) fn validate(opts: &PingOptions) -> Result<()> {
     if !is_safe_host(&opts.target) {
         bail!("Invalid target.");
     }
@@ -210,12 +210,43 @@ pub(crate) fn shape_ping_output(
     parsed
 }
 
+pub(crate) struct NativePingRaw {
+    pub(crate) raw: String,
+    pub(crate) timed_out: bool,
+    pub(crate) exit_code: Option<i32>,
+}
+
 async fn run_icmp(
     opts: &PingOptions,
     target: &ResolvedTarget,
     progress: Option<ProgressTx>,
     process_timeout: Duration,
 ) -> Result<ParsedPing> {
+    let native = run_icmp_raw_inner(opts, target, progress, process_timeout, None).await?;
+    Ok(shape_ping_output(
+        &native.raw,
+        &target.address.to_string(),
+        &target.hostname,
+        native.timed_out,
+    ))
+}
+
+pub(crate) async fn run_icmp_raw_stream(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    process_timeout: Duration,
+    raw_events: &RawExecutionTx,
+) -> Result<NativePingRaw> {
+    run_icmp_raw_inner(opts, target, None, process_timeout, Some(raw_events)).await
+}
+
+async fn run_icmp_raw_inner(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
+    process_timeout: Duration,
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<NativePingRaw> {
     let args = build_args(opts);
     let mut child = Command::new("ping")
         .args(&args)
@@ -235,30 +266,42 @@ async fn run_icmp(
         while let Some(line) = lines.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
+            if let Some(tx) = raw_events {
+                tx.stdout_line(&line)
+                    .await
+                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+            }
             if let Some(tx) = &progress {
                 let mut normalized = normalize_ping_output(&line, &address, &target.hostname);
                 normalized.push('\n');
                 tx.send(json!({ "rawOutput": normalized })).ok();
             }
         }
-        child.wait().await.map(|_| ())
+        child.wait().await
     })
     .await;
 
-    let timed_out = completed.is_err();
-    if timed_out {
+    let (timed_out, exit_code) = if let Ok(result) = completed {
+        let status = result?;
+        (
+            false,
+            Some(
+                status
+                    .code()
+                    .unwrap_or_else(|| i32::from(!status.success())),
+            ),
+        )
+    } else {
         child.kill().await.ok();
         child.wait().await.ok();
-    } else {
-        completed??;
-    }
+        (true, None)
+    };
 
-    Ok(shape_ping_output(
-        &raw_output,
-        &address,
-        &target.hostname,
+    Ok(NativePingRaw {
+        raw: raw_output,
         timed_out,
-    ))
+        exit_code,
+    })
 }
 
 fn format_compact(value: f64, decimals: usize) -> String {
@@ -300,32 +343,71 @@ async fn run_tcp(
     progress: Option<ProgressTx>,
     remaining: Duration,
 ) -> Result<ParsedPing> {
+    let native = run_tcp_raw_inner(opts, target, progress, remaining, None).await?;
+    Ok(shape_ping_output(
+        &native.raw,
+        &target.address.to_string(),
+        &target.hostname,
+        native.timed_out,
+    ))
+}
+
+pub(crate) async fn run_tcp_raw_stream(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    remaining: Duration,
+    raw_events: &RawExecutionTx,
+) -> Result<NativePingRaw> {
+    run_tcp_raw_inner(opts, target, None, remaining, Some(raw_events)).await
+}
+
+async fn run_tcp_raw_inner(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
+    remaining: Duration,
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<NativePingRaw> {
     let start = Instant::now();
     let address = target.address.to_string();
     let tasks = spawn_tcp_probes(opts, &address, remaining);
 
-    let mut probes: Vec<TcpPingProbe> = Vec::with_capacity(usize::from(opts.packets));
-    let mut raw_lines = vec![format!(
+    let header = format!(
         "PING {} ({address}) on port {}.",
         target.hostname, opts.port
-    )];
+    );
+    let mut raw_lines = vec![header.clone()];
+    if let Some(tx) = raw_events {
+        tx.stdout_line(&header)
+            .await
+            .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+    }
 
+    let mut probes: Vec<TcpPingProbe> = Vec::with_capacity(usize::from(opts.packets));
     for (index, task) in tasks.into_iter().enumerate() {
         let probe = task.await.unwrap_or(TcpPingProbe { rtt_ms: None });
         let number = index + 1;
-        match probe.rtt_ms {
-            Some(rtt) => {
-                raw_lines.push(format!(
+        let line = probe.rtt_ms.map_or_else(
+            || {
+                format!(
+                    "No reply from {} ({address}) on port {}: tcp_conn={number}",
+                    target.hostname, opts.port,
+                )
+            },
+            |rtt| {
+                format!(
                     "Reply from {} ({address}) on port {}: tcp_conn={number} time={} ms",
                     target.hostname,
                     opts.port,
                     format_compact(rtt, 2),
-                ));
-            }
-            None => raw_lines.push(format!(
-                "No reply from {} ({address}) on port {}: tcp_conn={number}",
-                target.hostname, opts.port,
-            )),
+                )
+            },
+        );
+        raw_lines.push(line.clone());
+        if let Some(tx) = raw_events {
+            tx.stdout_line(&line)
+                .await
+                .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
         }
         probes.push(probe);
 
@@ -336,30 +418,41 @@ async fn run_tcp(
 
     let stats = compute_tcp_stats(&probes, opts.packets);
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    raw_lines.push(String::new());
-    raw_lines.push(format!(
-        "--- {} ({address}) ping statistics ---",
-        target.hostname
-    ));
-    let loss = format_compact(stats.loss, 2);
-    raw_lines.push(format!(
-        "{} packets transmitted, {} received, {loss}% packet loss, time {elapsed_ms} ms",
-        stats.total, stats.rcv,
-    ));
+    let summary = [
+        String::new(),
+        format!("--- {} ({address}) ping statistics ---", target.hostname),
+        format!(
+            "{} packets transmitted, {} received, {}% packet loss, time {elapsed_ms} ms",
+            stats.total,
+            stats.rcv,
+            format_compact(stats.loss, 2),
+        ),
+    ];
+    for line in summary {
+        raw_lines.push(line.clone());
+        if let Some(tx) = raw_events {
+            tx.stdout_line(&line)
+                .await
+                .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+        }
+    }
     if let (Some(min), Some(avg), Some(max), Some(mdev)) =
         (stats.min, stats.avg, stats.max, stats.mdev)
     {
-        raw_lines.push(format!(
-            "rtt min/avg/max/mdev = {min:.3}/{avg:.3}/{max:.3}/{mdev:.3} ms"
-        ));
+        let line = format!("rtt min/avg/max/mdev = {min:.3}/{avg:.3}/{max:.3}/{mdev:.3} ms");
+        raw_lines.push(line.clone());
+        if let Some(tx) = raw_events {
+            tx.stdout_line(&line)
+                .await
+                .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+        }
     }
 
-    Ok(shape_ping_output(
-        &raw_lines.join("\n"),
-        &address,
-        &target.hostname,
-        false,
-    ))
+    Ok(NativePingRaw {
+        raw: raw_lines.join("\n"),
+        timed_out: false,
+        exit_code: Some(0),
+    })
 }
 
 // ── Public helper for integration tests / status manager ─────────────────────

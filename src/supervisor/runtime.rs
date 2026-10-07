@@ -1152,6 +1152,29 @@ no answer yet for icmp_seq=1\n\
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires live network tools/access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_shadow_progress_is_emitted_before_native_execution_finishes() {
+        let shadow = run_real_host_shadow(json!({
+            "type": "ping",
+            "target": "one.one.one.one",
+            "protocol": "TCP",
+            "port": 443,
+            "packets": 8,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": true
+        }))
+        .await;
+        assert_eq!(shadow.component, shadow.native);
+        assert!(!shadow.progress.is_empty());
+        assert!(
+            shadow.progress_during_native_execution,
+            "progress was emitted only after the native execution had already completed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
     async fn live_shadow_icmp_ping_matches_native_result() {
         let measurement = json!({

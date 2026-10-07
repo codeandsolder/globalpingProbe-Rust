@@ -4,8 +4,60 @@ pub mod mtr;
 pub mod ping;
 pub mod traceroute;
 
+use std::net::IpAddr;
+
 use serde_json::Value;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::SendError};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, error::SendError};
+
+pub(crate) const RAW_EXECUTION_EVENT_CAPACITY: usize = 32;
+
+#[derive(Debug)]
+pub(crate) enum RawExecutionEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    ObservedAddress(IpAddr),
+    Exited(i32),
+    TimedOut,
+}
+
+#[derive(Clone)]
+pub(crate) struct RawExecutionTx(Sender<RawExecutionEvent>);
+
+impl RawExecutionTx {
+    #[must_use]
+    pub(crate) fn channel() -> (Self, Receiver<RawExecutionEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(RAW_EXECUTION_EVENT_CAPACITY);
+        (Self(tx), rx)
+    }
+
+    pub(crate) async fn send(
+        &self,
+        event: RawExecutionEvent,
+    ) -> Result<(), SendError<RawExecutionEvent>> {
+        self.0.send(event).await
+    }
+
+    pub(crate) async fn stdout_line(&self, line: &str) -> Result<(), SendError<RawExecutionEvent>> {
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        self.send(RawExecutionEvent::Stdout(bytes)).await
+    }
+
+    pub(crate) async fn stderr_chunk(
+        &self,
+        bytes: &[u8],
+    ) -> Result<(), SendError<RawExecutionEvent>> {
+        self.send(RawExecutionEvent::Stderr(bytes.to_vec())).await
+    }
+
+    pub(crate) async fn observe(
+        &self,
+        address: IpAddr,
+    ) -> Result<(), SendError<RawExecutionEvent>> {
+        self.send(RawExecutionEvent::ObservedAddress(address)).await
+    }
+}
 
 pub type LazyProgress = Box<dyn FnOnce() -> Value + Send + 'static>;
 
