@@ -7,7 +7,7 @@ use core::net::IpAddr;
 use serde::Serialize;
 
 use super::codeandsolder::globalping_behavior::host::{CapabilityToken, MeasurementKind};
-use super::execution::{self, NativeExecution};
+use super::execution::{self, ExecutionOutcome, NativeExecution};
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 use super::ip::is_private_or_reserved;
 
@@ -41,6 +41,19 @@ struct ResultPayload {
     resolved_address: Option<String>,
     resolved_hostname: Option<String>,
     hops: Vec<Hop>,
+}
+
+fn resolution_failure(
+    reason: super::codeandsolder::globalping_behavior::host::ResolutionFailureKind,
+) -> ResultPayload {
+    ResultPayload {
+        status: Status::Failed,
+        failure_source: Some(execution::resolution_failure_source(reason, "resolver").to_string()),
+        raw_output: execution::resolution_failure_message(reason),
+        resolved_address: None,
+        resolved_hostname: None,
+        hops: Vec::new(),
+    }
 }
 
 fn header_address(raw: &str) -> Option<String> {
@@ -227,7 +240,7 @@ where
 }
 
 pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String, BehaviorError> {
-    let native = execution::collect(token, MeasurementKind::Traceroute, |_chunk, all, start| {
+    let outcome = execution::collect(token, MeasurementKind::Traceroute, |_chunk, all, start| {
         if !in_progress_updates {
             return Ok(());
         }
@@ -239,6 +252,13 @@ pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String,
             .map_err(|error| BehaviorError::Internal(error.to_string()))?;
         execution::emit_progress(token, &payload, false)
     })?;
+    let native = match outcome {
+        ExecutionOutcome::Executed(native) => native,
+        ExecutionOutcome::ResolutionFailed(reason) => {
+            return serde_json::to_string(&resolution_failure(reason))
+                .map_err(|error| BehaviorError::Internal(error.to_string()));
+        }
+    };
 
     let local_addresses = native.local_addresses.clone();
     let mut seen = BTreeSet::new();

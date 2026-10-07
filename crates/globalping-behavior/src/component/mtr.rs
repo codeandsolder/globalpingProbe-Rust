@@ -4,15 +4,29 @@ use core::cell::RefCell;
 use core::net::IpAddr;
 
 use globalping_behavior_core::mtr::{
-    MtrEnrichmentEntry, MtrEnrichmentMap, normalize_ip_text, render_progress, shape_result,
+    MtrEnrichmentEntry, MtrEnrichmentMap, MtrStatus, ParsedMtr, normalize_ip_text, render_progress,
+    shape_result,
 };
 
 use super::codeandsolder::globalping_behavior::host::{
     CapabilityToken, ExecutionStart, MeasurementKind,
 };
-use super::execution;
+use super::execution::{self, ExecutionOutcome};
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 use super::ip::is_private_or_reserved;
+
+fn resolution_failure(
+    reason: super::codeandsolder::globalping_behavior::host::ResolutionFailureKind,
+) -> ParsedMtr {
+    ParsedMtr {
+        status: MtrStatus::Failed,
+        failure_source: Some(execution::resolution_failure_source(reason, "internal").to_string()),
+        raw_output: execution::resolution_failure_message(reason),
+        resolved_address: None,
+        resolved_hostname: None,
+        hops: alloc::vec::Vec::new(),
+    }
+}
 
 #[derive(Default)]
 struct State {
@@ -74,7 +88,7 @@ fn emit_snapshot(token: &CapabilityToken, raw: &str, state: &State) -> Result<()
 
 pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String, BehaviorError> {
     let state = RefCell::new(State::default());
-    let native = execution::collect_with_observed(
+    let outcome = execution::collect_with_observed(
         token,
         MeasurementKind::Mtr,
         |_line, cumulative, start| {
@@ -94,6 +108,13 @@ pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String,
             Ok(())
         },
     )?;
+    let native = match outcome {
+        ExecutionOutcome::Executed(native) => native,
+        ExecutionOutcome::ResolutionFailed(reason) => {
+            return serde_json::to_string(&resolution_failure(reason))
+                .map_err(|error| BehaviorError::Internal(error.to_string()));
+        }
+    };
 
     let mut state = state.into_inner();
     if !state.seeded && native.resolved_hostname != native.resolved_address {

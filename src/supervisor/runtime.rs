@@ -165,7 +165,8 @@ impl wit_host::Host for SelfTestState {
     fn start(
         &mut self,
         _token: wit_host::CapabilityToken,
-    ) -> impl Future<Output = Result<wit_host::ExecutionStart, wit_host::HostError>> + Send {
+    ) -> impl Future<Output = Result<wit_host::ExecutionStartResult, wit_host::HostError>> + Send
+    {
         ready(Self::denied())
     }
 
@@ -270,6 +271,7 @@ mod differential_tests {
         resolved_address: String,
         resolved_hostname: String,
         target_is_icann: bool,
+        resolution_failure: Option<wit_host::ResolutionFailureKind>,
         progress: Vec<(String, bool)>,
         reverse_requests: Vec<String>,
         asn_requests: Vec<String>,
@@ -298,11 +300,17 @@ mod differential_tests {
                 resolved_address: resolved_address.into(),
                 resolved_hostname: resolved_hostname.into(),
                 target_is_icann,
+                resolution_failure: None,
                 progress: Vec::new(),
                 reverse_requests: Vec::new(),
                 asn_requests: Vec::new(),
                 started: false,
             }
+        }
+
+        fn with_resolution_failure(mut self, reason: wit_host::ResolutionFailureKind) -> Self {
+            self.resolution_failure = Some(reason);
+            self
         }
 
         const fn valid_token(&self, token: &wit_host::CapabilityToken) -> bool {
@@ -321,7 +329,7 @@ mod differential_tests {
         fn start(
             &mut self,
             token: wit_host::CapabilityToken,
-        ) -> impl Future<Output = Result<wit_host::ExecutionStart, wit_host::HostError>> + Send
+        ) -> impl Future<Output = Result<wit_host::ExecutionStartResult, wit_host::HostError>> + Send
         {
             let result = if !self.valid_token(&token) {
                 Err(Self::error(
@@ -335,15 +343,21 @@ mod differential_tests {
                 ))
             } else {
                 self.started = true;
-                Ok(wit_host::ExecutionStart {
-                    kind: self.kind.wit(),
-                    raw_byte_limit: 64 * 1024,
-                    deadline_ms: 30_000,
-                    resolved_address: self.resolved_address.clone(),
-                    resolved_hostname: self.resolved_hostname.clone(),
-                    target_is_icann: self.target_is_icann,
-                    local_addresses: Vec::new(),
-                })
+                if let Some(reason) = self.resolution_failure.clone() {
+                    Ok(wit_host::ExecutionStartResult::ResolutionFailed(reason))
+                } else {
+                    Ok(wit_host::ExecutionStartResult::Started(
+                        wit_host::ExecutionStart {
+                            kind: self.kind.wit(),
+                            raw_byte_limit: 64 * 1024,
+                            deadline_ms: 30_000,
+                            resolved_address: self.resolved_address.clone(),
+                            resolved_hostname: self.resolved_hostname.clone(),
+                            target_is_icann: self.target_is_icann,
+                            local_addresses: Vec::new(),
+                        },
+                    ))
+                }
             };
             ready(result)
         }
@@ -498,6 +512,29 @@ mod differential_tests {
         resolved_address: &str,
         resolved_hostname: &str,
     ) -> FixtureResult {
+        run_fixture_configured(
+            kind,
+            measurement,
+            events,
+            reverse,
+            asn,
+            resolved_address,
+            resolved_hostname,
+            None,
+        )
+        .await
+    }
+
+    async fn run_fixture_configured(
+        kind: FixtureKind,
+        measurement: Value,
+        events: Vec<wit_host::ExecutionEvent>,
+        reverse: HashMap<String, String>,
+        asn: HashMap<String, Vec<u32>>,
+        resolved_address: &str,
+        resolved_hostname: &str,
+        resolution_failure: Option<wit_host::ResolutionFailureKind>,
+    ) -> FixtureResult {
         let runtime = BehaviorRuntime::new()
             .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
         let path = component_path();
@@ -520,7 +557,7 @@ mod differential_tests {
                 psl::suffix(target.trim_end_matches('.').as_bytes())
                     .is_some_and(|suffix| suffix.typ() == Some(psl::Type::Icann))
             });
-        let state = FixtureState::new(
+        let mut state = FixtureState::new(
             &token,
             kind,
             events,
@@ -530,6 +567,9 @@ mod differential_tests {
             resolved_hostname,
             target_is_icann,
         );
+        if let Some(reason) = resolution_failure {
+            state = state.with_resolution_failure(reason);
+        }
         let mut store = Store::new(runtime.engine(), state);
         store.limiter(|state| &mut state.limits);
         store
@@ -573,6 +613,24 @@ mod differential_tests {
             reverse_requests: store.data().reverse_requests.clone(),
             asn_requests: store.data().asn_requests.clone(),
         }
+    }
+
+    async fn run_resolution_failure_fixture(
+        kind: FixtureKind,
+        measurement: Value,
+        reason: wit_host::ResolutionFailureKind,
+    ) -> FixtureResult {
+        run_fixture_configured(
+            kind,
+            measurement,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            "unused",
+            "unused",
+            Some(reason),
+        )
+        .await
     }
 
     fn dns_progress(raw: &str, opts: &DnsOptions) -> Vec<(Value, bool)> {
@@ -622,6 +680,88 @@ mod differential_tests {
             let current = lines[..count].join("\n");
             (json!({"rawOutput": normalize_numeric_output(&current, target, &HashMap::new())}), false)
         }).collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_ping_private_resolution_failure_matches_native() {
+        let measurement = json!({
+            "type":"ping", "target":"10.0.0.1", "protocol":"ICMP",
+            "packets":1, "ipVersion":4, "timeout":10, "inProgressUpdates":true
+        });
+        let actual = run_resolution_failure_fixture(
+            FixtureKind::Ping,
+            measurement,
+            wit_host::ResolutionFailureKind::PrivateAddress,
+        )
+        .await;
+        let error = crate::util::resolve_target::ResolveTargetError::PrivateIp;
+        let expected = serde_json::to_value(crate::command::ping::resolution_failure(&error))
+            .unwrap_or_else(|error| panic!("native ping failure serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert!(actual.progress.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_ping_lookup_resolution_failure_matches_native() {
+        let measurement = json!({
+            "type":"ping", "target":"does-not-resolve.invalid", "protocol":"ICMP",
+            "packets":1, "ipVersion":4, "timeout":10, "inProgressUpdates":false
+        });
+        let actual = run_resolution_failure_fixture(
+            FixtureKind::Ping,
+            measurement,
+            wit_host::ResolutionFailureKind::LookupFailed,
+        )
+        .await;
+        let error = crate::util::resolve_target::ResolveTargetError::Lookup("fixture".to_string());
+        let expected = serde_json::to_value(crate::command::ping::resolution_failure(&error))
+            .unwrap_or_else(|error| panic!("native ping failure serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_traceroute_not_found_resolution_failure_matches_native() {
+        let measurement = json!({
+            "type":"traceroute", "target":"example.invalid", "protocol":"ICMP",
+            "port":80, "ipVersion":4, "timeout":10, "inProgressUpdates":false
+        });
+        let actual = run_resolution_failure_fixture(
+            FixtureKind::Traceroute,
+            measurement,
+            wit_host::ResolutionFailureKind::NotFound,
+        )
+        .await;
+        let error = crate::util::resolve_target::ResolveTargetError::NotFound;
+        let expected = serde_json::to_value(crate::command::traceroute::resolution_failure(&error))
+            .unwrap_or_else(|error| {
+                panic!("native traceroute failure serialization failed: {error}")
+            });
+        assert_eq!(actual.final_json, expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_mtr_resolution_timeout_matches_native() {
+        let measurement = json!({
+            "type":"mtr", "target":"example.invalid", "protocol":"ICMP",
+            "port":80, "packets":1, "ipVersion":4, "timeout":10, "inProgressUpdates":true
+        });
+        let actual = run_resolution_failure_fixture(
+            FixtureKind::Mtr,
+            measurement,
+            wit_host::ResolutionFailureKind::TimedOut,
+        )
+        .await;
+        let error = crate::util::resolve_target::ResolveTargetError::TimedOut;
+        let expected = serde_json::to_value(crate::command::mtr::resolution_failure(&error))
+            .unwrap_or_else(|error| panic!("native MTR failure serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert!(actual.progress.is_empty());
+        assert!(actual.reverse_requests.is_empty());
+        assert!(actual.asn_requests.is_empty());
     }
 
     #[tokio::test]
@@ -1147,6 +1287,64 @@ no answer yet for icmp_seq=1\n\
                     .all(|(_, actual)| *actual == overwrite),
                 "{kind} emitted the wrong overwrite mode"
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_shadow_resolution_failures_match_native_oracles() {
+        let cases = [
+            json!({
+                "type": "ping",
+                "target": "10.0.0.1",
+                "protocol": "ICMP",
+                "packets": 1,
+                "ipVersion": 4,
+                "timeout": 10,
+                "inProgressUpdates": true
+            }),
+            json!({
+                "type": "traceroute",
+                "target": "10.0.0.1",
+                "protocol": "ICMP",
+                "port": 80,
+                "ipVersion": 4,
+                "timeout": 10,
+                "inProgressUpdates": true
+            }),
+            json!({
+                "type": "mtr",
+                "target": "10.0.0.1",
+                "protocol": "ICMP",
+                "port": 80,
+                "packets": 1,
+                "ipVersion": 4,
+                "timeout": 10,
+                "inProgressUpdates": true
+            }),
+        ];
+
+        for measurement in cases {
+            let kind = measurement["type"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let shadow = run_real_host_shadow(measurement).await;
+            assert_eq!(
+                shadow.component, shadow.native,
+                "{kind} resolution failure mismatch"
+            );
+            assert_eq!(shadow.component["status"], "failed");
+            assert_eq!(shadow.component["failureSource"], "target");
+            assert_eq!(
+                shadow.component["rawOutput"],
+                "Private IP ranges are not allowed."
+            );
+            assert!(shadow.component["resolvedAddress"].is_null());
+            assert!(shadow.component["resolvedHostname"].is_null());
+            assert!(shadow.progress.is_empty());
+            assert!(!shadow.progress_during_native_execution);
         }
     }
 

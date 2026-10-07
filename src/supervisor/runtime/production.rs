@@ -37,7 +37,7 @@ enum ShadowOracle {
 type OracleSlot = std::sync::Arc<std::sync::Mutex<Option<Result<ShadowOracle, String>>>>;
 
 struct StartedExecution {
-    start: wit_host::ExecutionStart,
+    start: wit_host::ExecutionStartResult,
     events: tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>,
     oracle: OracleSlot,
 }
@@ -244,6 +244,32 @@ fn new_oracle_slot() -> OracleSlot {
     std::sync::Arc::new(std::sync::Mutex::new(None))
 }
 
+const fn resolution_failure_kind(
+    error: &crate::util::resolve_target::ResolveTargetError,
+) -> wit_host::ResolutionFailureKind {
+    use crate::util::resolve_target::ResolveTargetError;
+    match error {
+        ResolveTargetError::PrivateIp => wit_host::ResolutionFailureKind::PrivateAddress,
+        ResolveTargetError::TimedOut => wit_host::ResolutionFailureKind::TimedOut,
+        ResolveTargetError::NotFound => wit_host::ResolutionFailureKind::NotFound,
+        ResolveTargetError::Lookup(_) => wit_host::ResolutionFailureKind::LookupFailed,
+    }
+}
+
+fn resolution_failed_execution(
+    reason: wit_host::ResolutionFailureKind,
+    native: serde_json::Value,
+) -> StartedExecution {
+    let (_tx, events) = crate::command::RawExecutionTx::channel();
+    let oracle = new_oracle_slot();
+    store_oracle(&oracle, Ok(ShadowOracle::Ready(native)));
+    StartedExecution {
+        start: wit_host::ExecutionStartResult::ResolutionFailed(reason),
+        events,
+        oracle,
+    }
+}
+
 fn store_oracle(slot: &OracleSlot, oracle: Result<ShadowOracle, String>) {
     if let Ok(mut guard) = slot.lock() {
         *guard = Some(oracle);
@@ -277,9 +303,15 @@ async fn prepare_ping(
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = ping_budget(opts.packets, opts.timeout, None);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = resolve_command_target(&opts.target, opts.ip_version, dns_budget)
-        .await
-        .map_err(native_error)?;
+    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
+        Ok(target) => target,
+        Err(error) => {
+            let reason = resolution_failure_kind(&error);
+            let native =
+                serde_json::to_value(ping::resolution_failure(&error)).map_err(native_error)?;
+            return Ok(resolution_failed_execution(reason, native));
+        }
+    };
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
     let (tx, events) = crate::command::RawExecutionTx::channel();
@@ -316,12 +348,12 @@ async fn prepare_ping(
         }
     });
     Ok(StartedExecution {
-        start: execution_start(
+        start: wit_host::ExecutionStartResult::Started(execution_start(
             wit_host::MeasurementKind::Ping,
             scope,
             target.address.to_string(),
             target.hostname,
-        ),
+        )),
         events,
         oracle,
     })
@@ -383,12 +415,12 @@ fn prepare_dns(
         }
     });
     Ok(StartedExecution {
-        start: execution_start(
+        start: wit_host::ExecutionStartResult::Started(execution_start(
             wit_host::MeasurementKind::Dns,
             scope,
             start_target.clone(),
             start_target,
-        ),
+        )),
         events,
         oracle,
     })
@@ -408,9 +440,15 @@ async fn prepare_traceroute(
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = traceroute_budget(opts.timeout, 2);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = resolve_command_target(&opts.target, opts.ip_version, dns_budget)
-        .await
-        .map_err(native_error)?;
+    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
+        Ok(target) => target,
+        Err(error) => {
+            let reason = resolution_failure_kind(&error);
+            let native = serde_json::to_value(traceroute::resolution_failure(&error))
+                .map_err(native_error)?;
+            return Ok(resolution_failed_execution(reason, native));
+        }
+    };
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
     let args = traceroute::build_args(&resolved_options);
@@ -455,12 +493,12 @@ async fn prepare_traceroute(
         }
     });
     Ok(StartedExecution {
-        start: execution_start(
+        start: wit_host::ExecutionStartResult::Started(execution_start(
             wit_host::MeasurementKind::Traceroute,
             scope,
             target.address.to_string(),
             target.hostname,
-        ),
+        )),
         events,
         oracle,
     })
@@ -480,9 +518,15 @@ async fn prepare_mtr(
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = mtr_budget(opts.packets, opts.timeout);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = resolve_command_target(&opts.target, opts.ip_version, dns_budget)
-        .await
-        .map_err(native_error)?;
+    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
+        Ok(target) => target,
+        Err(error) => {
+            let reason = resolution_failure_kind(&error);
+            let native =
+                serde_json::to_value(mtr::resolution_failure(&error)).map_err(native_error)?;
+            return Ok(resolution_failed_execution(reason, native));
+        }
+    };
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
     let args = mtr::build_args(&resolved_options);
@@ -509,12 +553,12 @@ async fn prepare_mtr(
         }
     });
     Ok(StartedExecution {
-        start: execution_start(
+        start: wit_host::ExecutionStartResult::Started(execution_start(
             wit_host::MeasurementKind::Mtr,
             scope,
             target.address.to_string(),
             target.hostname,
-        ),
+        )),
         events,
         oracle,
     })
@@ -541,7 +585,7 @@ impl wit_host::Host for ProductionHost {
     async fn start(
         &mut self,
         token: wit_host::CapabilityToken,
-    ) -> Result<wit_host::ExecutionStart, wit_host::HostError> {
+    ) -> Result<wit_host::ExecutionStartResult, wit_host::HostError> {
         self.check_token(&token)?;
         self.lease
             .authorize_start(std::time::Instant::now())

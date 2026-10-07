@@ -109,7 +109,7 @@ impl PingCommand {
     }
 }
 
-fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
+pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
     ParsedPing {
         status: PingStatus::Failed,
         failure_source: Some(error.failure_source_or("internal").to_string()),

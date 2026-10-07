@@ -105,7 +105,7 @@ impl TracerouteCommand {
     }
 }
 
-fn resolution_failure(error: &ResolveTargetError) -> ParsedTraceroute {
+pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedTraceroute {
     ParsedTraceroute {
         status: TracerouteStatus::Failed,
         failure_source: Some(error.failure_source_or("resolver").to_string()),

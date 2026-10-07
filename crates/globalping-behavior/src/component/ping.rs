@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use serde::Serialize;
 
 use super::codeandsolder::globalping_behavior::host::{CapabilityToken, MeasurementKind};
-use super::execution::{self, NativeExecution};
+use super::execution::{self, ExecutionOutcome, NativeExecution};
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 
 #[derive(Debug, Serialize)]
@@ -44,6 +44,20 @@ struct ResultPayload {
     resolved_hostname: Option<String>,
     timings: Vec<Timing>,
     stats: Stats,
+}
+
+fn resolution_failure(
+    reason: super::codeandsolder::globalping_behavior::host::ResolutionFailureKind,
+) -> ResultPayload {
+    ResultPayload {
+        status: Status::Failed,
+        failure_source: Some(execution::resolution_failure_source(reason, "internal").to_string()),
+        raw_output: execution::resolution_failure_message(reason),
+        resolved_address: None,
+        resolved_hostname: None,
+        timings: Vec::new(),
+        stats: Stats::default(),
+    }
 }
 
 fn parse_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
@@ -204,7 +218,7 @@ pub fn run(
     in_progress_updates: bool,
     tcp_progress: bool,
 ) -> Result<String, BehaviorError> {
-    let native = execution::collect(token, MeasurementKind::Ping, |line, all, start| {
+    let outcome = execution::collect(token, MeasurementKind::Ping, |line, all, start| {
         if !in_progress_updates {
             return Ok(());
         }
@@ -226,7 +240,10 @@ pub fn run(
             .map_err(|error| BehaviorError::Internal(error.to_string()))?;
         execution::emit_progress(token, &payload, false)
     })?;
-    let payload = shape(&native);
+    let payload = match outcome {
+        ExecutionOutcome::Executed(native) => shape(&native),
+        ExecutionOutcome::ResolutionFailed(reason) => resolution_failure(reason),
+    };
     serde_json::to_string(&payload).map_err(|error| BehaviorError::Internal(error.to_string()))
 }
 

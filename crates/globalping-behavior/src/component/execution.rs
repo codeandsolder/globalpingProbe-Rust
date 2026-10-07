@@ -3,8 +3,14 @@ use alloc::vec::Vec;
 
 use super::codeandsolder::globalping_behavior::host::{
     self, CapabilityToken, ExecutionEvent, HostError, HostErrorCode, MeasurementKind,
+    ResolutionFailureKind,
 };
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
+
+pub enum ExecutionOutcome {
+    Executed(NativeExecution),
+    ResolutionFailed(ResolutionFailureKind),
+}
 
 pub struct NativeExecution {
     pub resolved_address: String,
@@ -54,7 +60,7 @@ pub fn collect<F>(
     token: &CapabilityToken,
     expected_kind: MeasurementKind,
     on_stdout: F,
-) -> Result<NativeExecution, BehaviorError>
+) -> Result<ExecutionOutcome, BehaviorError>
 where
     F: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
 {
@@ -68,12 +74,17 @@ pub fn collect_with_observed<F, G>(
     expected_kind: MeasurementKind,
     mut on_stdout: F,
     mut on_observed: G,
-) -> Result<NativeExecution, BehaviorError>
+) -> Result<ExecutionOutcome, BehaviorError>
 where
     F: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
     G: FnMut(&str, &str, &host::ExecutionStart) -> Result<(), BehaviorError>,
 {
-    let start = host::start(copy_token(token)).map_err(map_host_error)?;
+    let start = match host::start(copy_token(token)).map_err(map_host_error)? {
+        host::ExecutionStartResult::Started(start) => start,
+        host::ExecutionStartResult::ResolutionFailed(reason) => {
+            return Ok(ExecutionOutcome::ResolutionFailed(reason));
+        }
+    };
     if !same_kind(start.kind, expected_kind) {
         return Err(BehaviorError::Internal(
             "host started the wrong measurement kind".to_string(),
@@ -130,7 +141,7 @@ where
 
     let stdout = decode_utf8(&stdout_bytes)?.to_string();
     let stderr = decode_utf8(&stderr_bytes)?.to_string();
-    Ok(NativeExecution {
+    Ok(ExecutionOutcome::Executed(NativeExecution {
         resolved_address: start.resolved_address,
         resolved_hostname: start.resolved_hostname,
         target_is_icann: start.target_is_icann,
@@ -139,7 +150,28 @@ where
         stderr,
         exit_code,
         timed_out,
-    })
+    }))
+}
+
+#[must_use]
+pub const fn resolution_failure_source(kind: ResolutionFailureKind, fallback: &str) -> &str {
+    match kind {
+        ResolutionFailureKind::PrivateAddress => "target",
+        ResolutionFailureKind::TimedOut => "resolver",
+        ResolutionFailureKind::NotFound | ResolutionFailureKind::LookupFailed => fallback,
+    }
+}
+
+#[must_use]
+pub fn resolution_failure_message(kind: ResolutionFailureKind) -> String {
+    match kind {
+        ResolutionFailureKind::PrivateAddress => "Private IP ranges are not allowed.",
+        ResolutionFailureKind::TimedOut => "The measurement timed out during DNS resolution.",
+        ResolutionFailureKind::NotFound | ResolutionFailureKind::LookupFailed => {
+            "Test failed. Please try again."
+        }
+    }
+    .to_string()
 }
 
 pub fn emit_progress(

@@ -5,7 +5,7 @@ use core::net::IpAddr;
 use serde::Serialize;
 
 use super::codeandsolder::globalping_behavior::host::{CapabilityToken, MeasurementKind};
-use super::execution::{self, NativeExecution};
+use super::execution::{self, ExecutionOutcome, NativeExecution};
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 use super::ip::is_private_or_reserved;
 
@@ -473,7 +473,7 @@ pub fn run(
     in_progress_updates: bool,
 ) -> Result<String, BehaviorError> {
     let mut private_seen = false;
-    let native = execution::collect(token, MeasurementKind::Dns, |_line, cumulative, start| {
+    let outcome = execution::collect(token, MeasurementKind::Dns, |_line, cumulative, start| {
         if !in_progress_updates {
             return Ok(());
         }
@@ -492,6 +492,14 @@ pub fn run(
             }
         }
     })?;
+    let native = match outcome {
+        ExecutionOutcome::Executed(native) => native,
+        ExecutionOutcome::ResolutionFailed(_) => {
+            return Err(BehaviorError::Internal(
+                "DNS host unexpectedly reported pre-resolution failure".to_string(),
+            ));
+        }
+    };
     let payload = if trace {
         serde_json::to_string(&shape_trace(native, private_seen))
     } else {

@@ -138,7 +138,7 @@ impl MtrCommand {
 
 // ── Internal runner ───────────────────────────────────────────────────────────
 
-fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
+pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
     ParsedMtr {
         status: MtrStatus::Failed,
         failure_source: Some(error.failure_source_or("internal").to_string()),
