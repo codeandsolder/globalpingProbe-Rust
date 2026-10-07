@@ -1,4 +1,4 @@
-package codeandsolder:globalping-behavior@0.4.0;
+package codeandsolder:globalping-behavior@0.5.0;
 
 interface host {
     record capability-token {
@@ -37,25 +37,49 @@ interface host {
         lookup-failed,
     }
 
+    record resolution-failure {
+        kind: resolution-failure-kind,
+        public-message: option<string>,
+    }
+
     record execution-start {
         kind: measurement-kind,
         raw-byte-limit: u32,
         deadline-ms: u32,
         resolved-address: string,
         resolved-hostname: string,
+        dns-duration-ms: option<u64>,
         target-is-icann: bool,
         local-addresses: list<string>,
     }
 
+    record http-tls-enrichment {
+        authorized: option<bool>,
+        subject-alt: option<string>,
+        key-type: option<string>,
+        key-bits: option<u32>,
+        serial-number: option<string>,
+        fingerprint256: option<string>,
+    }
+
+    record http-native-failure {
+        failure-source: string,
+        message: string,
+    }
+
     variant execution-start-result {
         started(execution-start),
-        resolution-failed(resolution-failure-kind),
+        resolution-failed(resolution-failure),
     }
 
     variant execution-event {
         stdout(list<u8>),
         stderr(list<u8>),
         observed-address(string),
+        http-response-headers(list<u8>),
+        http-response-body(list<u8>),
+        http-tls-enrichment(http-tls-enrichment),
+        http-native-failure(http-native-failure),
         exited(s32),
         timed-out,
     }

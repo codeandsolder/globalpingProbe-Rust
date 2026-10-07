@@ -277,6 +277,7 @@ mod differential_tests {
         Dns,
         Traceroute,
         Mtr,
+        Http,
     }
 
     impl FixtureKind {
@@ -286,6 +287,7 @@ mod differential_tests {
                 Self::Dns => wit_host::MeasurementKind::Dns,
                 Self::Traceroute => wit_host::MeasurementKind::Traceroute,
                 Self::Mtr => wit_host::MeasurementKind::Mtr,
+                Self::Http => wit_host::MeasurementKind::Http,
             }
         }
     }
@@ -301,7 +303,9 @@ mod differential_tests {
         resolved_address: String,
         resolved_hostname: String,
         target_is_icann: bool,
+        dns_duration_ms: Option<u64>,
         resolution_failure: Option<wit_host::ResolutionFailureKind>,
+        resolution_public_message: Option<String>,
         progress: Vec<(String, bool)>,
         reverse_requests: Vec<String>,
         asn_requests: Vec<String>,
@@ -330,7 +334,9 @@ mod differential_tests {
                 resolved_address: resolved_address.into(),
                 resolved_hostname: resolved_hostname.into(),
                 target_is_icann,
+                dns_duration_ms: None,
                 resolution_failure: None,
+                resolution_public_message: None,
                 progress: Vec::new(),
                 reverse_requests: Vec::new(),
                 asn_requests: Vec::new(),
@@ -338,8 +344,18 @@ mod differential_tests {
             }
         }
 
-        fn with_resolution_failure(mut self, reason: wit_host::ResolutionFailureKind) -> Self {
+        fn with_resolution_failure(
+            mut self,
+            reason: wit_host::ResolutionFailureKind,
+            public_message: Option<String>,
+        ) -> Self {
             self.resolution_failure = Some(reason);
+            self.resolution_public_message = public_message;
+            self
+        }
+
+        const fn with_dns_duration(mut self, dns_duration_ms: Option<u64>) -> Self {
+            self.dns_duration_ms = dns_duration_ms;
             self
         }
 
@@ -374,7 +390,12 @@ mod differential_tests {
             } else {
                 self.started = true;
                 if let Some(reason) = self.resolution_failure.clone() {
-                    Ok(wit_host::ExecutionStartResult::ResolutionFailed(reason))
+                    Ok(wit_host::ExecutionStartResult::ResolutionFailed(
+                        wit_host::ResolutionFailure {
+                            kind: reason,
+                            public_message: self.resolution_public_message.clone(),
+                        },
+                    ))
                 } else {
                     Ok(wit_host::ExecutionStartResult::Started(
                         wit_host::ExecutionStart {
@@ -383,6 +404,7 @@ mod differential_tests {
                             deadline_ms: 30_000,
                             resolved_address: self.resolved_address.clone(),
                             resolved_hostname: self.resolved_hostname.clone(),
+                            dns_duration_ms: self.dns_duration_ms,
                             target_is_icann: self.target_is_icann,
                             local_addresses: Vec::new(),
                         },
@@ -551,6 +573,8 @@ mod differential_tests {
             resolved_address,
             resolved_hostname,
             None,
+            None,
+            None,
         )
         .await
     }
@@ -564,6 +588,8 @@ mod differential_tests {
         resolved_address: &str,
         resolved_hostname: &str,
         resolution_failure: Option<wit_host::ResolutionFailureKind>,
+        resolution_public_message: Option<String>,
+        dns_duration_ms: Option<u64>,
     ) -> FixtureResult {
         let runtime = BehaviorRuntime::new()
             .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
@@ -598,8 +624,9 @@ mod differential_tests {
             target_is_icann,
         );
         if let Some(reason) = resolution_failure {
-            state = state.with_resolution_failure(reason);
+            state = state.with_resolution_failure(reason, resolution_public_message);
         }
+        state = state.with_dns_duration(dns_duration_ms);
         let mut store = Store::new(runtime.engine(), state);
         store.limiter(|state| &mut state.limits);
         store
@@ -659,6 +686,49 @@ mod differential_tests {
             "unused",
             "unused",
             Some(reason),
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn run_http_fixture(
+        measurement: Value,
+        events: Vec<wit_host::ExecutionEvent>,
+        resolved_address: &str,
+        dns_duration_ms: Option<u64>,
+    ) -> FixtureResult {
+        run_fixture_configured(
+            FixtureKind::Http,
+            measurement,
+            events,
+            HashMap::new(),
+            HashMap::new(),
+            resolved_address,
+            resolved_address,
+            None,
+            None,
+            dns_duration_ms,
+        )
+        .await
+    }
+
+    async fn run_http_resolution_failure_fixture(
+        measurement: Value,
+        reason: wit_host::ResolutionFailureKind,
+        public_message: String,
+    ) -> FixtureResult {
+        run_fixture_configured(
+            FixtureKind::Http,
+            measurement,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            "unused",
+            "unused",
+            Some(reason),
+            Some(public_message),
+            None,
         )
         .await
     }
@@ -710,6 +780,123 @@ mod differential_tests {
             let current = lines[..count].join("\n");
             (json!({"rawOutput": normalize_numeric_output(&current, target, &HashMap::new())}), false)
         }).collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_http_success_progress_and_tls_match_native() {
+        use globalping_behavior_core::http::{
+            HttpSuccessInput, TlsEnrichment, apply_tls_enrichment, parse_metrics,
+            parse_tls_verbose, shape_success_http_result,
+        };
+
+        let measurement = json!({
+            "type":"http", "target":"example.com", "protocol":"HTTPS",
+            "ipVersion":4, "timeout":10, "inProgressUpdates":true,
+            "request":{"method":"GET","path":"/","query":"","headers":{}}
+        });
+        let headers = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Test: yes\r\n\r\n";
+        let verbose = "* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384\n* start date: Nov  5 00:00:00 2024 GMT\n* expire date: Nov  4 23:59:59 2025 GMT\n* subject: CN=example.com\n* issuer: C=US; O=Example CA; CN=Example Root\n";
+        let metrics_raw = r#"{"remote_ip":"93.184.216.34","time_namelookup":0.0,"time_connect":0.010,"time_appconnect":0.020,"time_starttransfer":0.030,"time_total":0.040,"http_version":"1.1","response_code":200,"ssl_verify_result":0}"#;
+        let enrichment = wit_host::HttpTlsEnrichment {
+            authorized: Some(true),
+            subject_alt: Some("DNS:example.com".to_string()),
+            key_type: Some("EC".to_string()),
+            key_bits: Some(256),
+            serial_number: Some("AA:BB".to_string()),
+            fingerprint256: Some("11:22".to_string()),
+        };
+        let events = vec![
+            wit_host::ExecutionEvent::HttpResponseHeaders(headers.to_vec()),
+            wit_host::ExecutionEvent::HttpResponseBody(b"he".to_vec()),
+            wit_host::ExecutionEvent::HttpResponseBody(b"llo".to_vec()),
+            stdout(metrics_raw),
+            wit_host::ExecutionEvent::Stderr(verbose.as_bytes().to_vec()),
+            wit_host::ExecutionEvent::HttpTlsEnrichment(enrichment.clone()),
+            wit_host::ExecutionEvent::Exited(0),
+        ];
+        let actual = run_http_fixture(measurement, events, "93.184.216.34", Some(7)).await;
+
+        let metrics = parse_metrics(metrics_raw, verbose)
+            .unwrap_or_else(|error| panic!("fixture metrics failed: {error}"));
+        let mut tls = parse_tls_verbose(verbose, metrics.ssl_verify_result)
+            .unwrap_or_else(|| panic!("fixture TLS parse failed"));
+        apply_tls_enrichment(
+            &mut tls,
+            TlsEnrichment {
+                authorized: enrichment.authorized,
+                subject_alt: enrichment.subject_alt,
+                key_type: enrichment.key_type,
+                key_bits: enrichment.key_bits,
+                serial_number: enrichment.serial_number,
+                fingerprint256: enrichment.fingerprint256,
+            },
+        );
+        let expected = serde_json::to_value(shape_success_http_result(HttpSuccessInput {
+            method: "GET",
+            protocol: "HTTPS",
+            raw_header_file: &String::from_utf8_lossy(headers),
+            raw_body_bytes: b"hello",
+            metrics: &metrics,
+            final_resolved_ip: "93.184.216.34".to_string(),
+            dns_ms: Some(7),
+            tls: Some(tls),
+        }))
+        .unwrap_or_else(|error| panic!("native HTTP fixture serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert_eq!(actual.progress.len(), 2);
+        assert_eq!(actual.progress[0].0["rawBody"], "he");
+        assert_eq!(
+            actual.progress[0].0["rawHeaders"],
+            "Content-Type: text/plain\nX-Test: yes"
+        );
+        assert_eq!(
+            actual.progress[1],
+            (json!({"rawBody":"llo","rawOutput":"llo"}), false)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_http_resolution_failure_preserves_public_message() {
+        let measurement = json!({
+            "type":"http", "target":"missing.invalid", "protocol":"HTTPS",
+            "ipVersion":4, "timeout":10, "request":{"method":"HEAD"}
+        });
+        let message = "DNS resolution returned no results for missing.invalid".to_string();
+        let actual = run_http_resolution_failure_fixture(
+            measurement,
+            wit_host::ResolutionFailureKind::LookupFailed,
+            message.clone(),
+        )
+        .await;
+        let expected = serde_json::to_value(globalping_behavior_core::http::failed_result(
+            "target", message,
+        ))
+        .unwrap_or_else(|error| panic!("HTTP failure serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
+        assert!(actual.progress.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
+    async fn differential_http_timeout_phase_matches_native() {
+        let measurement = json!({
+            "type":"http", "target":"example.com", "protocol":"HTTPS",
+            "ipVersion":4, "timeout":10, "request":{"method":"GET"}
+        });
+        let verbose = "* Connected to example.com (93.184.216.34) port 443\n";
+        let events = vec![
+            wit_host::ExecutionEvent::Stderr(verbose.as_bytes().to_vec()),
+            wit_host::ExecutionEvent::TimedOut,
+        ];
+        let actual = run_http_fixture(measurement, events, "93.184.216.34", Some(4)).await;
+        let expected = serde_json::to_value(globalping_behavior_core::http::failed_result(
+            "target",
+            "Request timed out during the TLS handshake.".to_string(),
+        ))
+        .unwrap_or_else(|error| panic!("HTTP timeout serialization failed: {error}"));
+        assert_eq!(actual.final_json, expected);
     }
 
     #[tokio::test]
@@ -1297,6 +1484,23 @@ no answer yet for icmp_seq=1\n\
                 }),
                 true,
             ),
+            (
+                json!({
+                    "type": "http",
+                    "target": "example.com",
+                    "protocol": "HTTPS",
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": true,
+                    "request": {
+                        "method": "GET",
+                        "path": "/",
+                        "query": "",
+                        "headers": {}
+                    }
+                }),
+                false,
+            ),
         ];
 
         for (measurement, overwrite) in cases {
@@ -1317,6 +1521,12 @@ no answer yet for icmp_seq=1\n\
                     .all(|(_, actual)| *actual == overwrite),
                 "{kind} emitted the wrong overwrite mode"
             );
+            if kind == "http" {
+                assert!(
+                    shadow.progress_during_native_execution,
+                    "HTTP progress was emitted only after curl/TLS oracle completion"
+                );
+            }
         }
     }
 
@@ -1352,6 +1562,15 @@ no answer yet for icmp_seq=1\n\
                 "ipVersion": 4,
                 "timeout": 10,
                 "inProgressUpdates": true
+            }),
+            json!({
+                "type": "http",
+                "target": "10.0.0.1",
+                "protocol": "HTTPS",
+                "ipVersion": 4,
+                "timeout": 10,
+                "inProgressUpdates": true,
+                "request": {"method": "HEAD", "path": "/", "query": "", "headers": {}}
             }),
         ];
 

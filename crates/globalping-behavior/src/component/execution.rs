@@ -3,13 +3,13 @@ use alloc::vec::Vec;
 
 use super::codeandsolder::globalping_behavior::host::{
     self, CapabilityToken, ExecutionEvent, HostError, HostErrorCode, MeasurementKind,
-    ResolutionFailureKind,
+    ResolutionFailure, ResolutionFailureKind,
 };
 use super::exports::codeandsolder::globalping_behavior::guest::BehaviorError;
 
 pub enum ExecutionOutcome {
     Executed(NativeExecution),
-    ResolutionFailed(ResolutionFailureKind),
+    ResolutionFailed(ResolutionFailure),
 }
 
 pub struct NativeExecution {
@@ -122,6 +122,14 @@ where
                 let cumulative = decode_utf8(&stdout_bytes)?;
                 on_observed(&address, cumulative, &start)?;
             }
+            ExecutionEvent::HttpResponseHeaders(_)
+            | ExecutionEvent::HttpResponseBody(_)
+            | ExecutionEvent::HttpTlsEnrichment(_)
+            | ExecutionEvent::HttpNativeFailure(_) => {
+                return Err(BehaviorError::Internal(
+                    "host emitted HTTP-only data for a non-HTTP measurement".to_string(),
+                ));
+            }
             ExecutionEvent::Exited(code) => {
                 exit_code = Some(code);
                 break;
@@ -154,8 +162,11 @@ where
 }
 
 #[must_use]
-pub const fn resolution_failure_source(kind: ResolutionFailureKind, fallback: &str) -> &str {
-    match kind {
+pub const fn resolution_failure_source<'a>(
+    failure: &ResolutionFailure,
+    fallback: &'a str,
+) -> &'a str {
+    match failure.kind {
         ResolutionFailureKind::PrivateAddress => "target",
         ResolutionFailureKind::TimedOut => "resolver",
         ResolutionFailureKind::NotFound | ResolutionFailureKind::LookupFailed => fallback,
@@ -163,8 +174,8 @@ pub const fn resolution_failure_source(kind: ResolutionFailureKind, fallback: &s
 }
 
 #[must_use]
-pub fn resolution_failure_message(kind: ResolutionFailureKind) -> String {
-    match kind {
+pub fn resolution_failure_message(failure: &ResolutionFailure) -> String {
+    match failure.kind {
         ResolutionFailureKind::PrivateAddress => "Private IP ranges are not allowed.",
         ResolutionFailureKind::TimedOut => "The measurement timed out during DNS resolution.",
         ResolutionFailureKind::NotFound | ResolutionFailureKind::LookupFailed => {

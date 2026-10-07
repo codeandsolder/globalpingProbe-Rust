@@ -119,10 +119,22 @@ mod component {
 
     mod dns;
     mod execution;
+    mod http;
     mod ip;
     mod mtr;
     mod ping;
     mod traceroute;
+
+    fn default_http_method() -> String {
+        "HEAD".to_string()
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct HttpRequest {
+        #[serde(default = "default_http_method")]
+        method: String,
+    }
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -134,6 +146,8 @@ mod component {
         in_progress_updates: bool,
         #[serde(default)]
         trace: bool,
+        #[serde(default)]
+        request: Option<HttpRequest>,
     }
 
     struct Behavior;
@@ -171,9 +185,19 @@ mod component {
                     traceroute::run(&job.token, measurement.in_progress_updates)
                 }
                 MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
-                MeasurementKind::Http => Err(BehaviorError::Internal(
-                    "measurement behavior has not migrated to the component yet".to_string(),
-                )),
+                MeasurementKind::Http => {
+                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
+                    let method = measurement
+                        .request
+                        .as_ref()
+                        .map_or("HEAD", |request| request.method.as_str());
+                    http::run(
+                        &job.token,
+                        protocol,
+                        method,
+                        measurement.in_progress_updates,
+                    )
+                }
             }
         }
 
@@ -182,6 +206,7 @@ mod component {
             ping::self_test()?;
             mtr::self_test()?;
             traceroute::self_test()?;
+            http::self_test()?;
             Ok(())
         }
     }

@@ -278,9 +278,6 @@ fn spawn_behavior_shadow(
     measurement_type: &str,
     shadow_jobs: &ActiveJobs,
 ) {
-    if measurement_type == "http" {
-        return;
-    }
     let Some(controller) = behavior_controller else {
         return;
     };

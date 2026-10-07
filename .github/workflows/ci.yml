@@ -54,15 +54,19 @@ jobs:
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
         run: cargo +1.99.0 test --locked --test behavior_component -- --include-ignored
-      - name: Differential-test WASIp2 ping/DNS/traceroute/MTR behavior against native shaping
+      - name: Differential-test all WASIp2 measurement behavior against native shaping
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
         run: cargo +1.99.0 test --locked --lib differential_tests::differential_ -- --ignored
       - name: Clippy production targets
         run: cargo +1.99.0 clippy --locked --lib --bins -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy shared behavior core
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior-core -- -D warnings -D clippy::pedantic -D clippy::nursery
       - name: Clippy WASIp2 behavior component
         run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 -- -D warnings -D clippy::pedantic -D clippy::nursery
       - name: Unit tests
         run: cargo +1.99.0 test --locked --lib --bins
+      - name: Shared behavior core unit tests
+        run: cargo +1.99.0 test --locked -p globalping-behavior-core
       - name: Documentation
         run: cargo +1.99.0 doc --locked --no-deps

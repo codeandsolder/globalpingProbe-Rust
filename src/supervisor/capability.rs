@@ -10,6 +10,8 @@ use crate::util::private_ip::is_ip_private;
 pub const MAX_RAW_EXECUTION_BYTES: usize = 64 * 1024;
 pub const MAX_PROGRESS_JSON_BYTES: usize = 10_240;
 pub const MAX_FINAL_JSON_BYTES: usize = 10_240;
+pub const MAX_HTTP_PROGRESS_JSON_BYTES: usize = 128 * 1024;
+pub const MAX_HTTP_FINAL_JSON_BYTES: usize = 128 * 1024;
 pub const MAX_POLL_CALLS: u32 = 4_096;
 pub const MAX_ENRICHMENT_LOOKUPS: u32 = 128;
 pub const MAX_PROGRESS_EVENTS: u32 = 128;
@@ -261,7 +263,12 @@ impl CapabilityLease {
     /// consume an event slot.
     pub fn authorize_progress(&mut self, json: &str, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
-        if json.len() > MAX_PROGRESS_JSON_BYTES {
+        let limit = if self.scope.kind == MeasurementKind::Http {
+            MAX_HTTP_PROGRESS_JSON_BYTES
+        } else {
+            MAX_PROGRESS_JSON_BYTES
+        };
+        if json.len() > limit {
             return Err(PolicyError::ProgressQuota);
         }
         self.progress_events = self
@@ -281,7 +288,12 @@ impl CapabilityLease {
     /// final-payload limit.
     pub fn authorize_final_result(&self, json: &str, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
-        if json.len() > MAX_FINAL_JSON_BYTES {
+        let limit = if self.scope.kind == MeasurementKind::Http {
+            MAX_HTTP_FINAL_JSON_BYTES
+        } else {
+            MAX_FINAL_JSON_BYTES
+        };
+        if json.len() > limit {
             return Err(PolicyError::FinalResultQuota);
         }
         Ok(())
@@ -336,6 +348,18 @@ mod tests {
             "packets": 3,
             "ipVersion": 4,
             "timeout": timeout
+        }))
+        .unwrap_or_else(|error| panic!("fixture must be valid: {error}"))
+    }
+
+    fn http_scope(timeout: u64) -> MeasurementScope {
+        MeasurementScope::from_server_measurement(json!({
+            "type": "http",
+            "target": "example.com",
+            "protocol": "HTTPS",
+            "ipVersion": 4,
+            "timeout": timeout,
+            "request": {"method": "GET", "path": "/", "headers": {}}
         }))
         .unwrap_or_else(|error| panic!("fixture must be valid: {error}"))
     }
@@ -434,6 +458,24 @@ mod tests {
         );
         assert_eq!(
             lease.authorize_final_result(&"x".repeat(MAX_FINAL_JSON_BYTES + 1), now),
+            Err(PolicyError::FinalResultQuota)
+        );
+    }
+
+    #[test]
+    fn http_payload_quotas_are_larger_without_widening_other_measurements() {
+        let now = Instant::now();
+        let mut http = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, http_scope(10), now);
+        assert_eq!(http.authorize_start(now), Ok(()));
+        let payload = "x".repeat(MAX_PROGRESS_JSON_BYTES + 1);
+        assert_eq!(http.authorize_progress(&payload, now), Ok(()));
+        assert_eq!(http.authorize_final_result(&payload, now), Ok(()));
+        assert_eq!(
+            http.authorize_progress(&"x".repeat(MAX_HTTP_PROGRESS_JSON_BYTES + 1), now),
+            Err(PolicyError::ProgressQuota)
+        );
+        assert_eq!(
+            http.authorize_final_result(&"x".repeat(MAX_HTTP_FINAL_JSON_BYTES + 1), now),
             Err(PolicyError::FinalResultQuota)
         );
     }

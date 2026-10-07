@@ -44,7 +44,7 @@ struct ResultPayload {
 }
 
 fn resolution_failure(
-    reason: super::codeandsolder::globalping_behavior::host::ResolutionFailureKind,
+    reason: &super::codeandsolder::globalping_behavior::host::ResolutionFailure,
 ) -> ResultPayload {
     ResultPayload {
         status: Status::Failed,
@@ -255,7 +255,7 @@ pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String,
     let native = match outcome {
         ExecutionOutcome::Executed(native) => native,
         ExecutionOutcome::ResolutionFailed(reason) => {
-            return serde_json::to_string(&resolution_failure(reason))
+            return serde_json::to_string(&resolution_failure(&reason))
                 .map_err(|error| BehaviorError::Internal(error.to_string()));
         }
     };

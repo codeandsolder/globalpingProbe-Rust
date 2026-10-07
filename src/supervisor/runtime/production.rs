@@ -235,6 +235,7 @@ fn execution_start(
         deadline_ms: u32::try_from(scope.timeout.as_millis()).unwrap_or(u32::MAX),
         resolved_address,
         resolved_hostname,
+        dns_duration_ms: None,
         target_is_icann: target_is_icann(&scope.target),
         local_addresses: local_addresses(),
     }
@@ -256,18 +257,29 @@ const fn resolution_failure_kind(
     }
 }
 
-fn resolution_failed_execution(
+fn resolution_failed_execution_with_message(
     reason: wit_host::ResolutionFailureKind,
+    public_message: Option<String>,
     native: serde_json::Value,
 ) -> StartedExecution {
     let (_tx, events) = crate::command::RawExecutionTx::channel();
     let oracle = new_oracle_slot();
     store_oracle(&oracle, Ok(ShadowOracle::Ready(native)));
     StartedExecution {
-        start: wit_host::ExecutionStartResult::ResolutionFailed(reason),
+        start: wit_host::ExecutionStartResult::ResolutionFailed(wit_host::ResolutionFailure {
+            kind: reason,
+            public_message,
+        }),
         events,
         oracle,
     }
+}
+
+fn resolution_failed_execution(
+    reason: wit_host::ResolutionFailureKind,
+    native: serde_json::Value,
+) -> StartedExecution {
+    resolution_failed_execution_with_message(reason, None, native)
 }
 
 fn store_oracle(slot: &OracleSlot, oracle: Result<ShadowOracle, String>) {
@@ -564,6 +576,76 @@ async fn prepare_mtr(
     })
 }
 
+async fn prepare_http(
+    scope: &crate::supervisor::capability::MeasurementScope,
+) -> Result<StartedExecution, wit_host::HostError> {
+    use crate::command::http;
+    use crate::util::measurement_timeout::MeasurementDeadline;
+
+    let opts: http::HttpOptions =
+        serde_json::from_value(scope.measurement.clone()).map_err(native_error)?;
+    http::validate(&opts).map_err(native_error)?;
+    let deadline = MeasurementDeadline::new(opts.timeout);
+    let (resolved_ip, dns_ms) = match http::resolve_target(
+        &opts.target,
+        opts.resolver.as_deref(),
+        opts.ip_version,
+        opts.timeout,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let reason = match error {
+                http::HttpResolveError::PrivateIp => {
+                    wit_host::ResolutionFailureKind::PrivateAddress
+                }
+                http::HttpResolveError::TimedOut => wit_host::ResolutionFailureKind::TimedOut,
+                http::HttpResolveError::Failed(_) => wit_host::ResolutionFailureKind::LookupFailed,
+            };
+            let message = error.public_message();
+            let native = serde_json::to_value(globalping_behavior_core::http::failed_result(
+                error.failure_source(),
+                message.clone(),
+            ))
+            .map_err(native_error)?;
+            return Ok(resolution_failed_execution_with_message(
+                reason,
+                Some(message),
+                native,
+            ));
+        }
+    };
+
+    let (tx, events) = crate::command::RawExecutionTx::channel();
+    let oracle = new_oracle_slot();
+    let task_oracle = std::sync::Arc::clone(&oracle);
+    let task_opts = opts.clone();
+    let task_ip = resolved_ip.clone();
+    tokio::spawn(async move {
+        let raw = http::run_raw_stream(&task_opts, task_ip, dns_ms, deadline, &tx).await;
+        match serde_json::to_value(raw.native) {
+            Ok(native) => {
+                store_oracle(&task_oracle, Ok(ShadowOracle::Ready(native)));
+                send_terminal(&tx, raw.timed_out, raw.exit_code).await;
+            }
+            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+        }
+    });
+    let mut start = execution_start(
+        wit_host::MeasurementKind::Http,
+        scope,
+        resolved_ip,
+        opts.target.clone(),
+    );
+    start.dns_duration_ms = dns_ms;
+    Ok(StartedExecution {
+        start: wit_host::ExecutionStartResult::Started(start),
+        events,
+        oracle,
+    })
+}
+
 async fn prepare_native_execution(
     scope: &crate::supervisor::capability::MeasurementScope,
 ) -> Result<StartedExecution, wit_host::HostError> {
@@ -574,10 +656,7 @@ async fn prepare_native_execution(
             prepare_traceroute(scope).await
         }
         crate::supervisor::capability::MeasurementKind::Mtr => prepare_mtr(scope).await,
-        crate::supervisor::capability::MeasurementKind::Http => Err(host_error(
-            wit_host::HostErrorCode::WrongMeasurementKind,
-            "HTTP behavior has not migrated to the component yet",
-        )),
+        crate::supervisor::capability::MeasurementKind::Http => prepare_http(scope).await,
     }
 }
 
@@ -660,6 +739,35 @@ impl wit_host::Host for ProductionHost {
                     .map_err(policy_error)?;
                 wit_host::ExecutionEvent::ObservedAddress(address.to_string())
             }
+            crate::command::RawExecutionEvent::HttpResponseHeaders(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                wit_host::ExecutionEvent::HttpResponseHeaders(bytes)
+            }
+            crate::command::RawExecutionEvent::HttpResponseBody(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                wit_host::ExecutionEvent::HttpResponseBody(bytes)
+            }
+            crate::command::RawExecutionEvent::HttpTlsEnrichment(enrichment) => {
+                wit_host::ExecutionEvent::HttpTlsEnrichment(wit_host::HttpTlsEnrichment {
+                    authorized: enrichment.authorized,
+                    subject_alt: enrichment.subject_alt,
+                    key_type: enrichment.key_type,
+                    key_bits: enrichment.key_bits,
+                    serial_number: enrichment.serial_number,
+                    fingerprint256: enrichment.fingerprint256,
+                })
+            }
+            crate::command::RawExecutionEvent::HttpNativeFailure {
+                failure_source,
+                message,
+            } => wit_host::ExecutionEvent::HttpNativeFailure(wit_host::HttpNativeFailure {
+                failure_source,
+                message,
+            }),
             crate::command::RawExecutionEvent::Exited(code) => {
                 wit_host::ExecutionEvent::Exited(code)
             }

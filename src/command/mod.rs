@@ -16,6 +16,13 @@ pub(crate) enum RawExecutionEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     ObservedAddress(IpAddr),
+    HttpResponseHeaders(Vec<u8>),
+    HttpResponseBody(Vec<u8>),
+    HttpTlsEnrichment(globalping_behavior_core::http::TlsEnrichment),
+    HttpNativeFailure {
+        failure_source: String,
+        message: String,
+    },
     Exited(i32),
     TimedOut,
 }

@@ -19,4 +19,5 @@ unimplemented = "deny"
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 libm = "0.2"
