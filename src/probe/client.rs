@@ -3,6 +3,8 @@ use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio::time::Duration;
@@ -271,6 +273,11 @@ async fn apply_behavior_health(
     }
 }
 
+#[cfg(test)]
+static FORCE_BEHAVIOR_SHADOW_DIVERGENCE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCED_BEHAVIOR_SHADOW_MATCHES: AtomicUsize = AtomicUsize::new(0);
+
 fn spawn_behavior_shadow(
     behavior_controller: Option<Arc<BehaviorController>>,
     measurement: &Value,
@@ -292,7 +299,18 @@ fn spawn_behavior_shadow(
         };
         let sequence = shadow.sequence();
         let build_id = shadow.build_id().to_string();
-        let health_event = match shadow.run(shadow_measurement).await {
+        let shadow_result = shadow.run(shadow_measurement).await;
+        #[cfg(test)]
+        let shadow_result = shadow_result.map(|mut result| {
+            if FORCE_BEHAVIOR_SHADOW_DIVERGENCE.load(Ordering::SeqCst) {
+                if result.component == result.native {
+                    FORCED_BEHAVIOR_SHADOW_MATCHES.fetch_add(1, Ordering::SeqCst);
+                }
+                result.component = json!({"__forcedHealthTestDivergence": true});
+            }
+            result
+        });
+        let health_event = match shadow_result {
             Ok(result) if result.component == result.native => {
                 debug!(
                     target: "behavior-shadow",
@@ -1198,6 +1216,27 @@ fn parse_connect_error(payload: &Payload) -> (String, Option<String>) {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    use std::num::NonZeroU32;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    use ed25519_dalek::{Signer as _, SigningKey};
+    #[cfg(target_os = "linux")]
+    use semver::Version;
+    #[cfg(target_os = "linux")]
+    use sha2::{Digest as _, Sha256};
+
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::bootstrap::BehaviorBootstrapConfig;
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::health::BehaviorHealthPolicy;
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::storage::PersistentBehaviorSlots;
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::update::{BehaviorManifest, SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR};
+
     fn cfg(uuid: &str) -> ClientConfig {
         ClientConfig {
             api_host: "https://api.globalping.io".into(),
@@ -1370,6 +1409,168 @@ mod tests {
             CommandKind::Ping.progress_mode(&icmp),
             BufferMode::Append
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn health_test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x47; 32])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signed_health_test_component(
+        path: &Path,
+        sequence: u64,
+        build_id: &str,
+    ) -> (BehaviorManifest, Vec<u8>) {
+        let component = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let signing_key = health_test_signing_key();
+        let digest = Sha256::digest(&component);
+        let mut manifest = BehaviorManifest {
+            sequence,
+            abi_major: SUPPORTED_ABI_MAJOR,
+            abi_minor: SUPPORTED_ABI_MINOR,
+            min_supervisor_version: env!("CARGO_PKG_VERSION").to_string(),
+            size: u64::try_from(component.len())
+                .unwrap_or_else(|error| panic!("component size does not fit in u64: {error}")),
+            sha256: hex::encode(digest),
+            build_id: build_id.to_string(),
+            signature: String::new(),
+        };
+        manifest.signature = hex::encode(signing_key.sign(&manifest.signing_payload()).to_bytes());
+        (manifest, component)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
+    async fn live_shadow_health_rolls_back_persistently_after_all_six_measurements_diverge() {
+        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let threshold =
+            NonZeroU32::new(6).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
+                .with_health_policy(BehaviorHealthPolicy::new(threshold));
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+
+        let (normal_manifest, normal_component) =
+            signed_health_test_component(&component_path, 1, "health-normal");
+        controller
+            .activate_candidate(normal_manifest, normal_component)
+            .await
+            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
+        let (active_manifest, active_component) =
+            signed_health_test_component(&component_path, 2, "health-test-active");
+        controller
+            .activate_candidate(active_manifest, active_component)
+            .await
+            .unwrap_or_else(|error| panic!("test behavior activation failed: {error}"));
+
+        struct ForcedDivergenceGuard;
+        impl Drop for ForcedDivergenceGuard {
+            fn drop(&mut self) {
+                FORCE_BEHAVIOR_SHADOW_DIVERGENCE.store(false, Ordering::SeqCst);
+            }
+        }
+        FORCED_BEHAVIOR_SHADOW_MATCHES.store(0, Ordering::SeqCst);
+        FORCE_BEHAVIOR_SHADOW_DIVERGENCE.store(true, Ordering::SeqCst);
+        let _forced_divergence = ForcedDivergenceGuard;
+
+        let cases = [
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "ICMP",
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "dns", "target": "example.com", "protocol": "UDP", "port": 53,
+                "resolver": null, "trace": false, "query": {"type": "A"},
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "traceroute", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "mtr", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "http", "target": "example.com", "protocol": "HTTPS",
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true,
+                "request": {"method": "GET", "path": "/", "query": "", "headers": {}}
+            }),
+        ];
+        let shadow_jobs = ActiveJobs::new();
+
+        for (index, measurement) in cases.into_iter().enumerate() {
+            let measurement_type = measurement["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("test measurement is missing type"));
+            spawn_behavior_shadow(
+                Some(Arc::clone(&controller)),
+                &measurement,
+                &format!("health-{index}-{measurement_type}"),
+                measurement_type,
+                &shadow_jobs,
+            );
+            shadow_jobs.wait_idle().await;
+
+            if index < 5 {
+                assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+                let health = controller.health_snapshot().await;
+                assert_eq!(health.active_sequence, Some(2));
+                assert_eq!(
+                    health.consecutive_faults,
+                    u32::try_from(index + 1).unwrap_or(u32::MAX)
+                );
+                assert_eq!(
+                    health.divergences,
+                    u64::try_from(index + 1).unwrap_or(u64::MAX)
+                );
+                assert_eq!(health.runtime_faults, 0);
+                assert_eq!(health.inconclusive, 0);
+            }
+        }
+
+        assert_eq!(FORCED_BEHAVIOR_SHADOW_MATCHES.load(Ordering::SeqCst), 6);
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        assert!(!controller.has_previous().unwrap_or(true));
+        let executor = controller
+            .executor()
+            .await
+            .unwrap_or_else(|| panic!("rolled-back executor must exist"));
+        assert_eq!(executor.sequence(), 1);
+        assert_eq!(executor.build_id(), "health-normal");
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(1));
+        assert_eq!(health.consecutive_faults, 0);
+        assert_eq!(health.divergences, 0);
+        assert_eq!(health.runtime_faults, 0);
+        assert_eq!(health.inconclusive, 0);
+
+        let persisted = PersistentBehaviorSlots::load(
+            root.path(),
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        assert_eq!(persisted.active().manifest.sequence, 1);
+        assert_eq!(persisted.active().manifest.build_id, "health-normal");
+        assert_eq!(persisted.accepted_sequence(), 2);
+        assert!(persisted.previous().is_none());
     }
 
     // ── Error message parsing via reconnect ───────────────────────────────────
