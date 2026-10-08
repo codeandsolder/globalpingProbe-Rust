@@ -45,7 +45,7 @@ regex       = "1"
 futures     = "0.3"
 futures-util  = "0.3"
 rust_socketio = { version = "0.6", features = ["async"] }
-reqwest       = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest       = { version = "0.13", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 bytes         = "1"
