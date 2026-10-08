@@ -50,6 +50,18 @@ jobs:
         run: cargo +1.99.0 build --locked --release --no-default-features --features wasm-core --bin globalping-sandbox --target wasm32-wasip2
       - name: Build WASIp2 behavior component
         run: cargo +1.99.0 build --locked --release -p globalping-behavior --target wasm32-wasip2
+      - name: Package signed behavior update artifact
+        run: |
+          # Deterministic public CI-only seed. Production signing material never enters the probe runtime.
+          printf '47%.0s' {1..32} | cargo +1.99.0 run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
+            --component target/wasm32-wasip2/release/globalping_behavior.wasm \
+            --output-dir target/ci-behavior-artifact \
+            --sequence 1 \
+            --build-id ci-${GITHUB_SHA} \
+            --signing-key -
+          test -f target/ci-behavior-artifact/manifest.json
+          test -f target/ci-behavior-artifact/component.wasm
+          test "$(find target/ci-behavior-artifact -maxdepth 1 -type f | wc -l)" -eq 2
       - name: Verify signed behavior runtime and shadow executor
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm

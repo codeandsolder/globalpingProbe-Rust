@@ -5,7 +5,7 @@ A Rust rewrite of the [globalping-probe](https://github.com/jsdelivr/globalping-
 **Why Rust?**
 - Memory safety at compile time — no buffer overflows, use-after-free, or data races
 - ~70 % RAM reduction vs Node.js (target: 10–20 MB idle vs 50–70 MB)
-- Single static binary — no runtime, no `node_modules`, no self-update logic
+- Single static probe binary — no Node.js runtime or `node_modules`; optional signed WASM behavior updates stay behind the native trust boundary
 - Async via Tokio — maps directly onto the probe's concurrent measurement model
 
 ---
@@ -14,7 +14,7 @@ A Rust rewrite of the [globalping-probe](https://github.com/jsdelivr/globalping-
 
 | Tool | Version | Notes |
 |---|---|---|
-| Rust (stable) | ≥ 1.85 | edition 2024 |
+| Rust (stable) | 1.99.0 | edition 2024 |
 | Linux (WSL Ubuntu-24.04 or native) | — | Build and run target |
 | `libssl-dev`, `pkg-config` | — | Required by `rust_socketio` → `openssl-sys` |
 | `traceroute` | any | Must have `cap_net_raw` for ICMP mode (see below) |
@@ -139,6 +139,25 @@ The probe UUID is persisted to `/.globalping-probe-uuid` (falls back to `$HOME/.
 
 Behavior bootstrap is opt-in and fail-closed. With no `GP_BEHAVIOR_*` variables, startup remains native-only. If any behavior option is set, `GP_BEHAVIOR_VERIFYING_KEY` is mandatory; persisted behavior is re-verified and self-tested before use. The update URL is only a transport/discovery source—the locally provisioned Ed25519 key, manifest signature, SHA-256 digest, ABI/supervisor compatibility, and monotonic sequence decide whether an artifact can activate. Put `GP_BEHAVIOR_ROOT` on persistent storage if active/rollback slots must survive container or host replacement. In this branch the WASM path remains diagnostic: native measurement results and progress are still authoritative.
 
+### Packaging signed behavior updates
+
+The signing key stays outside the probe runtime. Build the WASIp2 behavior component, then use the separate offline packer to create the exact two files consumed by `GP_BEHAVIOR_UPDATE_URL`:
+
+```bash
+cargo +1.99.0 build --locked --release \
+  -p globalping-behavior --target wasm32-wasip2
+
+printf '%s\n' "$GP_BEHAVIOR_SIGNING_SEED_HEX" | \
+  cargo +1.99.0 run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
+    --component target/wasm32-wasip2/release/globalping_behavior.wasm \
+    --output-dir target/behavior-release-42 \
+    --sequence 42 \
+    --build-id git-$(git rev-parse --short=12 HEAD) \
+    --signing-key -
+```
+
+`--signing-key` accepts either `-` for stdin or a file containing exactly a 32-byte Ed25519 seed encoded as 64 hexadecimal characters. The sequence must be positive and strictly newer than the probe's persisted accepted high-water mark. The output directory must not already exist; on success it contains only `manifest.json` and `component.wasm`. The packer hashes and signs the component, then round-trips the pair through the production verifier before writing it. Publish the pair together under the configured HTTPS update directory; never place private signing material on the probe host.
+
 ---
 
 ## Test
@@ -151,7 +170,7 @@ cargo test --all -- --nocapture           # show stdout during tests
 cargo test <name>                         # run tests matching name
 ```
 
-614 tests pass as of the latest build, covering every module and command.
+The Rust 1.99 CI matrix covers unit, integration, signed-behavior runtime, deterministic differential, and strict Clippy/rustdoc gates.
 
 ### Test layout
 
