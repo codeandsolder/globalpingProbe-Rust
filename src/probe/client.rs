@@ -35,8 +35,8 @@ use crate::status::{
     status_manager::StatusManager,
 };
 use crate::supervisor::bootstrap::{BehaviorController, BehaviorHealthAction};
-use crate::supervisor::health::ShadowHealthEvent;
-use crate::supervisor::runtime::{BehaviorShadowResult, RuntimeError};
+use crate::supervisor::health::BehaviorHealthEvent;
+use crate::supervisor::runtime::{BehaviorExecutionResult, RuntimeError};
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -234,20 +234,20 @@ fn make_command(mtype: &str) -> Option<CommandKind> {
 async fn apply_behavior_health(
     controller: &BehaviorController,
     sequence: u64,
-    event: ShadowHealthEvent,
+    event: BehaviorHealthEvent,
 ) {
-    match controller.observe_shadow_health(sequence, event).await {
+    match controller.observe_health(sequence, event).await {
         Ok(BehaviorHealthAction::None) => {}
         Ok(BehaviorHealthAction::IgnoredStaleSequence) => {
             debug!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 behavior_sequence = sequence,
                 "Ignored health result from a behavior slot that is no longer active."
             );
         }
         Ok(BehaviorHealthAction::ThresholdReachedNoPrevious) => {
             warn!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 behavior_sequence = sequence,
                 "Behavior health threshold reached, but no previous verified slot exists for rollback."
             );
@@ -257,7 +257,7 @@ async fn apply_behavior_health(
             to_sequence,
         }) => {
             warn!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 from_sequence,
                 to_sequence,
                 "Behavior health threshold triggered automatic local rollback."
@@ -265,7 +265,7 @@ async fn apply_behavior_health(
         }
         Err(error) => {
             warn!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 behavior_sequence = sequence,
                 %error,
                 "Behavior health accounting could not complete rollback."
@@ -275,67 +275,67 @@ async fn apply_behavior_health(
 }
 
 #[cfg(test)]
-static FORCE_BEHAVIOR_SHADOW_DIVERGENCE: AtomicBool = AtomicBool::new(false);
+static FORCE_BEHAVIOR_DIVERGENCE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-static FORCED_BEHAVIOR_SHADOW_MATCHES: AtomicUsize = AtomicUsize::new(0);
+static FORCED_BEHAVIOR_MATCHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BEHAVIOR_PRESTART_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BEHAVIOR_COMPONENT_AUTHORITIES: AtomicUsize = AtomicUsize::new(0);
 
-const fn behavior_error_health_event(error: &RuntimeError) -> ShadowHealthEvent {
+const fn behavior_error_health_event(error: &RuntimeError) -> BehaviorHealthEvent {
     if error.is_component_health_fault() {
-        ShadowHealthEvent::RuntimeFault
+        BehaviorHealthEvent::RuntimeFault
     } else {
-        ShadowHealthEvent::Inconclusive
+        BehaviorHealthEvent::Inconclusive
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BehaviorResultAuthority {
     Component,
-    NativeFallback,
+    OracleFallback,
 }
 
-fn select_behavior_result(result: BehaviorShadowResult) -> (Value, BehaviorResultAuthority) {
-    let BehaviorShadowResult {
-        native,
-        native_error,
+fn select_behavior_result(result: BehaviorExecutionResult) -> (Value, BehaviorResultAuthority) {
+    let BehaviorExecutionResult {
+        oracle,
+        oracle_error,
         component,
         ..
     } = result;
-    if native_error.is_none()
+    if oracle_error.is_none()
         && let Ok(component) = component
     {
         return (component, BehaviorResultAuthority::Component);
     }
-    (native, BehaviorResultAuthority::NativeFallback)
+    (oracle, BehaviorResultAuthority::OracleFallback)
 }
 
 fn classify_behavior_health(
-    result: &Result<BehaviorShadowResult, RuntimeError>,
+    result: &Result<BehaviorExecutionResult, RuntimeError>,
     measurement_id: &str,
     measurement_type: &str,
     sequence: u64,
     build_id: &str,
-) -> ShadowHealthEvent {
+) -> BehaviorHealthEvent {
     match result {
-        Ok(result) if result.native_error.is_some() => {
+        Ok(result) if result.oracle_error.is_some() => {
             warn!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 measurement_id,
                 measurement_type,
                 behavior_sequence = sequence,
                 behavior_build_id = build_id,
-                native_error = result.native_error.as_deref().unwrap_or("unknown native failure"),
+                oracle_error = result.oracle_error.as_deref().unwrap_or("unknown native failure"),
                 "Native execution failed while behavior diagnostics were active."
             );
-            ShadowHealthEvent::Inconclusive
+            BehaviorHealthEvent::Inconclusive
         }
         Ok(result) => match &result.component {
-            Ok(component) if component == &result.native => {
+            Ok(component) if component == &result.oracle => {
                 debug!(
-                    target: "behavior-shadow",
+                    target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
                     behavior_sequence = sequence,
@@ -344,11 +344,11 @@ fn classify_behavior_health(
                     streamed_progress = result.progress_during_native_execution,
                     "Behavior result matched its native diagnostic oracle."
                 );
-                ShadowHealthEvent::Match
+                BehaviorHealthEvent::Match
             }
             Ok(_) => {
                 warn!(
-                    target: "behavior-shadow",
+                    target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
                     behavior_sequence = sequence,
@@ -357,19 +357,19 @@ fn classify_behavior_health(
                     streamed_progress = result.progress_during_native_execution,
                     "Behavior result diverged from its native diagnostic oracle."
                 );
-                ShadowHealthEvent::Divergence
+                BehaviorHealthEvent::Divergence
             }
             Err(error) => {
                 let event = behavior_error_health_event(error);
                 warn!(
-                    target: "behavior-shadow",
+                    target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
                     behavior_sequence = sequence,
                     behavior_build_id = build_id,
                     component_health_fault = error.is_component_health_fault(),
                     %error,
-                    "Behavior shadow failed after native execution started."
+                    "Behavior execution failed after native execution started."
                 );
                 event
             }
@@ -377,14 +377,14 @@ fn classify_behavior_health(
         Err(error) => {
             let event = behavior_error_health_event(error);
             warn!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 measurement_id,
                 measurement_type,
                 behavior_sequence = sequence,
                 behavior_build_id = build_id,
                 component_health_fault = error.is_component_health_fault(),
                 %error,
-                "Behavior shadow failed before native execution started."
+                "Behavior execution failed before native execution started."
             );
             event
         }
@@ -399,34 +399,34 @@ async fn run_behavior_measurement(
     behavior_progress_sink: Option<ProgressSink>,
 ) -> Option<Result<Value, RuntimeError>> {
     let controller = behavior_controller?;
-    let shadow = controller.executor().await?;
-    let sequence = shadow.sequence();
-    let build_id = shadow.build_id().to_string();
-    let shadow_result = shadow
+    let executor = controller.executor().await?;
+    let sequence = executor.sequence();
+    let build_id = executor.build_id().to_string();
+    let execution_result = executor
         .run_with_behavior_progress(measurement.clone(), behavior_progress_sink)
         .await;
 
     #[cfg(test)]
-    let shadow_result = {
-        let mut shadow_result = shadow_result;
-        if let Ok(result) = &mut shadow_result {
-            if FORCE_BEHAVIOR_SHADOW_DIVERGENCE.load(Ordering::SeqCst) {
-                if result.native_error.is_none()
+    let execution_result = {
+        let mut execution_result = execution_result;
+        if let Ok(result) = &mut execution_result {
+            if FORCE_BEHAVIOR_DIVERGENCE.load(Ordering::SeqCst) {
+                if result.oracle_error.is_none()
                     && result
                         .component
                         .as_ref()
-                        .is_ok_and(|component| component == &result.native)
+                        .is_ok_and(|component| component == &result.oracle)
                 {
-                    FORCED_BEHAVIOR_SHADOW_MATCHES.fetch_add(1, Ordering::SeqCst);
+                    FORCED_BEHAVIOR_MATCHES.fetch_add(1, Ordering::SeqCst);
                 }
                 result.component = Ok(json!({"__forcedHealthTestDivergence": true}));
             }
         }
-        shadow_result
+        execution_result
     };
 
     let health_event = classify_behavior_health(
-        &shadow_result,
+        &execution_result,
         measurement_id,
         measurement_type,
         sequence,
@@ -434,7 +434,7 @@ async fn run_behavior_measurement(
     );
     apply_behavior_health(controller, sequence, health_event).await;
 
-    Some(match shadow_result {
+    Some(match execution_result {
         Ok(result) => {
             let (value, authority) = select_behavior_result(result);
             #[cfg(test)]
@@ -442,7 +442,7 @@ async fn run_behavior_measurement(
                 BEHAVIOR_COMPONENT_AUTHORITIES.fetch_add(1, Ordering::SeqCst);
             }
             debug!(
-                target: "behavior-shadow",
+                target: "behavior-runtime",
                 measurement_id,
                 measurement_type,
                 behavior_sequence = sequence,
@@ -479,7 +479,7 @@ async fn run_measurement(
                 #[cfg(test)]
                 BEHAVIOR_PRESTART_FALLBACKS.fetch_add(1, Ordering::SeqCst);
                 warn!(
-                    target: "behavior-shadow",
+                    target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
                     %error,
@@ -1553,13 +1553,13 @@ mod tests {
     }
 
     fn behavior_result(
-        native: Value,
+        oracle: Value,
         component: Result<Value, RuntimeError>,
-        native_error: Option<String>,
-    ) -> BehaviorShadowResult {
-        BehaviorShadowResult {
-            native,
-            native_error,
+        oracle_error: Option<String>,
+    ) -> BehaviorExecutionResult {
+        BehaviorExecutionResult {
+            oracle,
+            oracle_error,
             component,
             progress: Vec::new(),
             progress_during_native_execution: false,
@@ -1592,11 +1592,11 @@ mod tests {
         let (selected, authority) =
             select_behavior_result(behavior_result(native.clone(), component, None));
         assert_eq!(selected, native);
-        assert_eq!(authority, BehaviorResultAuthority::NativeFallback);
+        assert_eq!(authority, BehaviorResultAuthority::OracleFallback);
     }
 
     #[test]
-    fn native_failure_remains_authoritative() {
+    fn oracle_failure_uses_oracle_fallback() {
         let native = json!({
             "status": "failed", "failureSource": "internal", "rawOutput": "native failed"
         });
@@ -1606,7 +1606,7 @@ mod tests {
             Some("native failed".to_string()),
         ));
         assert_eq!(selected, native);
-        assert_eq!(authority, BehaviorResultAuthority::NativeFallback);
+        assert_eq!(authority, BehaviorResultAuthority::OracleFallback);
     }
 
     #[cfg(target_os = "linux")]
@@ -1726,7 +1726,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
-    async fn live_shadow_health_rolls_back_persistently_after_all_six_measurements_diverge() {
+    async fn live_behavior_health_rolls_back_persistently_after_all_six_measurements_diverge() {
         let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -1758,11 +1758,11 @@ mod tests {
         struct ForcedDivergenceGuard;
         impl Drop for ForcedDivergenceGuard {
             fn drop(&mut self) {
-                FORCE_BEHAVIOR_SHADOW_DIVERGENCE.store(false, Ordering::SeqCst);
+                FORCE_BEHAVIOR_DIVERGENCE.store(false, Ordering::SeqCst);
             }
         }
-        FORCED_BEHAVIOR_SHADOW_MATCHES.store(0, Ordering::SeqCst);
-        FORCE_BEHAVIOR_SHADOW_DIVERGENCE.store(true, Ordering::SeqCst);
+        FORCED_BEHAVIOR_MATCHES.store(0, Ordering::SeqCst);
+        FORCE_BEHAVIOR_DIVERGENCE.store(true, Ordering::SeqCst);
         let _forced_divergence = ForcedDivergenceGuard;
 
         let cases = live_behavior_cases();
@@ -1798,7 +1798,7 @@ mod tests {
             }
         }
 
-        assert_eq!(FORCED_BEHAVIOR_SHADOW_MATCHES.load(Ordering::SeqCst), 6);
+        assert_eq!(FORCED_BEHAVIOR_MATCHES.load(Ordering::SeqCst), 6);
         assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
         assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
         assert!(!controller.has_previous().unwrap_or(true));

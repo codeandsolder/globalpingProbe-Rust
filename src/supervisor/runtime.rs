@@ -242,7 +242,7 @@ wasmtime::component::bindgen!({
 });
 
 mod production;
-pub use production::{BehaviorShadowExecutor, BehaviorShadowResult};
+pub use production::{BehaviorExecutionResult, BehaviorExecutor};
 
 #[cfg(test)]
 mod differential_tests {
@@ -1419,7 +1419,7 @@ no answer yet for icmp_seq=1\n\
         assert!(actual.progress.is_empty());
     }
 
-    async fn run_real_host_shadow(measurement: Value) -> BehaviorShadowResult {
+    async fn run_real_host_behavior(measurement: Value) -> BehaviorExecutionResult {
         let runtime = BehaviorRuntime::new()
             .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
         let path = component_path();
@@ -1428,15 +1428,15 @@ no answer yet for icmp_seq=1\n\
         let component = Component::from_binary(runtime.engine(), &bytes)
             .unwrap_or_else(|error| panic!("component compilation failed: {error}"));
         runtime
-            .shadow_component(&component, measurement, None)
+            .execute_component(&component, measurement, None)
             .await
-            .unwrap_or_else(|error| panic!("real host shadow failed: {error}"))
+            .unwrap_or_else(|error| panic!("real host behavior failed: {error}"))
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network tools/access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_shadow_real_host_adapter_matches_native_oracles() {
+    async fn live_behavior_real_host_adapter_matches_native_oracles() {
         let cases = [
             (
                 json!({
@@ -1527,18 +1527,21 @@ no answer yet for icmp_seq=1\n\
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
-            let shadow = run_real_host_shadow(measurement).await;
-            let component = shadow
+            let execution = run_real_host_behavior(measurement).await;
+            let component = execution
                 .component
                 .as_ref()
                 .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
-            assert_eq!(component, &shadow.native, "{kind} shadow mismatch");
+            assert_eq!(
+                component, &execution.oracle,
+                "{kind} behavior/oracle mismatch"
+            );
             assert!(
-                !shadow.progress.is_empty(),
+                !execution.progress.is_empty(),
                 "{kind} should emit progress through the real host adapter"
             );
             assert!(
-                shadow
+                execution
                     .progress
                     .iter()
                     .all(|(_, actual)| *actual == expected_mode),
@@ -1546,7 +1549,7 @@ no answer yet for icmp_seq=1\n\
             );
             if kind == "http" {
                 assert!(
-                    shadow.progress_during_native_execution,
+                    execution.progress_during_native_execution,
                     "HTTP progress was emitted only after curl/TLS oracle completion"
                 );
             }
@@ -1556,7 +1559,7 @@ no answer yet for icmp_seq=1\n\
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_shadow_resolution_failures_match_native_oracles() {
+    async fn live_behavior_resolution_failures_match_native_oracles() {
         let cases = [
             json!({
                 "type": "ping",
@@ -1602,13 +1605,13 @@ no answer yet for icmp_seq=1\n\
                 .as_str()
                 .unwrap_or("unknown")
                 .to_string();
-            let shadow = run_real_host_shadow(measurement).await;
-            let component = shadow
+            let execution = run_real_host_behavior(measurement).await;
+            let component = execution
                 .component
                 .as_ref()
                 .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
             assert_eq!(
-                component, &shadow.native,
+                component, &execution.oracle,
                 "{kind} resolution failure mismatch"
             );
             assert_eq!(component["status"], "failed");
@@ -1616,16 +1619,16 @@ no answer yet for icmp_seq=1\n\
             assert_eq!(component["rawOutput"], "Private IP ranges are not allowed.");
             assert!(component["resolvedAddress"].is_null());
             assert!(component["resolvedHostname"].is_null());
-            assert!(shadow.progress.is_empty());
-            assert!(!shadow.progress_during_native_execution);
+            assert!(execution.progress.is_empty());
+            assert!(!execution.progress_during_native_execution);
         }
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network tools/access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_shadow_progress_is_emitted_before_native_execution_finishes() {
-        let shadow = run_real_host_shadow(json!({
+    async fn live_behavior_progress_is_emitted_before_native_execution_finishes() {
+        let execution = run_real_host_behavior(json!({
             "type": "ping",
             "target": "one.one.one.one",
             "protocol": "TCP",
@@ -1636,14 +1639,14 @@ no answer yet for icmp_seq=1\n\
             "inProgressUpdates": true
         }))
         .await;
-        let component = shadow
+        let component = execution
             .component
             .as_ref()
             .unwrap_or_else(|error| panic!("component failed: {error}"));
-        assert_eq!(component, &shadow.native);
-        assert!(!shadow.progress.is_empty());
+        assert_eq!(component, &execution.oracle);
+        assert!(!execution.progress.is_empty());
         assert!(
-            shadow.progress_during_native_execution,
+            execution.progress_during_native_execution,
             "progress was emitted only after the native execution had already completed"
         );
     }
@@ -1651,7 +1654,7 @@ no answer yet for icmp_seq=1\n\
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_shadow_icmp_ping_matches_native_result() {
+    async fn live_behavior_icmp_ping_matches_native_result() {
         let measurement = json!({
             "type": "ping",
             "target": "1.1.1.1",
@@ -1689,7 +1692,7 @@ no answer yet for icmp_seq=1\n\
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_shadow_tcp_ping_matches_native_result() {
+    async fn live_behavior_tcp_ping_matches_native_result() {
         let measurement = json!({
             "type": "ping",
             "target": "1.1.1.1",
@@ -1728,7 +1731,7 @@ no answer yet for icmp_seq=1\n\
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_shadow_traceroute_matches_native_raw_pipeline() {
+    async fn live_behavior_traceroute_matches_native_raw_pipeline() {
         let measurement = json!({
             "type": "traceroute",
             "target": "1.1.1.1",

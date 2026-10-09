@@ -62,7 +62,7 @@ jobs:
           test -f target/ci-behavior-artifact/manifest.json
           test -f target/ci-behavior-artifact/component.wasm
           test "$(find target/ci-behavior-artifact -maxdepth 1 -type f | wc -l)" -eq 2
-      - name: Verify signed behavior runtime and shadow executor
+      - name: Verify signed behavior runtime and behavior executor
         env:
           GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
         run: cargo +1.99.0 test --locked --test behavior_component -- --include-ignored

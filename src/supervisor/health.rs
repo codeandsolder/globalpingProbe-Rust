@@ -1,4 +1,4 @@
-//! Health accounting for diagnostic behavior shadows.
+//! Health accounting for behavior execution health.
 //!
 //! Only failures that are attributable to the behavior component advance the
 //! rollback streak. Host/native failures are recorded as inconclusive so an
@@ -34,7 +34,7 @@ impl BehaviorHealthPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShadowHealthEvent {
+pub enum BehaviorHealthEvent {
     Match,
     Divergence,
     RuntimeFault,
@@ -103,28 +103,28 @@ impl BehaviorHealthState {
         self.rollback_recommended = false;
     }
 
-    pub fn observe(&mut self, sequence: u64, event: ShadowHealthEvent) -> HealthDecision {
+    pub fn observe(&mut self, sequence: u64, event: BehaviorHealthEvent) -> HealthDecision {
         if self.snapshot.active_sequence != Some(sequence) {
             return HealthDecision::IgnoredStaleSequence;
         }
 
         match event {
-            ShadowHealthEvent::Match => {
+            BehaviorHealthEvent::Match => {
                 self.snapshot.matches = self.snapshot.matches.saturating_add(1);
                 self.snapshot.consecutive_faults = 0;
                 self.rollback_recommended = false;
             }
-            ShadowHealthEvent::Divergence => {
+            BehaviorHealthEvent::Divergence => {
                 self.snapshot.divergences = self.snapshot.divergences.saturating_add(1);
                 self.snapshot.consecutive_faults =
                     self.snapshot.consecutive_faults.saturating_add(1);
             }
-            ShadowHealthEvent::RuntimeFault => {
+            BehaviorHealthEvent::RuntimeFault => {
                 self.snapshot.runtime_faults = self.snapshot.runtime_faults.saturating_add(1);
                 self.snapshot.consecutive_faults =
                     self.snapshot.consecutive_faults.saturating_add(1);
             }
-            ShadowHealthEvent::Inconclusive => {
+            BehaviorHealthEvent::Inconclusive => {
                 self.snapshot.inconclusive = self.snapshot.inconclusive.saturating_add(1);
             }
         }
@@ -155,17 +155,17 @@ mod tests {
     fn exact_matches_reset_the_fault_streak() {
         let mut health = BehaviorHealthState::new(policy(2), Some(7));
         assert_eq!(
-            health.observe(7, ShadowHealthEvent::Divergence),
+            health.observe(7, BehaviorHealthEvent::Divergence),
             HealthDecision::None
         );
         assert_eq!(health.snapshot().consecutive_faults, 1);
         assert_eq!(
-            health.observe(7, ShadowHealthEvent::Match),
+            health.observe(7, BehaviorHealthEvent::Match),
             HealthDecision::None
         );
         assert_eq!(health.snapshot().consecutive_faults, 0);
         assert_eq!(
-            health.observe(7, ShadowHealthEvent::RuntimeFault),
+            health.observe(7, BehaviorHealthEvent::RuntimeFault),
             HealthDecision::None
         );
         assert_eq!(health.snapshot().consecutive_faults, 1);
@@ -175,11 +175,11 @@ mod tests {
     fn inconclusive_errors_never_advance_the_fault_streak() {
         let mut health = BehaviorHealthState::new(policy(2), Some(8));
         assert_eq!(
-            health.observe(8, ShadowHealthEvent::Divergence),
+            health.observe(8, BehaviorHealthEvent::Divergence),
             HealthDecision::None
         );
         assert_eq!(
-            health.observe(8, ShadowHealthEvent::Inconclusive),
+            health.observe(8, BehaviorHealthEvent::Inconclusive),
             HealthDecision::None
         );
         assert_eq!(health.snapshot().consecutive_faults, 1);
@@ -190,20 +190,20 @@ mod tests {
     fn threshold_recommends_rollback_only_once_until_reset() {
         let mut health = BehaviorHealthState::new(policy(2), Some(9));
         assert_eq!(
-            health.observe(9, ShadowHealthEvent::Divergence),
+            health.observe(9, BehaviorHealthEvent::Divergence),
             HealthDecision::None
         );
         assert_eq!(
-            health.observe(9, ShadowHealthEvent::RuntimeFault),
+            health.observe(9, BehaviorHealthEvent::RuntimeFault),
             HealthDecision::RollbackRecommended
         );
         assert_eq!(
-            health.observe(9, ShadowHealthEvent::Divergence),
+            health.observe(9, BehaviorHealthEvent::Divergence),
             HealthDecision::None
         );
         health.clear_rollback_recommendation();
         assert_eq!(
-            health.observe(9, ShadowHealthEvent::Divergence),
+            health.observe(9, BehaviorHealthEvent::Divergence),
             HealthDecision::RollbackRecommended
         );
     }
@@ -212,7 +212,7 @@ mod tests {
     fn stale_sequence_results_are_ignored() {
         let mut health = BehaviorHealthState::new(policy(1), Some(10));
         assert_eq!(
-            health.observe(9, ShadowHealthEvent::Divergence),
+            health.observe(9, BehaviorHealthEvent::Divergence),
             HealthDecision::IgnoredStaleSequence
         );
         assert_eq!(health.snapshot().consecutive_faults, 0);

@@ -15,10 +15,10 @@ use semver::Version;
 use tokio::sync::{Mutex, RwLock};
 
 use super::health::{
-    BehaviorHealthPolicy, BehaviorHealthSnapshot, BehaviorHealthState, HealthDecision,
-    ShadowHealthEvent,
+    BehaviorHealthEvent, BehaviorHealthPolicy, BehaviorHealthSnapshot, BehaviorHealthState,
+    HealthDecision,
 };
-use super::runtime::{BehaviorShadowExecutor, RuntimeError};
+use super::runtime::{BehaviorExecutor, RuntimeError};
 use super::storage::{PersistentBehaviorSlots, StorageError};
 use super::update::{BehaviorManifest, UpdateError, verify_candidate, verify_manifest};
 
@@ -127,8 +127,8 @@ pub enum BehaviorHealthAction {
 }
 
 struct ExecutorSlots {
-    active: Option<Arc<BehaviorShadowExecutor>>,
-    previous: Option<Arc<BehaviorShadowExecutor>>,
+    active: Option<Arc<BehaviorExecutor>>,
+    previous: Option<Arc<BehaviorExecutor>>,
 }
 
 pub struct BehaviorController {
@@ -179,16 +179,12 @@ impl BehaviorController {
             .and_then(PersistentBehaviorSlots::previous)
             .cloned();
         let active_executor = if let Some(active) = active {
-            Some(Arc::new(
-                BehaviorShadowExecutor::from_verified(active).await?,
-            ))
+            Some(Arc::new(BehaviorExecutor::from_verified(active).await?))
         } else {
             None
         };
         let previous_executor = if let Some(previous) = previous {
-            Some(Arc::new(
-                BehaviorShadowExecutor::from_verified(previous).await?,
-            ))
+            Some(Arc::new(BehaviorExecutor::from_verified(previous).await?))
         } else {
             None
         };
@@ -211,7 +207,7 @@ impl BehaviorController {
 
     /// Return the behavior executor currently admitted for new measurements.
     #[must_use]
-    pub async fn executor(&self) -> Option<Arc<BehaviorShadowExecutor>> {
+    pub async fn executor(&self) -> Option<Arc<BehaviorExecutor>> {
         self.executors.read().await.active.clone()
     }
 
@@ -220,15 +216,15 @@ impl BehaviorController {
         self.health.lock().await.snapshot()
     }
 
-    /// Record one diagnostic shadow outcome and roll back when the configured
+    /// Record one behavior execution health outcome and roll back when the configured
     /// consecutive hard-fault threshold is reached for the still-active slot.
     ///
     /// # Errors
     /// Returns an error only when a recommended rollback cannot be persisted.
-    pub async fn observe_shadow_health(
+    pub async fn observe_health(
         &self,
         sequence: u64,
-        event: ShadowHealthEvent,
+        event: BehaviorHealthEvent,
     ) -> Result<BehaviorHealthAction, BootstrapError> {
         let decision = {
             let mut health = self.health.lock().await;
@@ -324,7 +320,7 @@ impl BehaviorController {
         &self,
         manifest: BehaviorManifest,
         component: Vec<u8>,
-    ) -> Result<Arc<BehaviorShadowExecutor>, BootstrapError> {
+    ) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
         let _update = self.update_lock.lock().await;
         let accepted_sequence = self.accepted_sequence()?;
         let verified = verify_candidate(
@@ -334,8 +330,7 @@ impl BehaviorController {
             accepted_sequence,
             &self.supervisor_version,
         )?;
-        let next_executor =
-            Arc::new(BehaviorShadowExecutor::from_verified(verified.clone()).await?);
+        let next_executor = Arc::new(BehaviorExecutor::from_verified(verified.clone()).await?);
         let root = self.root.clone();
         let slots = Arc::clone(&self.slots);
         tokio::task::spawn_blocking(move || -> Result<(), BootstrapError> {
@@ -373,7 +368,7 @@ impl BehaviorController {
     /// # Errors
     /// Returns an error when no previous slot exists, persistence fails, or the
     /// storage lock is poisoned.
-    pub async fn rollback(&self) -> Result<Arc<BehaviorShadowExecutor>, BootstrapError> {
+    pub async fn rollback(&self) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
         let _update = self.update_lock.lock().await;
         let next_executor = self.rollback_locked().await?;
         self.health
@@ -383,7 +378,7 @@ impl BehaviorController {
         Ok(next_executor)
     }
 
-    async fn rollback_locked(&self) -> Result<Arc<BehaviorShadowExecutor>, BootstrapError> {
+    async fn rollback_locked(&self) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
         if !self.has_previous()? {
             return Err(UpdateError::NoPreviousVersion.into());
         }

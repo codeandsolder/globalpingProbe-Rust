@@ -5,8 +5,8 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use globalping_probe::supervisor::bootstrap::{
     BehaviorBootstrapConfig, BehaviorController, BehaviorHealthAction, BootstrapError,
 };
-use globalping_probe::supervisor::health::{BehaviorHealthPolicy, ShadowHealthEvent};
-use globalping_probe::supervisor::runtime::{BehaviorRuntime, BehaviorShadowExecutor};
+use globalping_probe::supervisor::health::{BehaviorHealthEvent, BehaviorHealthPolicy};
+use globalping_probe::supervisor::runtime::{BehaviorExecutor, BehaviorRuntime};
 use globalping_probe::supervisor::storage::{PersistentBehaviorSlots, StorageError};
 use globalping_probe::supervisor::update::{
     BehaviorManifest, SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR, UpdateError, verify_candidate,
@@ -87,12 +87,12 @@ async fn signed_component_instantiates_without_ambient_wasi() {
 
 #[tokio::test]
 #[ignore = "requires a prebuilt wasm32-wasip2 globalping-behavior component"]
-async fn verified_component_builds_shadow_executor() {
-    let executor = BehaviorShadowExecutor::from_verified(verified_component(7, "dispatch-shadow"))
+async fn verified_component_builds_behavior_executor() {
+    let executor = BehaviorExecutor::from_verified(verified_component(7, "dispatch-behavior"))
         .await
-        .unwrap_or_else(|error| panic!("shadow executor construction failed: {error}"));
+        .unwrap_or_else(|error| panic!("behavior executor construction failed: {error}"));
     assert_eq!(executor.sequence(), 7);
-    assert_eq!(executor.build_id(), "dispatch-shadow");
+    assert_eq!(executor.build_id(), "dispatch-behavior");
 }
 
 #[tokio::test]
@@ -215,7 +215,7 @@ async fn behavior_controller_auto_rolls_back_after_hard_fault_threshold() {
 
     assert_eq!(
         controller
-            .observe_shadow_health(2, ShadowHealthEvent::Divergence)
+            .observe_health(2, BehaviorHealthEvent::Divergence)
             .await
             .unwrap_or_else(|error| panic!("health accounting failed: {error}")),
         BehaviorHealthAction::None
@@ -224,7 +224,7 @@ async fn behavior_controller_auto_rolls_back_after_hard_fault_threshold() {
 
     assert_eq!(
         controller
-            .observe_shadow_health(2, ShadowHealthEvent::RuntimeFault)
+            .observe_health(2, BehaviorHealthEvent::RuntimeFault)
             .await
             .unwrap_or_else(|error| panic!("health rollback failed: {error}")),
         BehaviorHealthAction::RolledBack {

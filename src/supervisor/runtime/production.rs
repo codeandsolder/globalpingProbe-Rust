@@ -6,9 +6,9 @@ use super::{
 };
 
 #[derive(Debug)]
-pub struct BehaviorShadowResult {
-    pub native: serde_json::Value,
-    pub native_error: Option<String>,
+pub struct BehaviorExecutionResult {
+    pub oracle: serde_json::Value,
+    pub oracle_error: Option<String>,
     pub component: Result<serde_json::Value, RuntimeError>,
     pub progress: Vec<(serde_json::Value, BufferMode)>,
     pub progress_during_native_execution: bool,
@@ -180,7 +180,7 @@ fn new_oracle_slot() -> SharedOracleSlot {
 fn read_oracle(slot: &SharedOracleSlot) -> Result<Option<OracleResult>, String> {
     slot.result
         .lock()
-        .map_err(|_| "native shadow oracle lock was poisoned".to_string())
+        .map_err(|_| "native oracle lock was poisoned".to_string())
         .map(|guard| guard.clone())
 }
 
@@ -897,12 +897,12 @@ impl wit_host::Host for ProductionHost {
 }
 
 impl BehaviorRuntime {
-    pub(crate) async fn shadow_component(
+    pub(crate) async fn execute_component(
         &self,
         component: &Component,
         measurement: serde_json::Value,
         behavior_progress_sink: Option<crate::command::ProgressSink>,
-    ) -> Result<BehaviorShadowResult, RuntimeError> {
+    ) -> Result<BehaviorExecutionResult, RuntimeError> {
         let scope = crate::supervisor::capability::MeasurementScope::from_server_measurement(
             measurement.clone(),
         )
@@ -981,7 +981,7 @@ impl BehaviorRuntime {
             };
         };
 
-        let (native, native_error) = match wait_oracle(&oracle).await {
+        let (oracle, oracle_error) = match wait_oracle(&oracle).await {
             Ok(native) => (native, None),
             Err(error) => (
                 serde_json::json!({
@@ -992,44 +992,24 @@ impl BehaviorRuntime {
                 Some(error),
             ),
         };
-        Ok(BehaviorShadowResult {
-            native,
-            native_error,
+        Ok(BehaviorExecutionResult {
+            oracle,
+            oracle_error,
             component: component_result,
             progress,
             progress_during_native_execution,
         })
     }
-
-    /// Execute one immutable measurement through the real bounded host adapter
-    /// while retaining native shaping from the exact same raw execution as a
-    /// diagnostic/fault oracle. Component final/progress authority is chosen by
-    /// the caller-facing executor path.
-    ///
-    /// # Errors
-    /// Returns an error only when setup or guest execution fails before native
-    /// execution starts. Once native execution starts, its authoritative result
-    /// is retained and any later guest failure is carried in the returned
-    /// `BehaviorShadowResult`.
-    pub(crate) async fn shadow_measurement(
-        &self,
-        compiled: &CompiledBehavior,
-        measurement: serde_json::Value,
-        behavior_progress_sink: Option<crate::command::ProgressSink>,
-    ) -> Result<BehaviorShadowResult, RuntimeError> {
-        self.shadow_component(&compiled.component, measurement, behavior_progress_sink)
-            .await
-    }
 }
 
 #[derive(Clone)]
-pub struct BehaviorShadowExecutor {
+pub struct BehaviorExecutor {
     runtime: BehaviorRuntime,
     compiled: CompiledBehavior,
 }
 
-impl BehaviorShadowExecutor {
-    /// Build a diagnostic shadow executor from an artifact that has already
+impl BehaviorExecutor {
+    /// Build a behavior executor from an artifact that has already
     /// passed signature, digest, ABI, supervisor-version, and rollback checks.
     ///
     /// # Errors
@@ -1060,12 +1040,12 @@ impl BehaviorShadowExecutor {
     ///
     /// # Errors
     /// Returns a failure only when the behavior fails before native execution
-    /// starts. Once native execution starts, its result is preserved even if
-    /// the guest later traps, rejects the job, or violates policy.
+    /// starts. Once execution starts, the same-run native oracle remains available
+    /// for fault fallback even if the guest later traps, rejects the job, or violates policy.
     pub async fn run(
         &self,
         measurement: serde_json::Value,
-    ) -> Result<BehaviorShadowResult, RuntimeError> {
+    ) -> Result<BehaviorExecutionResult, RuntimeError> {
         self.run_with_behavior_progress(measurement, None).await
     }
 
@@ -1076,14 +1056,18 @@ impl BehaviorShadowExecutor {
     ///
     /// # Errors
     /// Returns a failure only when the behavior fails before native execution
-    /// starts; post-start guest failures are carried in `BehaviorShadowResult`.
+    /// starts; post-start guest failures are carried in `BehaviorExecutionResult`.
     pub(crate) async fn run_with_behavior_progress(
         &self,
         measurement: serde_json::Value,
         behavior_progress_sink: Option<crate::command::ProgressSink>,
-    ) -> Result<BehaviorShadowResult, RuntimeError> {
+    ) -> Result<BehaviorExecutionResult, RuntimeError> {
         self.runtime
-            .shadow_measurement(&self.compiled, measurement, behavior_progress_sink)
+            .execute_component(
+                &self.compiled.component,
+                measurement,
+                behavior_progress_sink,
+            )
             .await
     }
 }
