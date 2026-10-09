@@ -306,7 +306,6 @@ fn select_behavior_result(result: BehaviorShadowResult) -> (Value, BehaviorResul
     } = result;
     if native_error.is_none()
         && let Ok(component) = component
-        && component == native
     {
         return (component, BehaviorResultAuthority::Component);
     }
@@ -343,7 +342,7 @@ fn classify_behavior_health(
                     behavior_build_id = build_id,
                     progress_events = result.progress.len(),
                     streamed_progress = result.progress_during_native_execution,
-                    "Behavior shadow matched its native oracle."
+                    "Behavior result matched its native diagnostic oracle."
                 );
                 ShadowHealthEvent::Match
             }
@@ -356,7 +355,7 @@ fn classify_behavior_health(
                     behavior_build_id = build_id,
                     progress_events = result.progress.len(),
                     streamed_progress = result.progress_during_native_execution,
-                    "Behavior shadow diverged from its native oracle."
+                    "Behavior result diverged from its native diagnostic oracle."
                 );
                 ShadowHealthEvent::Divergence
             }
@@ -1195,9 +1194,10 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 /// Connect to the Globalping API with an optional trusted behavior controller.
 ///
 /// The controller supplies only verified/self-tested behavior executors. When
-/// enabled, WASM and the native oracle share one supervisor-owned execution.
-/// Exact WASM results are admitted as final output; divergence/faults use the
-/// already-computed native oracle, and native progress remains authoritative.
+/// enabled, WASM and the native diagnostic oracle share one supervisor-owned
+/// execution. A successful component result is authoritative; component/native
+/// execution faults use the already-computed native result without rerunning
+/// the measurement. Native progress remains authoritative in this phase.
 ///
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
@@ -1572,13 +1572,13 @@ mod tests {
     }
 
     #[test]
-    fn divergent_behavior_result_uses_native_fallback() {
+    fn divergent_behavior_result_remains_component_authoritative() {
         let native = json!({"status": "finished", "rawOutput": "native"});
         let component = json!({"status": "finished", "rawOutput": "component"});
         let (selected, authority) =
-            select_behavior_result(behavior_result(native.clone(), Ok(component), None));
-        assert_eq!(selected, native);
-        assert_eq!(authority, BehaviorResultAuthority::NativeFallback);
+            select_behavior_result(behavior_result(native, Ok(component.clone()), None));
+        assert_eq!(selected, component);
+        assert_eq!(authority, BehaviorResultAuthority::Component);
     }
 
     #[test]
@@ -1877,6 +1877,81 @@ mod tests {
         assert_eq!(health.runtime_faults, 1);
         assert_eq!(health.divergences, 0);
         assert_eq!(health.inconclusive, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus normal and divergent WASIp2 behavior fixtures"]
+    async fn live_signed_divergence_is_authoritative_then_rolls_back() {
+        let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let divergent_path = std::env::var_os("GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT must point to the divergence fixture"
+                )
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let threshold =
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
+                .with_health_policy(BehaviorHealthPolicy::new(threshold));
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+
+        let (normal_manifest, normal_component) =
+            signed_health_test_component(&normal_path, 1, "divergence-rollback-normal");
+        controller
+            .activate_candidate(normal_manifest, normal_component)
+            .await
+            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
+        let (divergent_manifest, divergent_component) =
+            signed_health_test_component(&divergent_path, 2, "divergence-authoritative");
+        controller
+            .activate_candidate(divergent_manifest, divergent_component)
+            .await
+            .unwrap_or_else(|error| panic!("divergent behavior activation failed: {error}"));
+
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        let result = run_measurement(
+            &CommandKind::Ping,
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": false
+            }),
+            Some(&controller),
+            "signed-divergence",
+            "ping",
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+
+        assert_eq!(result, json!({"__intentionalDivergence": true}));
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        let executor = controller
+            .executor()
+            .await
+            .unwrap_or_else(|| panic!("rolled-back executor must exist"));
+        assert_eq!(executor.build_id(), "divergence-rollback-normal");
+
+        let persisted = PersistentBehaviorSlots::load(
+            root.path(),
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        assert_eq!(persisted.active().manifest.sequence, 1);
+        assert_eq!(persisted.accepted_sequence(), 2);
     }
 
     // ── Error message parsing via reconnect ───────────────────────────────────
