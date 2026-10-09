@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 
@@ -170,26 +171,25 @@ impl EnrichmentCache {
         entries.entry(address).or_default().hostname = Some(hostname);
     }
 
-    fn has_hostname(&self, address: IpAddr) -> bool {
+    fn hostname(&self, address: IpAddr) -> Option<String> {
         self.entries
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&address)
-            .and_then(|entry| entry.hostname.as_ref())
-            .is_some()
+            .and_then(|entry| entry.hostname.clone())
     }
 
-    fn update(&self, address: IpAddr, hostname: Option<String>, asn: Vec<u32>) {
+    fn update(&self, address: IpAddr, entry: &MtrEnrichmentEntry) {
         let mut entries = self
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = entries.entry(address).or_default();
-        if hostname.is_some() {
-            entry.hostname = hostname;
+        let current = entries.entry(address).or_default();
+        if entry.hostname.is_some() {
+            current.hostname.clone_from(&entry.hostname);
         }
-        if !asn.is_empty() {
-            entry.asn = asn;
+        if !entry.asn.is_empty() {
+            current.asn.clone_from(&entry.asn);
         }
         drop(entries);
     }
@@ -204,23 +204,86 @@ impl EnrichmentCache {
     }
 }
 
-struct MtrEnrichment {
+#[derive(Clone)]
+pub(crate) struct MtrEnrichmentBroker {
     cache: EnrichmentCache,
-    seen: HashSet<IpAddr>,
-    tasks: JoinSet<()>,
+    lookups: Arc<RwLock<HashMap<IpAddr, Arc<OnceCell<MtrEnrichmentEntry>>>>>,
 }
 
-impl MtrEnrichment {
-    fn new(target: &ResolvedTarget) -> Self {
+impl MtrEnrichmentBroker {
+    pub(crate) fn new(target: &ResolvedTarget) -> Self {
         let cache = EnrichmentCache::default();
         if target.hostname != target.address.to_string() {
             cache.seed_hostname(target.address, target.hostname.clone());
         }
         Self {
             cache,
+            lookups: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn lookup_cell(&self, address: IpAddr) -> Arc<OnceCell<MtrEnrichmentEntry>> {
+        if let Some(cell) = self
+            .lookups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+        {
+            return Arc::clone(cell);
+        }
+        let mut lookups = self
+            .lookups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            lookups
+                .entry(address)
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        )
+    }
+
+    pub(crate) async fn lookup(&self, address: IpAddr, budget: Duration) -> MtrEnrichmentEntry {
+        if is_ip_private(address) {
+            return MtrEnrichmentEntry::default();
+        }
+        let cell = self.lookup_cell(address);
+        let cache = self.cache.clone();
+        cell.get_or_init(|| async move {
+            let hostname = match cache.hostname(address) {
+                Some(hostname) => Some(hostname),
+                None => reverse_lookup(address, budget.min(Duration::from_secs(3))).await,
+            };
+            let asn = lookup_asn(address, budget).await;
+            let entry = MtrEnrichmentEntry { hostname, asn };
+            cache.update(address, &entry);
+            entry
+        })
+        .await
+        .clone()
+    }
+
+    pub(crate) fn snapshot(&self) -> MtrEnrichmentMap {
+        self.cache.snapshot()
+    }
+}
+
+pub(crate) struct MtrEnrichment {
+    broker: MtrEnrichmentBroker,
+    seen: HashSet<IpAddr>,
+    tasks: JoinSet<()>,
+}
+
+impl MtrEnrichment {
+    pub(crate) fn new(target: &ResolvedTarget) -> Self {
+        Self {
+            broker: MtrEnrichmentBroker::new(target),
             seen: HashSet::new(),
             tasks: JoinSet::new(),
         }
+    }
+
+    pub(crate) fn broker(&self) -> MtrEnrichmentBroker {
+        self.broker.clone()
     }
 
     fn add(
@@ -234,25 +297,16 @@ impl MtrEnrichment {
             return;
         }
 
-        let cache = self.cache.clone();
-        let ptr_seeded = cache.has_hostname(address);
+        let broker = self.broker.clone();
         self.tasks.spawn(async move {
-            let ptr = async {
-                if ptr_seeded {
-                    None
-                } else {
-                    reverse_lookup(address, budget.min(Duration::from_secs(3))).await
-                }
-            };
-            let (hostname, asn) = tokio::join!(ptr, lookup_asn(address, budget));
-            cache.update(address, hostname, asn);
+            broker.lookup(address, budget).await;
             if let Some(tx) = progress {
-                queue_mtr_progress(&tx, raw, cache);
+                queue_mtr_progress(&tx, raw, broker.cache.clone());
             }
         });
     }
 
-    async fn wait(&mut self) {
+    pub(crate) async fn wait(&mut self) {
         while self.tasks.join_next().await.is_some() {}
     }
 }
@@ -301,9 +355,20 @@ fn hop_address_from_raw_line(line: &str) -> Option<IpAddr> {
 pub(crate) async fn run_native_mtr_stream(
     args: &[String],
     process_timeout: Duration,
+    progress: Option<&ProgressTx>,
+    enrichment: &mut MtrEnrichment,
+    deadline: &MeasurementDeadline,
     raw_events: &RawExecutionTx,
 ) -> Result<NativeMtrOutput> {
-    run_native_mtr_inner(args, process_timeout, None, None, None, Some(raw_events)).await
+    run_native_mtr_inner(
+        args,
+        process_timeout,
+        progress,
+        Some(enrichment),
+        Some(deadline),
+        Some(raw_events),
+    )
+    .await
 }
 
 async fn run_native_mtr(
@@ -358,10 +423,8 @@ async fn run_native_mtr_inner(
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(tx) = &raw_stderr
-                        && tx.stderr_chunk(&chunk[..read]).await.is_err()
-                    {
-                        break;
+                    if let Some(tx) = &raw_stderr {
+                        tx.stderr_chunk(&chunk[..read]).await;
                     }
                 }
             }
@@ -380,13 +443,9 @@ async fn run_native_mtr_inner(
             }
             let observed = hop_address_from_raw_line(&line);
             if let Some(tx) = raw_events {
-                tx.stdout_line(&line)
-                    .await
-                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                tx.stdout_line(&line).await;
                 if let Some(address) = observed {
-                    tx.observe(address)
-                        .await
-                        .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                    tx.observe(address).await;
                 }
             }
             if let (Some(address), Some(enrichment), Some(deadline)) =
@@ -400,7 +459,7 @@ async fn run_native_mtr_inner(
                 );
             }
             if let (Some(tx), Some(enrichment)) = (progress, enrichment.as_deref()) {
-                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.cache.clone());
+                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.broker.cache.clone());
             }
         }
         child.wait().await
@@ -460,7 +519,7 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
         &native.stderr,
         native.timed_out,
         &target,
-        &enrichment.cache.snapshot(),
+        &enrichment.broker.snapshot(),
     ))
 }
 
@@ -798,7 +857,13 @@ x 3 1";
     fn progress_render_applies_completed_enrichment() {
         let cache = EnrichmentCache::default();
         let address = "1.1.1.1".parse().expect("valid address");
-        cache.update(address, Some("one.one.one.one".into()), vec![13335]);
+        cache.update(
+            address,
+            &MtrEnrichmentEntry {
+                hostname: Some("one.one.one.one".into()),
+                asn: vec![13335],
+            },
+        );
         let raw = "h 0 192.168.1.1\nx 0 0\np 0 1000 0\nh 1 1.1.1.1\nx 1 0\np 1 2000 0\n";
         let rendered = render_mtr_progress(raw, &cache);
         let output = rendered["rawOutput"].as_str().expect("raw output");

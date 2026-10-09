@@ -241,9 +241,10 @@ pub(crate) async fn run_dig(
 
 pub(crate) async fn run_dig_stream(
     opts: &DnsOptions,
+    progress: Option<&ProgressTx>,
     raw_events: &RawExecutionTx,
 ) -> Result<NativeDnsOutput> {
-    run_dig_inner(opts, None, Some(raw_events)).await
+    run_dig_inner(opts, progress, Some(raw_events)).await
 }
 
 async fn run_dig_inner(
@@ -274,10 +275,8 @@ async fn run_dig_inner(
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(tx) = &raw_stderr
-                        && tx.stderr_chunk(&chunk[..read]).await.is_err()
-                    {
-                        break;
+                    if let Some(tx) = &raw_stderr {
+                        tx.stderr_chunk(&chunk[..read]).await;
                     }
                 }
             }
@@ -292,9 +291,7 @@ async fn run_dig_inner(
             raw.push_str(&line);
             raw.push('\n');
             if let Some(tx) = raw_events {
-                tx.stdout_line(&line)
-                    .await
-                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                tx.stdout_line(&line).await;
             }
             match dns_progress_output(&raw, opts) {
                 DnsProgress::Private => {

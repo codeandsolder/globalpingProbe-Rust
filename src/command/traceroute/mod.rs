@@ -2,6 +2,7 @@ pub mod parse;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -9,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
 use super::{ProgressTx, RawExecutionTx};
@@ -165,33 +167,86 @@ pub(crate) fn normalize_numeric_output(
     output.join("\n")
 }
 
+type TracerouteLookupCell = Arc<OnceCell<Option<String>>>;
+type TracerouteLookupMap = Arc<RwLock<HashMap<IpAddr, TracerouteLookupCell>>>;
+
+#[derive(Clone, Default)]
+pub(crate) struct TracerouteEnrichmentBroker {
+    lookups: TracerouteLookupMap,
+}
+
+impl TracerouteEnrichmentBroker {
+    fn lookup_cell(&self, address: IpAddr) -> TracerouteLookupCell {
+        if let Some(cell) = self
+            .lookups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+        {
+            return Arc::clone(cell);
+        }
+        let mut lookups = self
+            .lookups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            lookups
+                .entry(address)
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        )
+    }
+
+    pub(crate) async fn lookup(&self, address: IpAddr, budget: Duration) -> Option<String> {
+        if is_ip_private(address) {
+            return None;
+        }
+        let cell = self.lookup_cell(address);
+        cell.get_or_init(|| reverse_lookup(address, budget.min(Duration::from_secs(2))))
+            .await
+            .clone()
+    }
+
+    pub(crate) async fn enrich_raw(
+        &self,
+        raw: &str,
+        target: &ResolvedTarget,
+        budget: Duration,
+    ) -> HashMap<IpAddr, String> {
+        let mut addresses = Vec::new();
+        for (index, line) in raw.lines().skip(1).enumerate() {
+            if index == 0 {
+                continue;
+            }
+            for address in line_ip_tokens(line) {
+                if address != target.address
+                    && !is_ip_private(address)
+                    && !addresses.contains(&address)
+                {
+                    addresses.push(address);
+                }
+            }
+        }
+        let per_lookup = budget.min(Duration::from_secs(2));
+        futures::future::join_all(addresses.into_iter().map(|address| async move {
+            self.lookup(address, per_lookup)
+                .await
+                .map(|hostname| (address, hostname))
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
 pub(crate) async fn enrich_hostnames(
     raw: &str,
     target: &ResolvedTarget,
     budget: Duration,
 ) -> HashMap<IpAddr, String> {
-    let mut addresses = Vec::new();
-    for (index, line) in raw.lines().skip(1).enumerate() {
-        if index == 0 {
-            continue;
-        }
-        for address in line_ip_tokens(line) {
-            if address != target.address && !is_ip_private(address) && !addresses.contains(&address)
-            {
-                addresses.push(address);
-            }
-        }
-    }
-    let per_lookup = budget.min(Duration::from_secs(2));
-    futures::future::join_all(addresses.into_iter().map(|address| async move {
-        reverse_lookup(address, per_lookup)
-            .await
-            .map(|hostname| (address, hostname))
-    }))
-    .await
-    .into_iter()
-    .flatten()
-    .collect()
+    TracerouteEnrichmentBroker::default()
+        .enrich_raw(raw, target, budget)
+        .await
 }
 
 fn timeout_failure_source(
@@ -242,9 +297,10 @@ pub(crate) async fn run_native_traceroute_stream(
     args: &[String],
     process_timeout: Duration,
     target: &ResolvedTarget,
+    progress: Option<&ProgressTx>,
     raw_events: &RawExecutionTx,
 ) -> Result<NativeTraceOutput> {
-    run_native_traceroute_inner(args, process_timeout, target, None, Some(raw_events)).await
+    run_native_traceroute_inner(args, process_timeout, target, progress, Some(raw_events)).await
 }
 
 async fn run_native_traceroute_inner(
@@ -277,10 +333,8 @@ async fn run_native_traceroute_inner(
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
                     bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(tx) = &raw_stderr
-                        && tx.stderr_chunk(&chunk[..read]).await.is_err()
-                    {
-                        break;
+                    if let Some(tx) = &raw_stderr {
+                        tx.stderr_chunk(&chunk[..read]).await;
                     }
                 }
             }
@@ -293,13 +347,9 @@ async fn run_native_traceroute_inner(
         while let Some(line) = lines.next_line().await? {
             raw_lines.push(line.clone());
             if let Some(tx) = raw_events {
-                tx.stdout_line(&line)
-                    .await
-                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                tx.stdout_line(&line).await;
                 for address in line_ip_tokens(&line) {
-                    tx.observe(address)
-                        .await
-                        .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                    tx.observe(address).await;
                 }
             }
             if let Some(tx) = progress {

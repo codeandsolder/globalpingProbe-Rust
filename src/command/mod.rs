@@ -37,32 +37,25 @@ impl RawExecutionTx {
         (Self(tx), rx)
     }
 
-    pub(crate) async fn send(
-        &self,
-        event: RawExecutionEvent,
-    ) -> Result<(), SendError<RawExecutionEvent>> {
-        self.0.send(event).await
+    /// Best-effort raw-event delivery. Dropping the WASM consumer must never
+    /// abort the authoritative native measurement.
+    pub(crate) async fn send(&self, event: RawExecutionEvent) {
+        let _ = self.0.send(event).await;
     }
 
-    pub(crate) async fn stdout_line(&self, line: &str) -> Result<(), SendError<RawExecutionEvent>> {
+    pub(crate) async fn stdout_line(&self, line: &str) {
         let mut bytes = Vec::with_capacity(line.len() + 1);
         bytes.extend_from_slice(line.as_bytes());
-        bytes.push(b'\n');
-        self.send(RawExecutionEvent::Stdout(bytes)).await
+        bytes.push(10);
+        self.send(RawExecutionEvent::Stdout(bytes)).await;
     }
 
-    pub(crate) async fn stderr_chunk(
-        &self,
-        bytes: &[u8],
-    ) -> Result<(), SendError<RawExecutionEvent>> {
-        self.send(RawExecutionEvent::Stderr(bytes.to_vec())).await
+    pub(crate) async fn stderr_chunk(&self, bytes: &[u8]) {
+        self.send(RawExecutionEvent::Stderr(bytes.to_vec())).await;
     }
 
-    pub(crate) async fn observe(
-        &self,
-        address: IpAddr,
-    ) -> Result<(), SendError<RawExecutionEvent>> {
-        self.send(RawExecutionEvent::ObservedAddress(address)).await
+    pub(crate) async fn observe(&self, address: IpAddr) {
+        self.send(RawExecutionEvent::ObservedAddress(address)).await;
     }
 }
 

@@ -40,34 +40,37 @@ struct StartedExecution {
     start: wit_host::ExecutionStartResult,
     events: tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>,
     oracle: OracleSlot,
+    mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
 }
 
 struct ProductionHost {
     limits: StoreLimits,
     lease: crate::supervisor::capability::CapabilityLease,
     events: Option<tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>>,
-    progress_tx: Option<crate::command::ProgressTx>,
+    native_progress_tx: Option<crate::command::ProgressTx>,
     progress: Vec<(serde_json::Value, bool)>,
     progress_during_native_execution: bool,
     reverse_results: std::collections::HashMap<std::net::IpAddr, String>,
     asn_results: std::collections::HashMap<std::net::IpAddr, Vec<u32>>,
+    mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
     oracle: Option<OracleSlot>,
 }
 
 impl ProductionHost {
     fn new(
         lease: crate::supervisor::capability::CapabilityLease,
-        progress_tx: Option<crate::command::ProgressTx>,
+        native_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Self {
         Self {
             limits: BehaviorRuntime::store_limits(),
             lease,
             events: None,
-            progress_tx,
+            native_progress_tx,
             progress: Vec::new(),
             progress_during_native_execution: false,
             reverse_results: std::collections::HashMap::new(),
             asn_results: std::collections::HashMap::new(),
+            mtr_enrichment: None,
             oracle: None,
         }
     }
@@ -135,28 +138,10 @@ impl ProductionHost {
                 timed_out,
                 target,
             } => {
-                use crate::command::mtr::parse::{MtrEnrichmentEntry, MtrEnrichmentMap};
-                let mut enrichment = MtrEnrichmentMap::new();
-                if target.hostname != target.address.to_string() {
-                    enrichment.insert(
-                        target.address.to_string(),
-                        MtrEnrichmentEntry {
-                            hostname: Some(target.hostname.clone()),
-                            asn: Vec::new(),
-                        },
-                    );
-                }
-                for (address, hostname) in &self.reverse_results {
-                    enrichment.entry(address.to_string()).or_default().hostname =
-                        Some(hostname.clone());
-                }
-                for (address, asn) in &self.asn_results {
-                    enrichment
-                        .entry(address.to_string())
-                        .or_default()
-                        .asn
-                        .clone_from(asn);
-                }
+                let enrichment = self.mtr_enrichment.as_ref().map_or_else(
+                    Default::default,
+                    crate::command::mtr::MtrEnrichmentBroker::snapshot,
+                );
                 serde_json::to_value(crate::command::mtr::shape_mtr_output(
                     raw,
                     stderr,
@@ -272,6 +257,7 @@ fn resolution_failed_execution_with_message(
         }),
         events,
         oracle,
+        mtr_enrichment: None,
     }
 }
 
@@ -298,11 +284,12 @@ async fn send_terminal(
     } else {
         crate::command::RawExecutionEvent::Exited(exit_code.unwrap_or(1))
     };
-    let _ = tx.send(event).await;
+    tx.send(event).await;
 }
 
 async fn prepare_ping(
     scope: &crate::supervisor::capability::MeasurementScope,
+    native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::ping;
     use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
@@ -332,12 +319,19 @@ async fn prepare_ping(
     let task_target = target.clone();
     tokio::spawn(async move {
         let native = if resolved_options.protocol.eq_ignore_ascii_case("TCP") {
-            ping::run_tcp_raw_stream(&resolved_options, &task_target, deadline.remaining(), &tx)
-                .await
+            ping::run_tcp_raw_stream(
+                &resolved_options,
+                &task_target,
+                native_progress,
+                deadline.remaining(),
+                &tx,
+            )
+            .await
         } else {
             ping::run_icmp_raw_stream(
                 &resolved_options,
                 &task_target,
+                native_progress,
                 deadline.process_timeout(),
                 &tx,
             )
@@ -368,11 +362,13 @@ async fn prepare_ping(
         )),
         events,
         oracle,
+        mtr_enrichment: None,
     })
 }
 
 fn prepare_dns(
     scope: &crate::supervisor::capability::MeasurementScope,
+    native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::dns;
 
@@ -384,7 +380,7 @@ fn prepare_dns(
     let oracle = new_oracle_slot();
     let task_oracle = std::sync::Arc::clone(&oracle);
     tokio::spawn(async move {
-        match dns::run_dig_stream(&opts, &tx).await {
+        match dns::run_dig_stream(&opts, native_progress.as_ref(), &tx).await {
             Ok(native) => {
                 let process_failed = native.status.is_some_and(|status| !status.success());
                 let shaped = if opts.trace {
@@ -435,11 +431,13 @@ fn prepare_dns(
         )),
         events,
         oracle,
+        mtr_enrichment: None,
     })
 }
 
 async fn prepare_traceroute(
     scope: &crate::supervisor::capability::MeasurementScope,
+    native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::traceroute;
     use crate::util::measurement_timeout::{MeasurementDeadline, traceroute_budget};
@@ -473,6 +471,7 @@ async fn prepare_traceroute(
             &args,
             deadline.process_timeout(),
             &task_target,
+            native_progress.as_ref(),
             &tx,
         )
         .await
@@ -513,11 +512,13 @@ async fn prepare_traceroute(
         )),
         events,
         oracle,
+        mtr_enrichment: None,
     })
 }
 
 async fn prepare_mtr(
     scope: &crate::supervisor::capability::MeasurementScope,
+    native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::mtr;
     use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
@@ -546,9 +547,22 @@ async fn prepare_mtr(
     let oracle = new_oracle_slot();
     let task_oracle = std::sync::Arc::clone(&oracle);
     let task_target = target.clone();
+    let mut enrichment = mtr::MtrEnrichment::new(&target);
+    let shared_enrichment = enrichment.broker();
+    let task_progress = native_progress.clone();
     tokio::spawn(async move {
-        match mtr::run_native_mtr_stream(&args, deadline.process_timeout(), &tx).await {
+        match mtr::run_native_mtr_stream(
+            &args,
+            deadline.process_timeout(),
+            task_progress.as_ref(),
+            &mut enrichment,
+            &deadline,
+            &tx,
+        )
+        .await
+        {
             Ok(native) => {
+                enrichment.wait().await;
                 let timed_out = native.timed_out;
                 store_oracle(
                     &task_oracle,
@@ -573,11 +587,13 @@ async fn prepare_mtr(
         )),
         events,
         oracle,
+        mtr_enrichment: Some(shared_enrichment),
     })
 }
 
 async fn prepare_http(
     scope: &crate::supervisor::capability::MeasurementScope,
+    native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::http;
     use crate::util::measurement_timeout::MeasurementDeadline;
@@ -623,7 +639,15 @@ async fn prepare_http(
     let task_opts = opts.clone();
     let task_ip = resolved_ip.clone();
     tokio::spawn(async move {
-        let raw = http::run_raw_stream(&task_opts, task_ip, dns_ms, deadline, &tx).await;
+        let raw = http::run_raw_stream(
+            &task_opts,
+            task_ip,
+            dns_ms,
+            deadline,
+            native_progress.as_ref(),
+            &tx,
+        )
+        .await;
         match serde_json::to_value(raw.native) {
             Ok(native) => {
                 store_oracle(&task_oracle, Ok(ShadowOracle::Ready(native)));
@@ -643,20 +667,28 @@ async fn prepare_http(
         start: wit_host::ExecutionStartResult::Started(start),
         events,
         oracle,
+        mtr_enrichment: None,
     })
 }
 
 async fn prepare_native_execution(
     scope: &crate::supervisor::capability::MeasurementScope,
+    native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     match scope.kind {
-        crate::supervisor::capability::MeasurementKind::Ping => prepare_ping(scope).await,
-        crate::supervisor::capability::MeasurementKind::Dns => prepare_dns(scope),
-        crate::supervisor::capability::MeasurementKind::Traceroute => {
-            prepare_traceroute(scope).await
+        crate::supervisor::capability::MeasurementKind::Ping => {
+            prepare_ping(scope, native_progress).await
         }
-        crate::supervisor::capability::MeasurementKind::Mtr => prepare_mtr(scope).await,
-        crate::supervisor::capability::MeasurementKind::Http => prepare_http(scope).await,
+        crate::supervisor::capability::MeasurementKind::Dns => prepare_dns(scope, native_progress),
+        crate::supervisor::capability::MeasurementKind::Traceroute => {
+            prepare_traceroute(scope, native_progress).await
+        }
+        crate::supervisor::capability::MeasurementKind::Mtr => {
+            prepare_mtr(scope, native_progress).await
+        }
+        crate::supervisor::capability::MeasurementKind::Http => {
+            prepare_http(scope, native_progress).await
+        }
     }
 }
 
@@ -670,7 +702,8 @@ impl wit_host::Host for ProductionHost {
             .authorize_start(std::time::Instant::now())
             .map_err(policy_error)?;
         let scope = self.lease.scope.clone();
-        let started = prepare_native_execution(&scope).await?;
+        let started = prepare_native_execution(&scope, self.native_progress_tx.clone()).await?;
+        self.mtr_enrichment.clone_from(&started.mtr_enrichment);
         self.events = Some(started.events);
         self.oracle = Some(started.oracle);
         Ok(started.start)
@@ -789,13 +822,20 @@ impl wit_host::Host for ProductionHost {
         self.lease
             .authorize_reverse_lookup(address, now)
             .map_err(policy_error)?;
-        let hostname = crate::util::resolve_target::reverse_lookup(
-            address,
-            self.lease
-                .remaining(now)
-                .min(std::time::Duration::from_secs(3)),
-        )
-        .await;
+        let hostname = if let Some(broker) = &self.mtr_enrichment {
+            broker
+                .lookup(address, self.lease.remaining(now))
+                .await
+                .hostname
+        } else {
+            crate::util::resolve_target::reverse_lookup(
+                address,
+                self.lease
+                    .remaining(now)
+                    .min(std::time::Duration::from_secs(3)),
+            )
+            .await
+        };
         if let Some(hostname) = &hostname {
             self.reverse_results.insert(address, hostname.clone());
         }
@@ -815,7 +855,11 @@ impl wit_host::Host for ProductionHost {
         self.lease
             .authorize_asn_lookup(address, now)
             .map_err(policy_error)?;
-        let asn = crate::command::mtr::lookup_asn(address, self.lease.remaining(now)).await;
+        let asn = if let Some(broker) = &self.mtr_enrichment {
+            broker.lookup(address, self.lease.remaining(now)).await.asn
+        } else {
+            crate::command::mtr::lookup_asn(address, self.lease.remaining(now)).await
+        };
         if !asn.is_empty() {
             self.asn_results.insert(address, asn.clone());
         }
@@ -836,11 +880,6 @@ impl wit_host::Host for ProductionHost {
             let value: serde_json::Value = serde_json::from_str(&result_json).map_err(|error| {
                 host_error(wit_host::HostErrorCode::InvalidRequest, error.to_string())
             })?;
-            if let Some(tx) = &self.progress_tx {
-                tx.send(value.clone()).map_err(|error| {
-                    host_error(wit_host::HostErrorCode::NativeFailure, error.to_string())
-                })?;
-            }
             if self
                 .oracle
                 .as_ref()
@@ -860,7 +899,7 @@ impl BehaviorRuntime {
         &self,
         component: &Component,
         measurement: serde_json::Value,
-        progress_tx: Option<crate::command::ProgressTx>,
+        native_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
         let scope = crate::supervisor::capability::MeasurementScope::from_server_measurement(
             measurement.clone(),
@@ -891,7 +930,7 @@ impl BehaviorRuntime {
         let mut linker = Linker::<ProductionHost>::new(&self.engine);
         ProbeBehavior::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(RuntimeError::Linker)?;
-        let mut store = Store::new(&self.engine, ProductionHost::new(lease, progress_tx));
+        let mut store = Store::new(&self.engine, ProductionHost::new(lease, native_progress_tx));
         store.limiter(|state| &mut state.limits);
         store.set_fuel(JOB_FUEL).map_err(RuntimeError::Store)?;
         store.set_epoch_deadline(1);
@@ -945,9 +984,9 @@ impl BehaviorRuntime {
         &self,
         compiled: &CompiledBehavior,
         measurement: serde_json::Value,
-        progress_tx: Option<crate::command::ProgressTx>,
+        native_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
-        self.shadow_component(&compiled.component, measurement, progress_tx)
+        self.shadow_component(&compiled.component, measurement, native_progress_tx)
             .await
     }
 }

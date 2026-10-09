@@ -234,10 +234,11 @@ async fn run_icmp(
 pub(crate) async fn run_icmp_raw_stream(
     opts: &PingOptions,
     target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
     process_timeout: Duration,
     raw_events: &RawExecutionTx,
 ) -> Result<NativePingRaw> {
-    run_icmp_raw_inner(opts, target, None, process_timeout, Some(raw_events)).await
+    run_icmp_raw_inner(opts, target, progress, process_timeout, Some(raw_events)).await
 }
 
 async fn run_icmp_raw_inner(
@@ -267,9 +268,7 @@ async fn run_icmp_raw_inner(
             raw_output.push_str(&line);
             raw_output.push('\n');
             if let Some(tx) = raw_events {
-                tx.stdout_line(&line)
-                    .await
-                    .map_err(|_| std::io::Error::other("raw execution receiver dropped"))?;
+                tx.stdout_line(&line).await;
             }
             if let Some(tx) = &progress {
                 let mut normalized = normalize_ping_output(&line, &address, &target.hostname);
@@ -355,10 +354,11 @@ async fn run_tcp(
 pub(crate) async fn run_tcp_raw_stream(
     opts: &PingOptions,
     target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
     remaining: Duration,
     raw_events: &RawExecutionTx,
 ) -> Result<NativePingRaw> {
-    run_tcp_raw_inner(opts, target, None, remaining, Some(raw_events)).await
+    run_tcp_raw_inner(opts, target, progress, remaining, Some(raw_events)).await
 }
 
 async fn run_tcp_raw_inner(
@@ -378,9 +378,7 @@ async fn run_tcp_raw_inner(
     );
     let mut raw_lines = vec![header.clone()];
     if let Some(tx) = raw_events {
-        tx.stdout_line(&header)
-            .await
-            .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+        tx.stdout_line(&header).await;
     }
 
     let mut probes: Vec<TcpPingProbe> = Vec::with_capacity(usize::from(opts.packets));
@@ -405,9 +403,7 @@ async fn run_tcp_raw_inner(
         );
         raw_lines.push(line.clone());
         if let Some(tx) = raw_events {
-            tx.stdout_line(&line)
-                .await
-                .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+            tx.stdout_line(&line).await;
         }
         probes.push(probe);
 
@@ -431,9 +427,7 @@ async fn run_tcp_raw_inner(
     for line in summary {
         raw_lines.push(line.clone());
         if let Some(tx) = raw_events {
-            tx.stdout_line(&line)
-                .await
-                .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+            tx.stdout_line(&line).await;
         }
     }
     if let (Some(min), Some(avg), Some(max), Some(mdev)) =
@@ -442,9 +436,7 @@ async fn run_tcp_raw_inner(
         let line = format!("rtt min/avg/max/mdev = {min:.3}/{avg:.3}/{max:.3}/{mdev:.3} ms");
         raw_lines.push(line.clone());
         if let Some(tx) = raw_events {
-            tx.stdout_line(&line)
-                .await
-                .map_err(|_| anyhow::anyhow!("raw execution receiver dropped"))?;
+            tx.stdout_line(&line).await;
         }
     }
 

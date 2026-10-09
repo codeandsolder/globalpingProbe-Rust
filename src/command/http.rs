@@ -567,8 +567,7 @@ async fn emit_http_raw_events(
     if headers != *last_headers {
         last_headers.clone_from(&headers);
         if !headers.is_empty() {
-            let _ = tx
-                .send(RawExecutionEvent::HttpResponseHeaders(headers))
+            tx.send(RawExecutionEvent::HttpResponseHeaders(headers))
                 .await;
         }
     }
@@ -578,7 +577,7 @@ async fn emit_http_raw_events(
         let chunk = body[*sent_body..].to_vec();
         *sent_body = body.len();
         if !chunk.is_empty() {
-            let _ = tx.send(RawExecutionEvent::HttpResponseBody(chunk)).await;
+            tx.send(RawExecutionEvent::HttpResponseBody(chunk)).await;
         }
     }
 }
@@ -653,10 +652,10 @@ async fn publish_curl_streams(raw_tx: Option<&RawExecutionTx>, stdout: &[u8], st
         return;
     };
     if !stdout.is_empty() {
-        let _ = tx.send(RawExecutionEvent::Stdout(stdout.to_vec())).await;
+        tx.send(RawExecutionEvent::Stdout(stdout.to_vec())).await;
     }
     if !stderr.is_empty() {
-        let _ = tx.send(RawExecutionEvent::Stderr(stderr.to_vec())).await;
+        tx.send(RawExecutionEvent::Stderr(stderr.to_vec())).await;
     }
 }
 
@@ -805,12 +804,11 @@ async fn raw_failure(
     publish: bool,
 ) -> HttpRawExecution {
     if publish {
-        let _ = tx
-            .send(RawExecutionEvent::HttpNativeFailure {
-                failure_source: failure_source.to_string(),
-                message: message.clone(),
-            })
-            .await;
+        tx.send(RawExecutionEvent::HttpNativeFailure {
+            failure_source: failure_source.to_string(),
+            message: message.clone(),
+        })
+        .await;
     }
     HttpRawExecution {
         native: failed_result(failure_source, message),
@@ -862,8 +860,7 @@ async fn finalize_raw_success(
     )
     .await;
     if let Some(enrichment) = enrichment {
-        let _ = tx
-            .send(RawExecutionEvent::HttpTlsEnrichment(enrichment))
+        tx.send(RawExecutionEvent::HttpTlsEnrichment(enrichment))
             .await;
     }
     let native = shape_success_http_result(HttpSuccessInput {
@@ -888,6 +885,7 @@ pub(crate) async fn run_raw_stream(
     resolved_ip: String,
     dns_ms: Option<u64>,
     deadline: MeasurementDeadline,
+    progress: Option<&ProgressTx>,
     tx: &RawExecutionTx,
 ) -> HttpRawExecution {
     let protocol = opts.protocol.to_uppercase();
@@ -916,7 +914,7 @@ pub(crate) async fn run_raw_stream(
         remaining,
         is_https,
         CurlSinks {
-            progress: None,
+            progress,
             raw: Some(tx),
         },
     )
