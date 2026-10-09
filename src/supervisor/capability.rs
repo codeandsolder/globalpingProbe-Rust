@@ -263,6 +263,9 @@ impl CapabilityLease {
     /// consume an event slot.
     pub fn authorize_progress(&mut self, json: &str, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
+        if !self.started {
+            return Err(PolicyError::NotStarted);
+        }
         let limit = if self.scope.kind == MeasurementKind::Http {
             MAX_HTTP_PROGRESS_JSON_BYTES
         } else {
@@ -434,6 +437,17 @@ mod tests {
             lease.authorize_asn_lookup(gateway, now),
             Err(PolicyError::PrivateAddress)
         );
+    }
+
+    #[test]
+    fn progress_before_execution_start_is_rejected() {
+        let now = Instant::now();
+        let mut lease = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, ping_scope(10), now);
+        assert_eq!(
+            lease.authorize_progress("{}", now),
+            Err(PolicyError::NotStarted)
+        );
+        assert_eq!(lease.progress_events, 0);
     }
 
     #[test]

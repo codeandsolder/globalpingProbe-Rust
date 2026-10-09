@@ -396,14 +396,14 @@ async fn run_behavior_measurement(
     measurement: &Value,
     measurement_id: &str,
     measurement_type: &str,
-    native_progress_tx: Option<ProgressTx>,
+    behavior_progress_tx: Option<ProgressTx>,
 ) -> Option<Result<Value, RuntimeError>> {
     let controller = behavior_controller?;
     let shadow = controller.executor().await?;
     let sequence = shadow.sequence();
     let build_id = shadow.build_id().to_string();
     let shadow_result = shadow
-        .run_with_native_progress(measurement.clone(), native_progress_tx)
+        .run_with_behavior_progress(measurement.clone(), behavior_progress_tx)
         .await;
 
     #[cfg(test)]
@@ -1197,7 +1197,9 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 /// enabled, WASM and the native diagnostic oracle share one supervisor-owned
 /// execution. A successful component result is authoritative; component/native
 /// execution faults use the already-computed native result without rerunning
-/// the measurement. Native progress remains authoritative in this phase.
+/// the measurement. Verified WASM progress is API-facing when behavior is active;
+/// native progress is suppressed on that shared execution and is used only for
+/// native-only or pre-start fallback paths.
 ///
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
@@ -1855,19 +1857,38 @@ mod tests {
             "packets": 1,
             "ipVersion": 4,
             "timeout": 10,
-            "inProgressUpdates": false
+            "inProgressUpdates": true
         });
+        let (progress_tx, mut progress_rx) = ProgressTx::channel();
         let result = run_measurement(
             &CommandKind::Ping,
             measurement,
             Some(&controller),
             "post-start-fault",
             "ping",
-            None,
+            Some(progress_tx),
         )
         .await
         .unwrap_or_else(|error| panic!("shared native execution failed: {error}"));
 
+        let mut progress = Vec::new();
+        while let Ok(update) = progress_rx.try_recv() {
+            progress.push(update.resolve());
+        }
+        assert_eq!(
+            progress.len(),
+            2,
+            "native progress must not be mixed into the WASM stream"
+        );
+        assert!(
+            progress[0]["rawOutput"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("tcp_conn=1"))
+        );
+        assert_eq!(
+            progress[1]["rawOutput"],
+            "__post_start_fault_fixture_progress__"
+        );
         assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
         assert!(result.get("status").is_some());
         assert!(result.get("rawOutput").is_some());

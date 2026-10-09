@@ -255,6 +255,13 @@ mod component {
                     )
                 }
             }?;
+            if measurement.in_progress_updates {
+                let payload = serde_json::to_string(&serde_json::json!({
+                    "rawOutput": "__post_start_fault_fixture_progress__"
+                }))
+                .map_err(|error| BehaviorError::Internal(error.to_string()))?;
+                execution::emit_progress(&job.token, &payload, false)?;
+            }
             Err(BehaviorError::InvalidJob(
                 "intentional post-start health-test fault".to_string(),
             ))

@@ -34,7 +34,7 @@ struct ProductionHost {
     limits: StoreLimits,
     lease: crate::supervisor::capability::CapabilityLease,
     events: Option<tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>>,
-    native_progress_tx: Option<crate::command::ProgressTx>,
+    behavior_progress_tx: Option<crate::command::ProgressTx>,
     progress: Vec<(serde_json::Value, bool)>,
     progress_during_native_execution: bool,
     traceroute_enrichment: Option<crate::command::traceroute::TracerouteEnrichmentBroker>,
@@ -45,13 +45,13 @@ struct ProductionHost {
 impl ProductionHost {
     fn new(
         lease: crate::supervisor::capability::CapabilityLease,
-        native_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Self {
         Self {
             limits: BehaviorRuntime::store_limits(),
             lease,
             events: None,
-            native_progress_tx,
+            behavior_progress_tx,
             progress: Vec::new(),
             progress_during_native_execution: false,
             traceroute_enrichment: None,
@@ -73,6 +73,20 @@ impl ProductionHost {
                 "capability token mismatch",
             ))
         }
+    }
+}
+
+const fn wit_measurement_kind(
+    kind: crate::supervisor::capability::MeasurementKind,
+) -> wit_host::MeasurementKind {
+    match kind {
+        crate::supervisor::capability::MeasurementKind::Ping => wit_host::MeasurementKind::Ping,
+        crate::supervisor::capability::MeasurementKind::Dns => wit_host::MeasurementKind::Dns,
+        crate::supervisor::capability::MeasurementKind::Traceroute => {
+            wit_host::MeasurementKind::Traceroute
+        }
+        crate::supervisor::capability::MeasurementKind::Mtr => wit_host::MeasurementKind::Mtr,
+        crate::supervisor::capability::MeasurementKind::Http => wit_host::MeasurementKind::Http,
     }
 }
 
@@ -676,7 +690,7 @@ impl wit_host::Host for ProductionHost {
             .authorize_start(std::time::Instant::now())
             .map_err(policy_error)?;
         let scope = self.lease.scope.clone();
-        let started = prepare_native_execution(&scope, self.native_progress_tx.clone()).await?;
+        let started = prepare_native_execution(&scope, None).await?;
         self.traceroute_enrichment
             .clone_from(&started.traceroute_enrichment);
         self.mtr_enrichment.clone_from(&started.mtr_enrichment);
@@ -849,8 +863,19 @@ impl wit_host::Host for ProductionHost {
             let value: serde_json::Value = serde_json::from_str(&result_json).map_err(|error| {
                 host_error(wit_host::HostErrorCode::InvalidRequest, error.to_string())
             })?;
+            let expected_overwrite =
+                self.lease.scope.kind == crate::supervisor::capability::MeasurementKind::Mtr;
+            if overwrite != expected_overwrite {
+                return Err(host_error(
+                    wit_host::HostErrorCode::InvalidRequest,
+                    "behavior progress overwrite mode does not match measurement policy",
+                ));
+            }
             if self.oracle.as_ref().is_some_and(oracle_pending) {
                 self.progress_during_native_execution = true;
+            }
+            if let Some(tx) = &self.behavior_progress_tx {
+                tx.send(value.clone()).ok();
             }
             self.progress.push((value, overwrite));
             Ok(())
@@ -864,7 +889,7 @@ impl BehaviorRuntime {
         &self,
         component: &Component,
         measurement: serde_json::Value,
-        native_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
         let scope = crate::supervisor::capability::MeasurementScope::from_server_measurement(
             measurement.clone(),
@@ -878,15 +903,7 @@ impl BehaviorRuntime {
             hi: token.hi,
             lo: token.lo,
         };
-        let kind = match scope.kind {
-            crate::supervisor::capability::MeasurementKind::Ping => wit_host::MeasurementKind::Ping,
-            crate::supervisor::capability::MeasurementKind::Dns => wit_host::MeasurementKind::Dns,
-            crate::supervisor::capability::MeasurementKind::Traceroute => {
-                wit_host::MeasurementKind::Traceroute
-            }
-            crate::supervisor::capability::MeasurementKind::Mtr => wit_host::MeasurementKind::Mtr,
-            crate::supervisor::capability::MeasurementKind::Http => wit_host::MeasurementKind::Http,
-        };
+        let kind = wit_measurement_kind(scope.kind);
         let lease = crate::supervisor::capability::CapabilityLease::new(
             token,
             scope,
@@ -895,7 +912,10 @@ impl BehaviorRuntime {
         let mut linker = Linker::<ProductionHost>::new(&self.engine);
         ProbeBehavior::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(RuntimeError::Linker)?;
-        let mut store = Store::new(&self.engine, ProductionHost::new(lease, native_progress_tx));
+        let mut store = Store::new(
+            &self.engine,
+            ProductionHost::new(lease, behavior_progress_tx),
+        );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(JOB_FUEL).map_err(RuntimeError::Store)?;
         store.set_epoch_deadline(1);
@@ -970,8 +990,9 @@ impl BehaviorRuntime {
     }
 
     /// Execute one immutable measurement through the real bounded host adapter
-    /// while retaining the native result from the exact same raw execution as
-    /// an oracle. The component does not become authoritative here.
+    /// while retaining native shaping from the exact same raw execution as a
+    /// diagnostic/fault oracle. Component final/progress authority is chosen by
+    /// the caller-facing executor path.
     ///
     /// # Errors
     /// Returns an error only when setup or guest execution fails before native
@@ -982,9 +1003,9 @@ impl BehaviorRuntime {
         &self,
         compiled: &CompiledBehavior,
         measurement: serde_json::Value,
-        native_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
-        self.shadow_component(&compiled.component, measurement, native_progress_tx)
+        self.shadow_component(&compiled.component, measurement, behavior_progress_tx)
             .await
     }
 }
@@ -1021,8 +1042,9 @@ impl BehaviorShadowExecutor {
         &self.compiled.build_id
     }
 
-    /// Run one diagnostic-only behavior shadow. No guest progress is forwarded
-    /// outside the executor; callers decide what to do with the parity result.
+    /// Run one behavior execution without an external progress sink. Guest
+    /// progress remains bounded and recorded in the result for diagnostics and
+    /// parity checks.
     ///
     /// # Errors
     /// Returns a failure only when the behavior fails before native execution
@@ -1032,22 +1054,24 @@ impl BehaviorShadowExecutor {
         &self,
         measurement: serde_json::Value,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
-        self.run_with_native_progress(measurement, None).await
+        self.run_with_behavior_progress(measurement, None).await
     }
 
-    /// Run one behavior shadow while forwarding the authoritative native
-    /// execution's progress through the ordinary probe progress channel.
+    /// Run one behavior execution while forwarding the verified component's
+    /// bounded progress through the ordinary probe progress channel. Native
+    /// execution remains only the diagnostic/fault oracle and does not emit API
+    /// progress on this path.
     ///
     /// # Errors
     /// Returns a failure only when the behavior fails before native execution
     /// starts; post-start guest failures are carried in `BehaviorShadowResult`.
-    pub(crate) async fn run_with_native_progress(
+    pub(crate) async fn run_with_behavior_progress(
         &self,
         measurement: serde_json::Value,
-        native_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_tx: Option<crate::command::ProgressTx>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
         self.runtime
-            .shadow_measurement(&self.compiled, measurement, native_progress_tx)
+            .shadow_measurement(&self.compiled, measurement, behavior_progress_tx)
             .await
     }
 }
@@ -1055,6 +1079,82 @@ impl BehaviorShadowExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress_test_host(
+        kind: crate::supervisor::capability::MeasurementKind,
+        progress_tx: crate::command::ProgressTx,
+    ) -> (ProductionHost, wit_host::CapabilityToken) {
+        let measurement = match kind {
+            crate::supervisor::capability::MeasurementKind::Mtr => serde_json::json!({
+                "type": "mtr", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            _ => serde_json::json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+        };
+        let scope =
+            crate::supervisor::capability::MeasurementScope::from_server_measurement(measurement)
+                .unwrap_or_else(|error| panic!("test measurement scope failed: {error}"));
+        assert_eq!(scope.kind, kind);
+        let token = crate::supervisor::capability::CapabilityToken { hi: 11, lo: 29 };
+        let wit_token = wit_host::CapabilityToken {
+            hi: token.hi,
+            lo: token.lo,
+        };
+        let now = std::time::Instant::now();
+        let mut lease = crate::supervisor::capability::CapabilityLease::new(token, scope, now);
+        lease
+            .authorize_start(now)
+            .unwrap_or_else(|error| panic!("test capability start failed: {error}"));
+        (ProductionHost::new(lease, Some(progress_tx)), wit_token)
+    }
+
+    #[tokio::test]
+    async fn behavior_progress_is_forwarded_and_overwrite_mode_is_enforced() {
+        let (tx, mut rx) = crate::command::ProgressTx::channel();
+        let (mut ping, ping_token) =
+            progress_test_host(crate::supervisor::capability::MeasurementKind::Ping, tx);
+        wit_host::Host::emit_progress(
+            &mut ping,
+            ping_token.clone(),
+            r#"{"rawOutput":"guest"}"#.to_string(),
+            false,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("valid guest progress was rejected: {error:?}"));
+        let forwarded = rx
+            .try_recv()
+            .unwrap_or_else(|error| panic!("guest progress was not forwarded: {error}"))
+            .resolve();
+        assert_eq!(forwarded, serde_json::json!({"rawOutput": "guest"}));
+
+        let error = wit_host::Host::emit_progress(
+            &mut ping,
+            ping_token,
+            r#"{"rawOutput":"wrong-mode"}"#.to_string(),
+            true,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("invalid ping overwrite mode unexpectedly succeeded"));
+        assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
+
+        let (tx, _rx) = crate::command::ProgressTx::channel();
+        let (mut mtr, mtr_token) =
+            progress_test_host(crate::supervisor::capability::MeasurementKind::Mtr, tx);
+        let error = wit_host::Host::emit_progress(
+            &mut mtr,
+            mtr_token,
+            r#"{"rawOutput":"wrong-mode"}"#.to_string(),
+            false,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("invalid MTR overwrite mode unexpectedly succeeded"));
+        assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
+    }
 
     #[tokio::test]
     async fn oracle_wait_observes_result_stored_before_wait() {
