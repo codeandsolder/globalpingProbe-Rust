@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use core::net::IpAddr;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[must_use]
 pub fn normalize_ip_text(raw: &str) -> String {
@@ -14,20 +14,20 @@ pub fn normalize_ip_text(raw: &str) -> String {
         .map_or_else(|_| address.to_string(), |address| address.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MtrStatus {
     Finished,
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HopTiming {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rtt: Option<f64>, // ms; None = timeout/drop
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HopStats {
     pub min: f64,
@@ -43,7 +43,7 @@ pub struct HopStats {
     pub j_avg: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MtrHop {
     pub resolved_address: Option<String>,
@@ -53,7 +53,7 @@ pub struct MtrHop {
     pub timings: Vec<HopTiming>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedMtr {
     pub status: MtrStatus,

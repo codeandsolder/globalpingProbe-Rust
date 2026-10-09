@@ -118,6 +118,7 @@ impl From<RuntimeError> for BootstrapError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BehaviorHealthAction {
     None,
+    FirstDivergence,
     IgnoredStaleSequence,
     ThresholdReachedNoPrevious,
     RolledBack {
@@ -232,6 +233,9 @@ impl BehaviorController {
         };
         match decision {
             HealthDecision::None => return Ok(BehaviorHealthAction::None),
+            HealthDecision::FirstDivergence => {
+                return Ok(BehaviorHealthAction::FirstDivergence);
+            }
             HealthDecision::IgnoredStaleSequence => {
                 return Ok(BehaviorHealthAction::IgnoredStaleSequence);
             }

@@ -218,6 +218,17 @@ async fn behavior_controller_auto_rolls_back_after_hard_fault_threshold() {
             .observe_health(2, BehaviorHealthEvent::Divergence)
             .await
             .unwrap_or_else(|error| panic!("health accounting failed: {error}")),
+        BehaviorHealthAction::FirstDivergence
+    );
+    let divergent_health = controller.health_snapshot().await;
+    assert_eq!(divergent_health.consecutive_faults, 0);
+    assert_eq!(divergent_health.divergences, 1);
+
+    assert_eq!(
+        controller
+            .observe_health(2, BehaviorHealthEvent::RuntimeFault)
+            .await
+            .unwrap_or_else(|error| panic!("first hard fault accounting failed: {error}")),
         BehaviorHealthAction::None
     );
     assert_eq!(controller.health_snapshot().await.consecutive_faults, 1);

@@ -94,6 +94,50 @@ const fn wit_measurement_kind(
     }
 }
 
+fn validate_component_result(
+    kind: crate::supervisor::capability::MeasurementKind,
+    measurement: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<(), RuntimeError> {
+    use crate::supervisor::capability::MeasurementKind;
+
+    fn validate<T: serde::de::DeserializeOwned>(
+        kind: MeasurementKind,
+        value: &serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let parsed: Result<T, _> = serde::Deserialize::deserialize(value);
+        parsed.map(|_| ()).map_err(|error| {
+            RuntimeError::GuestInvalidOutput(format!(
+                "{kind:?} result does not match the supervisor schema: {error}"
+            ))
+        })
+    }
+
+    match kind {
+        MeasurementKind::Ping => {
+            validate::<globalping_behavior_core::ping::ParsedPing>(kind, value)
+        }
+        MeasurementKind::Dns => {
+            if measurement
+                .get("trace")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                validate::<globalping_behavior_core::dns::TraceResult>(kind, value)
+            } else {
+                validate::<globalping_behavior_core::dns::ClassicResult>(kind, value)
+            }
+        }
+        MeasurementKind::Traceroute => {
+            validate::<globalping_behavior_core::traceroute::ParsedTraceroute>(kind, value)
+        }
+        MeasurementKind::Mtr => validate::<globalping_behavior_core::mtr::ParsedMtr>(kind, value),
+        MeasurementKind::Http => {
+            validate::<globalping_behavior_core::http::ParsedHttp>(kind, value)
+        }
+    }
+}
+
 const fn buffer_mode(mode: wit_host::ProgressMode) -> BufferMode {
     match mode {
         wit_host::ProgressMode::Append => BufferMode::Append,
@@ -900,7 +944,8 @@ impl BehaviorRuntime {
             hi: token.hi,
             lo: token.lo,
         };
-        let kind = wit_measurement_kind(scope.kind);
+        let measurement_kind = scope.kind;
+        let kind = wit_measurement_kind(measurement_kind);
         let lease = crate::supervisor::capability::CapabilityLease::new(
             token,
             scope,
@@ -947,8 +992,10 @@ impl BehaviorRuntime {
                     .lease
                     .authorize_final_result(&result, std::time::Instant::now())
                     .map_err(|error| RuntimeError::Policy(error.to_string()))?;
-                serde_json::from_str::<serde_json::Value>(&result)
-                    .map_err(|error| RuntimeError::GuestInvalidOutput(error.to_string()))
+                let value = serde_json::from_str::<serde_json::Value>(&result)
+                    .map_err(|error| RuntimeError::GuestInvalidOutput(error.to_string()))?;
+                validate_component_result(measurement_kind, &measurement, &value)?;
+                Ok(value)
             }
             .await;
 
@@ -1082,6 +1129,165 @@ mod tests {
             .authorize_start(now)
             .unwrap_or_else(|error| panic!("test capability start failed: {error}"));
         (ProductionHost::new(lease, Some(progress_sink)), wit_token)
+    }
+
+    #[test]
+    fn component_result_schema_accepts_representative_results() {
+        use crate::supervisor::capability::MeasurementKind;
+
+        let cases = [
+            (
+                MeasurementKind::Ping,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "status": "finished",
+                    "rawOutput": "",
+                    "resolvedAddress": "1.1.1.1",
+                    "resolvedHostname": "one.one.one.one",
+                    "timings": [],
+                    "stats": {},
+                    "futureField": true
+                }),
+            ),
+            (
+                MeasurementKind::Dns,
+                serde_json::json!({"trace": false}),
+                serde_json::json!({
+                    "status": "finished",
+                    "statusCodeName": "NOERROR",
+                    "statusCode": 0,
+                    "answers": [],
+                    "timings": {"total": 1},
+                    "resolver": "1.1.1.1",
+                    "rawOutput": ""
+                }),
+            ),
+            (
+                MeasurementKind::Dns,
+                serde_json::json!({"trace": true}),
+                serde_json::json!({
+                    "status": "finished",
+                    "hops": [],
+                    "rawOutput": ""
+                }),
+            ),
+            (
+                MeasurementKind::Traceroute,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "status": "finished",
+                    "rawOutput": "",
+                    "resolvedAddress": "1.1.1.1",
+                    "resolvedHostname": "one.one.one.one",
+                    "hops": []
+                }),
+            ),
+            (
+                MeasurementKind::Mtr,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "status": "finished",
+                    "rawOutput": "",
+                    "resolvedAddress": "1.1.1.1",
+                    "resolvedHostname": "one.one.one.one",
+                    "hops": []
+                }),
+            ),
+            (
+                MeasurementKind::Http,
+                serde_json::json!({}),
+                serde_json::json!({
+                    "status": "finished",
+                    "statusCode": 200,
+                    "statusCodeName": "OK",
+                    "resolvedAddress": "1.1.1.1",
+                    "headers": {},
+                    "rawHeaders": "",
+                    "rawBody": "",
+                    "truncated": false,
+                    "tls": null,
+                    "timings": {},
+                    "rawOutput": ""
+                }),
+            ),
+        ];
+
+        for (kind, measurement, value) in cases {
+            validate_component_result(kind, &measurement, &value)
+                .unwrap_or_else(|error| panic!("{kind:?} representative result failed: {error}"));
+        }
+    }
+
+    #[test]
+    fn component_result_schema_rejects_marker_only_json_for_every_kind() {
+        use crate::supervisor::capability::MeasurementKind;
+
+        for (kind, measurement) in [
+            (MeasurementKind::Ping, serde_json::json!({})),
+            (MeasurementKind::Dns, serde_json::json!({"trace": false})),
+            (MeasurementKind::Dns, serde_json::json!({"trace": true})),
+            (MeasurementKind::Traceroute, serde_json::json!({})),
+            (MeasurementKind::Mtr, serde_json::json!({})),
+            (MeasurementKind::Http, serde_json::json!({})),
+        ] {
+            let error = validate_component_result(
+                kind,
+                &measurement,
+                &serde_json::json!({"__intentionalDivergence": true}),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{kind:?} accepted marker-only JSON"));
+            assert!(matches!(error, RuntimeError::GuestInvalidOutput(_)));
+        }
+    }
+
+    #[test]
+    fn dns_result_schema_follows_trace_request_bit() {
+        use crate::supervisor::capability::MeasurementKind;
+
+        let classic = serde_json::json!({
+            "status": "finished",
+            "answers": [],
+            "timings": {"total": 0},
+            "rawOutput": ""
+        });
+        let trace = serde_json::json!({
+            "status": "finished",
+            "hops": [],
+            "rawOutput": ""
+        });
+        assert!(
+            validate_component_result(
+                MeasurementKind::Dns,
+                &serde_json::json!({"trace": false}),
+                &classic,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_component_result(
+                MeasurementKind::Dns,
+                &serde_json::json!({"trace": true}),
+                &trace,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_component_result(
+                MeasurementKind::Dns,
+                &serde_json::json!({"trace": true}),
+                &classic,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_component_result(
+                MeasurementKind::Dns,
+                &serde_json::json!({"trace": false}),
+                &trace,
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

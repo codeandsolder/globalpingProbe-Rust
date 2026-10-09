@@ -235,9 +235,22 @@ async fn apply_behavior_health(
     controller: &BehaviorController,
     sequence: u64,
     event: BehaviorHealthEvent,
+    measurement_id: &str,
+    measurement_type: &str,
+    build_id: &str,
 ) {
     match controller.observe_health(sequence, event).await {
         Ok(BehaviorHealthAction::None) => {}
+        Ok(BehaviorHealthAction::FirstDivergence) => {
+            warn!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                "Verified behavior produced its first structurally valid divergence from the native diagnostic oracle; divergence is diagnostic-only and does not advance rollback."
+            );
+        }
         Ok(BehaviorHealthAction::IgnoredStaleSequence) => {
             debug!(
                 target: "behavior-runtime",
@@ -347,7 +360,7 @@ fn classify_behavior_health(
                 BehaviorHealthEvent::Match
             }
             Ok(_) => {
-                warn!(
+                debug!(
                     target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
@@ -355,7 +368,7 @@ fn classify_behavior_health(
                     behavior_build_id = build_id,
                     progress_events = result.progress.len(),
                     streamed_progress = result.progress_during_native_execution,
-                    "Behavior result diverged from its native diagnostic oracle."
+                    "Behavior result diverged from its native diagnostic oracle; the result remains authoritative and divergence is diagnostic-only."
                 );
                 BehaviorHealthEvent::Divergence
             }
@@ -419,7 +432,9 @@ async fn run_behavior_measurement(
                 {
                     FORCED_BEHAVIOR_MATCHES.fetch_add(1, Ordering::SeqCst);
                 }
-                result.component = Ok(json!({"__forcedHealthTestDivergence": true}));
+                if let Ok(component) = &mut result.component {
+                    component["__forcedHealthTestDivergence"] = Value::Bool(true);
+                }
             }
         }
         execution_result
@@ -432,7 +447,15 @@ async fn run_behavior_measurement(
         sequence,
         &build_id,
     );
-    apply_behavior_health(controller, sequence, health_event).await;
+    apply_behavior_health(
+        controller,
+        sequence,
+        health_event,
+        measurement_id,
+        measurement_type,
+        &build_id,
+    )
+    .await;
 
     Some(match execution_result {
         Ok(result) => {
@@ -1726,7 +1749,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
-    async fn live_behavior_health_rolls_back_persistently_after_all_six_measurements_diverge() {
+    async fn live_behavior_health_records_all_six_divergences_without_rollback() {
         let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -1734,7 +1757,7 @@ mod tests {
             });
         let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
         let threshold =
-            NonZeroU32::new(6).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
         let config =
             BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
                 .with_health_policy(BehaviorHealthPolicy::new(threshold));
@@ -1781,37 +1804,32 @@ mod tests {
             .unwrap_or_else(|| panic!("active behavior executor must exist"));
             shared.unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
 
-            if index < 5 {
-                assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
-                let health = controller.health_snapshot().await;
-                assert_eq!(health.active_sequence, Some(2));
-                assert_eq!(
-                    health.consecutive_faults,
-                    u32::try_from(index + 1).unwrap_or(u32::MAX)
-                );
-                assert_eq!(
-                    health.divergences,
-                    u64::try_from(index + 1).unwrap_or(u64::MAX)
-                );
-                assert_eq!(health.runtime_faults, 0);
-                assert_eq!(health.inconclusive, 0);
-            }
+            assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+            let health = controller.health_snapshot().await;
+            assert_eq!(health.active_sequence, Some(2));
+            assert_eq!(health.consecutive_faults, 0);
+            assert_eq!(
+                health.divergences,
+                u64::try_from(index + 1).unwrap_or(u64::MAX)
+            );
+            assert_eq!(health.runtime_faults, 0);
+            assert_eq!(health.inconclusive, 0);
         }
 
         assert_eq!(FORCED_BEHAVIOR_MATCHES.load(Ordering::SeqCst), 6);
-        assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
         assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
-        assert!(!controller.has_previous().unwrap_or(true));
+        assert!(controller.has_previous().unwrap_or(false));
         let executor = controller
             .executor()
             .await
-            .unwrap_or_else(|| panic!("rolled-back executor must exist"));
-        assert_eq!(executor.sequence(), 1);
-        assert_eq!(executor.build_id(), "health-normal");
+            .unwrap_or_else(|| panic!("active executor must exist"));
+        assert_eq!(executor.sequence(), 2);
+        assert_eq!(executor.build_id(), "health-test-active");
         let health = controller.health_snapshot().await;
-        assert_eq!(health.active_sequence, Some(1));
+        assert_eq!(health.active_sequence, Some(2));
         assert_eq!(health.consecutive_faults, 0);
-        assert_eq!(health.divergences, 0);
+        assert_eq!(health.divergences, 6);
         assert_eq!(health.runtime_faults, 0);
         assert_eq!(health.inconclusive, 0);
 
@@ -1822,10 +1840,14 @@ mod tests {
                 .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
         )
         .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
-        assert_eq!(persisted.active().manifest.sequence, 1);
-        assert_eq!(persisted.active().manifest.build_id, "health-normal");
+        assert_eq!(persisted.active().manifest.sequence, 2);
+        assert_eq!(persisted.active().manifest.build_id, "health-test-active");
         assert_eq!(persisted.accepted_sequence(), 2);
-        assert!(persisted.previous().is_none());
+        let previous = persisted
+            .previous()
+            .unwrap_or_else(|| panic!("previous verified slot must remain available"));
+        assert_eq!(previous.manifest.sequence, 1);
+        assert_eq!(previous.manifest.build_id, "health-normal");
     }
 
     #[cfg(target_os = "linux")]
@@ -1905,7 +1927,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network access plus normal and divergent WASIp2 behavior fixtures"]
-    async fn live_signed_divergence_is_authoritative_then_rolls_back() {
+    async fn live_signed_valid_divergence_is_authoritative_and_remains_active() {
         let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -1929,7 +1951,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
 
         let (normal_manifest, normal_component) =
-            signed_health_test_component(&normal_path, 1, "divergence-rollback-normal");
+            signed_health_test_component(&normal_path, 1, "divergence-normal");
         controller
             .activate_candidate(normal_manifest, normal_component)
             .await
@@ -1956,7 +1978,107 @@ mod tests {
         .await
         .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
 
-        assert_eq!(result, json!({"__intentionalDivergence": true}));
+        assert!(result.get("status").and_then(Value::as_str).is_some());
+        assert!(
+            result["rawOutput"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("__intentional_divergence__"))
+        );
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        let executor = controller
+            .executor()
+            .await
+            .unwrap_or_else(|| panic!("divergent executor must remain active"));
+        assert_eq!(executor.build_id(), "divergence-authoritative");
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(2));
+        assert_eq!(health.consecutive_faults, 0);
+        assert_eq!(health.divergences, 1);
+        assert_eq!(health.runtime_faults, 0);
+        assert_eq!(health.inconclusive, 0);
+
+        let persisted = PersistentBehaviorSlots::load(
+            root.path(),
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        assert_eq!(persisted.active().manifest.sequence, 2);
+        assert_eq!(
+            persisted.active().manifest.build_id,
+            "divergence-authoritative"
+        );
+        assert_eq!(persisted.accepted_sequence(), 2);
+        assert_eq!(
+            persisted
+                .previous()
+                .unwrap_or_else(|| panic!("previous verified slot must remain"))
+                .manifest
+                .sequence,
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus normal and invalid-output WASIp2 behavior fixtures"]
+    async fn live_signed_invalid_output_falls_back_and_rolls_back() {
+        let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let invalid_path = std::env::var_os("GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT must point to the invalid-output fixture"
+                )
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let threshold =
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
+                .with_health_policy(BehaviorHealthPolicy::new(threshold));
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+
+        let (normal_manifest, normal_component) =
+            signed_health_test_component(&normal_path, 1, "invalid-output-normal");
+        controller
+            .activate_candidate(normal_manifest, normal_component)
+            .await
+            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
+        let (invalid_manifest, invalid_component) =
+            signed_health_test_component(&invalid_path, 2, "invalid-output-active");
+        controller
+            .activate_candidate(invalid_manifest, invalid_component)
+            .await
+            .unwrap_or_else(|error| panic!("invalid-output behavior activation failed: {error}"));
+
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        let result = run_measurement(
+            &CommandKind::Ping,
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": false
+            }),
+            Some(&controller),
+            "signed-invalid-output",
+            "ping",
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+
+        assert!(result.get("status").is_some());
+        assert!(result.get("rawOutput").is_some());
+        assert!(result.get("__intentionalInvalidOutput").is_none());
         assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
         assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
         assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
@@ -1964,7 +2086,7 @@ mod tests {
             .executor()
             .await
             .unwrap_or_else(|| panic!("rolled-back executor must exist"));
-        assert_eq!(executor.build_id(), "divergence-rollback-normal");
+        assert_eq!(executor.build_id(), "invalid-output-normal");
 
         let persisted = PersistentBehaviorSlots::load(
             root.path(),
@@ -1974,6 +2096,10 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
         assert_eq!(persisted.active().manifest.sequence, 1);
+        assert_eq!(
+            persisted.active().manifest.build_id,
+            "invalid-output-normal"
+        );
         assert_eq!(persisted.accepted_sequence(), 2);
     }
 

@@ -9,14 +9,14 @@ pub const HEADERS_SIZE_LIMIT: usize = 10_000;
 pub const BODY_SIZE_LIMIT: usize = 10_000;
 const TRUNCATION_MARK: &str = "...[truncated]";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HttpStatus {
     Finished,
     Failed,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HttpTimings {
     pub total: Option<u64>,
@@ -27,7 +27,7 @@ pub struct HttpTimings {
     pub download: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsSubject {
     #[serde(rename = "CN", skip_serializing_if = "Option::is_none")]
     pub cn: Option<String>,
@@ -35,7 +35,7 @@ pub struct TlsSubject {
     pub alt: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsIssuer {
     #[serde(rename = "CN", skip_serializing_if = "Option::is_none")]
     pub cn: Option<String>,
@@ -45,7 +45,7 @@ pub struct TlsIssuer {
     pub c: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TlsInfo {
     pub authorized: bool,
@@ -62,7 +62,7 @@ pub struct TlsInfo {
     pub public_key: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParsedHttp {
     pub status: HttpStatus,

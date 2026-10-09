@@ -155,7 +155,8 @@ mod component {
     impl Guest for Behavior {
         #[cfg(not(any(
             feature = "post-start-fault-fixture",
-            feature = "post-start-divergence-fixture"
+            feature = "post-start-divergence-fixture",
+            feature = "post-start-invalid-output-fixture"
         )))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
@@ -207,7 +208,8 @@ mod component {
 
         #[cfg(all(
             feature = "post-start-fault-fixture",
-            not(feature = "post-start-divergence-fixture")
+            not(feature = "post-start-divergence-fixture"),
+            not(feature = "post-start-invalid-output-fixture")
         ))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
@@ -267,7 +269,10 @@ mod component {
             ))
         }
 
-        #[cfg(feature = "post-start-divergence-fixture")]
+        #[cfg(all(
+            feature = "post-start-divergence-fixture",
+            not(feature = "post-start-invalid-output-fixture")
+        ))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
                 return Err(BehaviorError::InvalidJob(
@@ -282,7 +287,7 @@ mod component {
                 ));
             }
 
-            let _ = match job.kind {
+            let result = match job.kind {
                 MeasurementKind::Dns => dns::run(
                     &job.token,
                     measurement.trace,
@@ -314,7 +319,76 @@ mod component {
                     )
                 }
             }?;
-            Ok(r#"{"__intentionalDivergence":true}"#.to_string())
+            let mut value: serde_json::Value = serde_json::from_str(&result)
+                .map_err(|error| BehaviorError::Internal(error.to_string()))?;
+            let raw_output = value
+                .get("rawOutput")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let divergent_raw = if raw_output.is_empty() {
+                "__intentional_divergence__".to_string()
+            } else {
+                alloc::format!("{raw_output}\n__intentional_divergence__")
+            };
+            let object = value.as_object_mut().ok_or_else(|| {
+                BehaviorError::Internal("measurement result is not an object".to_string())
+            })?;
+            object.insert(
+                "rawOutput".to_string(),
+                serde_json::Value::String(divergent_raw),
+            );
+            serde_json::to_string(&value)
+                .map_err(|error| BehaviorError::Internal(error.to_string()))
+        }
+
+        #[cfg(feature = "post-start-invalid-output-fixture")]
+        fn handle(job: Job) -> Result<String, BehaviorError> {
+            if job.measurement_json.is_empty() {
+                return Err(BehaviorError::InvalidJob(
+                    "measurement request is empty".to_string(),
+                ));
+            }
+            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
+                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
+            if measurement.target.is_empty() {
+                return Err(BehaviorError::InvalidJob(
+                    "measurement target is empty".to_string(),
+                ));
+            }
+
+            let _real_result = match job.kind {
+                MeasurementKind::Dns => dns::run(
+                    &job.token,
+                    measurement.trace,
+                    measurement.in_progress_updates,
+                ),
+                MeasurementKind::Ping => ping::run(
+                    &job.token,
+                    measurement.in_progress_updates,
+                    measurement
+                        .protocol
+                        .as_deref()
+                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
+                ),
+                MeasurementKind::Traceroute => {
+                    traceroute::run(&job.token, measurement.in_progress_updates)
+                }
+                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
+                MeasurementKind::Http => {
+                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
+                    let method = measurement
+                        .request
+                        .as_ref()
+                        .map_or("HEAD", |request| request.method.as_str());
+                    http::run(
+                        &job.token,
+                        protocol,
+                        method,
+                        measurement.in_progress_updates,
+                    )
+                }
+            }?;
+            Ok(r#"{"__intentionalInvalidOutput":true}"#.to_string())
         }
 
         fn self_test() -> Result<(), String> {

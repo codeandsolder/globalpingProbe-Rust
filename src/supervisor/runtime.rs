@@ -55,7 +55,7 @@ impl std::fmt::Display for RuntimeError {
                 "behavior component reported an internal failure: {error}"
             ),
             Self::GuestInvalidOutput(error) => {
-                write!(f, "behavior component returned invalid JSON: {error}")
+                write!(f, "behavior component returned invalid output: {error}")
             }
             Self::Policy(error) => write!(f, "behavior component violated host policy: {error}"),
             Self::Job(error) => write!(f, "behavior component job failed: {error}"),
@@ -270,6 +270,14 @@ mod differential_tests {
     use globalping_behavior_core::mtr::{MtrEnrichmentEntry, MtrEnrichmentMap, render_progress};
 
     const COMPONENT_ENV: &str = "GLOBALPING_BEHAVIOR_COMPONENT";
+
+    #[test]
+    fn health_fault_attribution_distinguishes_malformed_output_from_ambiguous_guest_internal() {
+        assert!(
+            RuntimeError::GuestInvalidOutput("fixture".to_string()).is_component_health_fault()
+        );
+        assert!(!RuntimeError::GuestInternal("fixture".to_string()).is_component_health_fault());
+    }
 
     #[derive(Clone, Copy)]
     enum FixtureKind {

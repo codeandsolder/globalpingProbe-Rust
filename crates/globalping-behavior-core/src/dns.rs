@@ -2,16 +2,16 @@ use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 use core::net::IpAddr;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsStatus {
     Finished,
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsAnswer {
     pub name: String,
     #[serde(rename = "type")]
@@ -21,12 +21,12 @@ pub struct DnsAnswer {
     pub value: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DnsTimings {
     pub total: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClassicResult {
     pub status: DnsStatus,
@@ -40,14 +40,14 @@ pub struct ClassicResult {
     pub raw_output: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceHop {
     pub answers: Vec<DnsAnswer>,
     pub timings: DnsTimings,
     pub resolver: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraceResult {
     pub status: DnsStatus,

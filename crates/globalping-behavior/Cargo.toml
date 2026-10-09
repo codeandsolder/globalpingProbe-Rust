@@ -24,6 +24,7 @@ unimplemented = "deny"
 default = []
 post-start-fault-fixture = []
 post-start-divergence-fixture = []
+post-start-invalid-output-fixture = []
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
