@@ -20,7 +20,12 @@ use crate::util::resolve_target::{
     ResolveTargetError, ResolvedTarget, resolve_command_target, reverse_lookup,
 };
 use crate::util::validate::is_safe_host;
-use parse::{ParsedTraceroute, TracerouteStatus, parse};
+use globalping_behavior_core::traceroute::{
+    TracerouteExecutionStatus, TracerouteHostnames, TracerouteIdentity, failed_traceroute,
+    line_addresses, normalize_numeric_output as core_normalize_numeric_output,
+    shape_traceroute_output as core_shape_traceroute_output,
+};
+use parse::ParsedTraceroute;
 
 const TRACEROUTE_PACKETS: u8 = 2;
 
@@ -108,24 +113,24 @@ impl TracerouteCommand {
 }
 
 pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedTraceroute {
-    ParsedTraceroute {
-        status: TracerouteStatus::Failed,
-        failure_source: Some(error.failure_source_or("resolver").to_string()),
-        raw_output: error.public_message(),
-        resolved_address: None,
-        resolved_hostname: None,
-        hops: vec![],
-    }
+    failed_traceroute(error.failure_source_or("resolver"), error.public_message())
 }
 
 fn line_ip_tokens(line: &str) -> Vec<IpAddr> {
-    line.split_whitespace()
-        .filter_map(|token| {
-            token
-                .trim_matches(|ch| matches!(ch, '(' | ')' | ',' | '[' | ']'))
-                .parse()
-                .ok()
-        })
+    line_addresses(line)
+}
+
+fn core_identity(target: &ResolvedTarget) -> TracerouteIdentity<'_> {
+    TracerouteIdentity {
+        address: target.address,
+        hostname: &target.hostname,
+    }
+}
+
+fn core_hostnames(hostnames: &HashMap<IpAddr, String>) -> TracerouteHostnames {
+    hostnames
+        .iter()
+        .map(|(address, hostname)| (*address, hostname.clone()))
         .collect()
 }
 
@@ -134,37 +139,7 @@ pub(crate) fn normalize_numeric_output(
     target: &ResolvedTarget,
     hostnames: &HashMap<IpAddr, String>,
 ) -> String {
-    let address = target.address.to_string();
-    let mut lines = raw.lines();
-    let Some(first) = lines.next() else {
-        return String::new();
-    };
-    let header = first.replacen(
-        &format!("traceroute to {address} ({address})"),
-        &format!("traceroute to {} ({address})", target.hostname),
-        1,
-    );
-    let mut output = vec![header];
-
-    for (index, line) in lines.enumerate() {
-        let mut normalized = line.to_string();
-        for ip in line_ip_tokens(line) {
-            let ip_text = ip.to_string();
-            let hostname = if index == 0 {
-                "_gateway".to_string()
-            } else if ip == target.address {
-                target.hostname.clone()
-            } else {
-                hostnames
-                    .get(&ip)
-                    .cloned()
-                    .unwrap_or_else(|| ip_text.clone())
-            };
-            normalized = normalized.replacen(&ip_text, &format!("{hostname} ({ip_text})"), 1);
-        }
-        output.push(normalized);
-    }
-    output.join("\n")
+    core_normalize_numeric_output(raw, core_identity(target), &core_hostnames(hostnames))
 }
 
 type TracerouteLookupCell = Arc<OnceCell<Option<String>>>;
@@ -247,34 +222,6 @@ pub(crate) async fn enrich_hostnames(
     TracerouteEnrichmentBroker::default()
         .enrich_raw(raw, target, budget)
         .await
-}
-
-fn timeout_failure_source(
-    raw: &str,
-    parsed: &ParsedTraceroute,
-    target: &ResolvedTarget,
-) -> &'static str {
-    let target_address = target.address.to_string();
-    let target_responded = parsed.hops.last().is_some_and(|hop| {
-        hop.resolved_address.as_deref() == Some(target_address.as_str()) && !hop.timings.is_empty()
-    });
-    if target_responded {
-        return "internal";
-    }
-    if raw.lines().skip(1).any(|line| line.contains('*')) {
-        "target"
-    } else {
-        "internal"
-    }
-}
-
-fn has_upstream_unreachable(output: &str) -> bool {
-    output.split_whitespace().any(|token| {
-        matches!(token, "!N" | "!H" | "!P" | "!X" | "!S" | "!F" | "!V" | "!C")
-            || token.strip_prefix('!').is_some_and(|suffix| {
-                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-            })
-    })
 }
 
 pub(crate) struct NativeTraceOutput {
@@ -383,44 +330,16 @@ pub(crate) fn shape_traceroute_output(
     target: &ResolvedTarget,
     hostnames: &HashMap<IpAddr, String>,
 ) -> ParsedTraceroute {
-    let normalized = normalize_numeric_output(raw, target, hostnames);
-    let mut parsed = parse(&normalized);
-    parsed.resolved_address = Some(target.address.to_string());
-    parsed.resolved_hostname = Some(target.hostname.clone());
-
-    if timed_out {
-        parsed.status = TracerouteStatus::Failed;
-        parsed.failure_source = Some(timeout_failure_source(raw, &parsed, target).to_string());
-        let mut timeout_raw = raw.to_string();
-        if !timeout_raw.is_empty() {
-            timeout_raw.push_str("\n\n");
-        }
-        timeout_raw.push_str("The measurement command timed out.");
-        parsed.raw_output = normalize_numeric_output(&timeout_raw, target, hostnames);
-    } else if succeeded == Some(false) {
-        parsed.status = TracerouteStatus::Failed;
-        parsed.failure_source = Some(
-            if has_upstream_unreachable(&normalized) {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-        if parsed.raw_output.trim().is_empty() {
-            parsed.raw_output = if stderr.trim().is_empty() {
-                "Test failed. Please try again.".to_string()
-            } else {
-                stderr.to_string()
-            };
-        }
-    } else if parsed.status == TracerouteStatus::Failed {
-        parsed.failure_source = Some("internal".to_string());
-        if parsed.raw_output.trim().is_empty() {
-            parsed.raw_output = "Test failed. Please try again.".to_string();
-        }
-    }
-    parsed
+    core_shape_traceroute_output(
+        raw,
+        stderr,
+        TracerouteExecutionStatus {
+            timed_out,
+            succeeded,
+        },
+        core_identity(target),
+        &core_hostnames(hostnames),
+    )
 }
 
 async fn run_traceroute(

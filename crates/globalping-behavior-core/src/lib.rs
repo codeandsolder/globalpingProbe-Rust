@@ -9,3 +9,4 @@ pub mod ip;
 pub mod mtr;
 
 pub mod ping;
+pub mod traceroute;
