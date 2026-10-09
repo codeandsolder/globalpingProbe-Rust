@@ -280,6 +280,8 @@ static FORCE_BEHAVIOR_SHADOW_DIVERGENCE: AtomicBool = AtomicBool::new(false);
 static FORCED_BEHAVIOR_SHADOW_MATCHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BEHAVIOR_PRESTART_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BEHAVIOR_COMPONENT_AUTHORITIES: AtomicUsize = AtomicUsize::new(0);
 
 const fn behavior_error_health_event(error: &RuntimeError) -> ShadowHealthEvent {
     if error.is_component_health_fault() {
@@ -287,6 +289,28 @@ const fn behavior_error_health_event(error: &RuntimeError) -> ShadowHealthEvent 
     } else {
         ShadowHealthEvent::Inconclusive
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BehaviorResultAuthority {
+    Component,
+    NativeFallback,
+}
+
+fn select_behavior_result(result: BehaviorShadowResult) -> (Value, BehaviorResultAuthority) {
+    let BehaviorShadowResult {
+        native,
+        native_error,
+        component,
+        ..
+    } = result;
+    if native_error.is_none()
+        && let Ok(component) = component
+        && component == native
+    {
+        return (component, BehaviorResultAuthority::Component);
+    }
+    (native, BehaviorResultAuthority::NativeFallback)
 }
 
 fn classify_behavior_health(
@@ -412,7 +436,23 @@ async fn run_behavior_measurement(
     apply_behavior_health(controller, sequence, health_event).await;
 
     Some(match shadow_result {
-        Ok(result) => Ok(result.native),
+        Ok(result) => {
+            let (value, authority) = select_behavior_result(result);
+            #[cfg(test)]
+            if authority == BehaviorResultAuthority::Component {
+                BEHAVIOR_COMPONENT_AUTHORITIES.fetch_add(1, Ordering::SeqCst);
+            }
+            debug!(
+                target: "behavior-shadow",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = %build_id,
+                ?authority,
+                "Selected final measurement result."
+            );
+            Ok(value)
+        }
         Err(error) => Err(error),
     })
 }
@@ -1155,8 +1195,9 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 /// Connect to the Globalping API with an optional trusted behavior controller.
 ///
 /// The controller supplies only verified/self-tested behavior executors. When
-/// enabled, WASM observes the same supervisor-owned native execution; native
-/// result/progress remain authoritative until the behavior authority switch.
+/// enabled, WASM and the native oracle share one supervisor-owned execution.
+/// Exact WASM results are admitted as final output; divergence/faults use the
+/// already-computed native oracle, and native progress remains authoritative.
 ///
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
@@ -1507,6 +1548,95 @@ mod tests {
         ));
     }
 
+    fn behavior_result(
+        native: Value,
+        component: Result<Value, RuntimeError>,
+        native_error: Option<String>,
+    ) -> BehaviorShadowResult {
+        BehaviorShadowResult {
+            native,
+            native_error,
+            component,
+            progress: Vec::new(),
+            progress_during_native_execution: false,
+        }
+    }
+
+    #[test]
+    fn exact_behavior_result_becomes_authoritative() {
+        let value = json!({"status": "finished", "rawOutput": "same"});
+        let (selected, authority) =
+            select_behavior_result(behavior_result(value.clone(), Ok(value.clone()), None));
+        assert_eq!(selected, value);
+        assert_eq!(authority, BehaviorResultAuthority::Component);
+    }
+
+    #[test]
+    fn divergent_behavior_result_uses_native_fallback() {
+        let native = json!({"status": "finished", "rawOutput": "native"});
+        let component = json!({"status": "finished", "rawOutput": "component"});
+        let (selected, authority) =
+            select_behavior_result(behavior_result(native.clone(), Ok(component), None));
+        assert_eq!(selected, native);
+        assert_eq!(authority, BehaviorResultAuthority::NativeFallback);
+    }
+
+    #[test]
+    fn behavior_fault_uses_native_fallback() {
+        let native = json!({"status": "finished", "rawOutput": "native"});
+        let component = Err(RuntimeError::GuestInvalidJob("fixture fault".to_string()));
+        let (selected, authority) =
+            select_behavior_result(behavior_result(native.clone(), component, None));
+        assert_eq!(selected, native);
+        assert_eq!(authority, BehaviorResultAuthority::NativeFallback);
+    }
+
+    #[test]
+    fn native_failure_remains_authoritative() {
+        let native = json!({
+            "status": "failed", "failureSource": "internal", "rawOutput": "native failed"
+        });
+        let (selected, authority) = select_behavior_result(behavior_result(
+            native.clone(),
+            Ok(native.clone()),
+            Some("native failed".to_string()),
+        ));
+        assert_eq!(selected, native);
+        assert_eq!(authority, BehaviorResultAuthority::NativeFallback);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn live_behavior_cases() -> [Value; 6] {
+        [
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "ICMP",
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "dns", "target": "example.com", "protocol": "UDP", "port": 53,
+                "resolver": null, "trace": false, "query": {"type": "A"},
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "traceroute", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "mtr", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "http", "target": "example.com", "protocol": "HTTPS",
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true,
+                "request": {"method": "GET", "path": "/", "query": "", "headers": {}}
+            }),
+        ]
+    }
+
     #[cfg(target_os = "linux")]
     fn health_test_signing_key() -> SigningKey {
         SigningKey::from_bytes(&[0x47; 32])
@@ -1535,6 +1665,58 @@ mod tests {
         };
         manifest.signature = hex::encode(signing_key.sign(&manifest.signing_payload()).to_bytes());
         (manifest, component)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
+    async fn live_exact_behavior_results_are_selected_for_all_six_measurements() {
+        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key());
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+        let (manifest, component) =
+            signed_health_test_component(&component_path, 1, "authority-healthy");
+        controller
+            .activate_candidate(manifest, component)
+            .await
+            .unwrap_or_else(|error| panic!("behavior activation failed: {error}"));
+
+        BEHAVIOR_COMPONENT_AUTHORITIES.store(0, Ordering::SeqCst);
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        for (index, measurement) in live_behavior_cases().into_iter().enumerate() {
+            let measurement_type = measurement["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("test measurement is missing type"));
+            let selected = run_behavior_measurement(
+                Some(&controller),
+                &measurement,
+                &format!("authority-{index}-{measurement_type}"),
+                measurement_type,
+                None,
+            )
+            .await
+            .unwrap_or_else(|| panic!("active behavior executor must exist"))
+            .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+            assert!(selected.get("status").is_some());
+        }
+
+        assert_eq!(BEHAVIOR_COMPONENT_AUTHORITIES.load(Ordering::SeqCst), 6);
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(1));
+        assert_eq!(health.matches, 6);
+        assert_eq!(health.consecutive_faults, 0);
+        assert_eq!(health.divergences, 0);
+        assert_eq!(health.runtime_faults, 0);
+        assert_eq!(health.inconclusive, 0);
     }
 
     #[cfg(target_os = "linux")]
@@ -1579,34 +1761,7 @@ mod tests {
         FORCE_BEHAVIOR_SHADOW_DIVERGENCE.store(true, Ordering::SeqCst);
         let _forced_divergence = ForcedDivergenceGuard;
 
-        let cases = [
-            json!({
-                "type": "ping", "target": "1.1.1.1", "protocol": "ICMP",
-                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
-            }),
-            json!({
-                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
-                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
-            }),
-            json!({
-                "type": "dns", "target": "example.com", "protocol": "UDP", "port": 53,
-                "resolver": null, "trace": false, "query": {"type": "A"},
-                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
-            }),
-            json!({
-                "type": "traceroute", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
-                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
-            }),
-            json!({
-                "type": "mtr", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
-                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
-            }),
-            json!({
-                "type": "http", "target": "example.com", "protocol": "HTTPS",
-                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true,
-                "request": {"method": "GET", "path": "/", "query": "", "headers": {}}
-            }),
-        ];
+        let cases = live_behavior_cases();
         for (index, measurement) in cases.into_iter().enumerate() {
             let measurement_type = measurement["type"]
                 .as_str()
