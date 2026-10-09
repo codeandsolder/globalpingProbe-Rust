@@ -1509,7 +1509,11 @@ no answer yet for icmp_seq=1\n\
                 .unwrap_or("unknown")
                 .to_string();
             let shadow = run_real_host_shadow(measurement).await;
-            assert_eq!(shadow.component, shadow.native, "{kind} shadow mismatch");
+            let component = shadow
+                .component
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
+            assert_eq!(component, &shadow.native, "{kind} shadow mismatch");
             assert!(
                 !shadow.progress.is_empty(),
                 "{kind} should emit progress through the real host adapter"
@@ -1580,18 +1584,19 @@ no answer yet for icmp_seq=1\n\
                 .unwrap_or("unknown")
                 .to_string();
             let shadow = run_real_host_shadow(measurement).await;
+            let component = shadow
+                .component
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
             assert_eq!(
-                shadow.component, shadow.native,
+                component, &shadow.native,
                 "{kind} resolution failure mismatch"
             );
-            assert_eq!(shadow.component["status"], "failed");
-            assert_eq!(shadow.component["failureSource"], "target");
-            assert_eq!(
-                shadow.component["rawOutput"],
-                "Private IP ranges are not allowed."
-            );
-            assert!(shadow.component["resolvedAddress"].is_null());
-            assert!(shadow.component["resolvedHostname"].is_null());
+            assert_eq!(component["status"], "failed");
+            assert_eq!(component["failureSource"], "target");
+            assert_eq!(component["rawOutput"], "Private IP ranges are not allowed.");
+            assert!(component["resolvedAddress"].is_null());
+            assert!(component["resolvedHostname"].is_null());
             assert!(shadow.progress.is_empty());
             assert!(!shadow.progress_during_native_execution);
         }
@@ -1612,7 +1617,11 @@ no answer yet for icmp_seq=1\n\
             "inProgressUpdates": true
         }))
         .await;
-        assert_eq!(shadow.component, shadow.native);
+        let component = shadow
+            .component
+            .as_ref()
+            .unwrap_or_else(|error| panic!("component failed: {error}"));
+        assert_eq!(component, &shadow.native);
         assert!(!shadow.progress.is_empty());
         assert!(
             shadow.progress_during_native_execution,

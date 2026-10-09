@@ -36,6 +36,7 @@ use crate::status::{
 };
 use crate::supervisor::bootstrap::{BehaviorController, BehaviorHealthAction};
 use crate::supervisor::health::ShadowHealthEvent;
+use crate::supervisor::runtime::{BehaviorShadowResult, RuntimeError};
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -277,45 +278,43 @@ async fn apply_behavior_health(
 static FORCE_BEHAVIOR_SHADOW_DIVERGENCE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static FORCED_BEHAVIOR_SHADOW_MATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BEHAVIOR_PRESTART_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
-fn spawn_behavior_shadow(
-    behavior_controller: Option<Arc<BehaviorController>>,
-    measurement: &Value,
+const fn behavior_error_health_event(error: &RuntimeError) -> ShadowHealthEvent {
+    if error.is_component_health_fault() {
+        ShadowHealthEvent::RuntimeFault
+    } else {
+        ShadowHealthEvent::Inconclusive
+    }
+}
+
+fn classify_behavior_health(
+    result: &Result<BehaviorShadowResult, RuntimeError>,
     measurement_id: &str,
     measurement_type: &str,
-    shadow_jobs: &ActiveJobs,
-) {
-    let Some(controller) = behavior_controller else {
-        return;
-    };
-    let shadow_measurement = measurement.clone();
-    let shadow_mid = measurement_id.to_string();
-    let shadow_type = measurement_type.to_string();
-    let shadow_job = shadow_jobs.start();
-    tokio::spawn(async move {
-        let _shadow_job = shadow_job;
-        let Some(shadow) = controller.executor().await else {
-            return;
-        };
-        let sequence = shadow.sequence();
-        let build_id = shadow.build_id().to_string();
-        let shadow_result = shadow.run(shadow_measurement).await;
-        #[cfg(test)]
-        let shadow_result = shadow_result.map(|mut result| {
-            if FORCE_BEHAVIOR_SHADOW_DIVERGENCE.load(Ordering::SeqCst) {
-                if result.component == result.native {
-                    FORCED_BEHAVIOR_SHADOW_MATCHES.fetch_add(1, Ordering::SeqCst);
-                }
-                result.component = json!({"__forcedHealthTestDivergence": true});
-            }
-            result
-        });
-        let health_event = match shadow_result {
-            Ok(result) if result.component == result.native => {
+    sequence: u64,
+    build_id: &str,
+) -> ShadowHealthEvent {
+    match result {
+        Ok(result) if result.native_error.is_some() => {
+            warn!(
+                target: "behavior-shadow",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                native_error = result.native_error.as_deref().unwrap_or("unknown native failure"),
+                "Native execution failed while behavior diagnostics were active."
+            );
+            ShadowHealthEvent::Inconclusive
+        }
+        Ok(result) => match &result.component {
+            Ok(component) if component == &result.native => {
                 debug!(
                     target: "behavior-shadow",
-                    measurement_id = %shadow_mid,
-                    measurement_type = %shadow_type,
+                    measurement_id,
+                    measurement_type,
                     behavior_sequence = sequence,
                     behavior_build_id = build_id,
                     progress_events = result.progress.len(),
@@ -324,13 +323,13 @@ fn spawn_behavior_shadow(
                 );
                 ShadowHealthEvent::Match
             }
-            Ok(result) => {
+            Ok(_) => {
                 warn!(
                     target: "behavior-shadow",
-                    measurement_id = %shadow_mid,
-                    measurement_type = %shadow_type,
+                    measurement_id,
+                    measurement_type,
                     behavior_sequence = sequence,
-                    behavior_build_id = %build_id,
+                    behavior_build_id = build_id,
                     progress_events = result.progress.len(),
                     streamed_progress = result.progress_during_native_execution,
                     "Behavior shadow diverged from its native oracle."
@@ -338,26 +337,123 @@ fn spawn_behavior_shadow(
                 ShadowHealthEvent::Divergence
             }
             Err(error) => {
-                let health_event = if error.is_component_health_fault() {
-                    ShadowHealthEvent::RuntimeFault
-                } else {
-                    ShadowHealthEvent::Inconclusive
-                };
+                let event = behavior_error_health_event(error);
                 warn!(
                     target: "behavior-shadow",
-                    measurement_id = %shadow_mid,
-                    measurement_type = %shadow_type,
+                    measurement_id,
+                    measurement_type,
                     behavior_sequence = sequence,
-                    behavior_build_id = %build_id,
+                    behavior_build_id = build_id,
                     component_health_fault = error.is_component_health_fault(),
                     %error,
-                    "Behavior shadow execution failed."
+                    "Behavior shadow failed after native execution started."
                 );
-                health_event
+                event
             }
-        };
-        apply_behavior_health(&controller, sequence, health_event).await;
-    });
+        },
+        Err(error) => {
+            let event = behavior_error_health_event(error);
+            warn!(
+                target: "behavior-shadow",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                component_health_fault = error.is_component_health_fault(),
+                %error,
+                "Behavior shadow failed before native execution started."
+            );
+            event
+        }
+    }
+}
+
+async fn run_behavior_measurement(
+    behavior_controller: Option<&Arc<BehaviorController>>,
+    measurement: &Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    native_progress_tx: Option<ProgressTx>,
+) -> Option<Result<Value, RuntimeError>> {
+    let controller = behavior_controller?;
+    let shadow = controller.executor().await?;
+    let sequence = shadow.sequence();
+    let build_id = shadow.build_id().to_string();
+    let shadow_result = shadow
+        .run_with_native_progress(measurement.clone(), native_progress_tx)
+        .await;
+
+    #[cfg(test)]
+    let shadow_result = {
+        let mut shadow_result = shadow_result;
+        if let Ok(result) = &mut shadow_result {
+            if FORCE_BEHAVIOR_SHADOW_DIVERGENCE.load(Ordering::SeqCst) {
+                if result.native_error.is_none()
+                    && result
+                        .component
+                        .as_ref()
+                        .is_ok_and(|component| component == &result.native)
+                {
+                    FORCED_BEHAVIOR_SHADOW_MATCHES.fetch_add(1, Ordering::SeqCst);
+                }
+                result.component = Ok(json!({"__forcedHealthTestDivergence": true}));
+            }
+        }
+        shadow_result
+    };
+
+    let health_event = classify_behavior_health(
+        &shadow_result,
+        measurement_id,
+        measurement_type,
+        sequence,
+        &build_id,
+    );
+    apply_behavior_health(controller, sequence, health_event).await;
+
+    Some(match shadow_result {
+        Ok(result) => Ok(result.native),
+        Err(error) => Err(error),
+    })
+}
+
+async fn run_measurement(
+    cmd: &CommandKind,
+    measurement: Value,
+    behavior_controller: Option<&Arc<BehaviorController>>,
+    measurement_id: &str,
+    measurement_type: &str,
+    progress_tx: Option<ProgressTx>,
+) -> Result<Value> {
+    if let Some(shared) = run_behavior_measurement(
+        behavior_controller,
+        &measurement,
+        measurement_id,
+        measurement_type,
+        progress_tx.clone(),
+    )
+    .await
+    {
+        match shared {
+            Ok(native) => return Ok(native),
+            Err(error) => {
+                #[cfg(test)]
+                BEHAVIOR_PRESTART_FALLBACKS.fetch_add(1, Ordering::SeqCst);
+                warn!(
+                    target: "behavior-shadow",
+                    measurement_id,
+                    measurement_type,
+                    %error,
+                    "Behavior failed before native execution started; falling back to the ordinary native path."
+                );
+            }
+        }
+    }
+
+    match progress_tx {
+        Some(tx) => cmd.run_with_progress(measurement, tx).await,
+        None => cmd.run(measurement).await,
+    }
 }
 
 /// Run one measurement job and emit the result back to the API.
@@ -371,7 +467,6 @@ pub async fn dispatch(
     status_manager: Arc<Mutex<StatusManager>>,
     jobs: ActiveJobs,
     behavior_controller: Option<Arc<BehaviorController>>,
-    shadow_jobs: ActiveJobs,
 ) {
     let mid = req.measurement_id.clone();
     let tid = req.test_id.clone();
@@ -394,14 +489,6 @@ pub async fn dispatch(
     };
     let _job = jobs.start();
 
-    spawn_behavior_shadow(
-        behavior_controller,
-        &req.measurement,
-        &mid,
-        mtype,
-        &shadow_jobs,
-    );
-
     let in_progress = req
         .measurement
         .get("inProgressUpdates")
@@ -416,11 +503,27 @@ pub async fn dispatch(
             let mode = cmd.progress_mode(&req.measurement);
             let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone(), mode);
             let emitter_task = tokio::spawn(emitter.forward(rx));
-            let result = cmd.run_with_progress(req.measurement.clone(), tx).await;
+            let result = run_measurement(
+                &cmd,
+                req.measurement.clone(),
+                behavior_controller.as_ref(),
+                &mid,
+                mtype,
+                Some(tx),
+            )
+            .await;
             let _ = emitter_task.await;
             result
         } else {
-            cmd.run(req.measurement.clone()).await
+            run_measurement(
+                &cmd,
+                req.measurement.clone(),
+                behavior_controller.as_ref(),
+                &mid,
+                mtype,
+                None,
+            )
+            .await
         }
     };
 
@@ -614,7 +717,6 @@ struct ConnectionHandlers {
     adoption: Arc<AdoptionServer>,
     is_hardware: bool,
     jobs: ActiveJobs,
-    shadow_jobs: ActiveJobs,
     behavior_controller: Option<Arc<BehaviorController>>,
     signal: OutcomeSignal,
     already_connected: Arc<AtomicBool>,
@@ -634,7 +736,6 @@ impl ConnectionHandlers {
             adoption,
             is_hardware,
             jobs: ActiveJobs::new(),
-            shadow_jobs: ActiveJobs::new(),
             behavior_controller,
             signal: OutcomeSignal::new(),
             already_connected: Arc::new(AtomicBool::new(false)),
@@ -867,7 +968,6 @@ fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Clie
                 state.status_manager,
                 state.jobs,
                 state.behavior_controller,
-                state.shadow_jobs,
             ));
         }
         Err(error) => warn!("Bad measurement request: {error}"),
@@ -981,19 +1081,15 @@ async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_ti
         .await
         .ok();
     let active_jobs = state.jobs.count();
-    let active_shadows = state.shadow_jobs.count();
-    if active_jobs + active_shadows > 0
-        && tokio::time::timeout(drain_timeout, async {
-            tokio::join!(state.jobs.wait_idle(), state.shadow_jobs.wait_idle());
-        })
-        .await
-        .is_err()
+    if active_jobs > 0
+        && tokio::time::timeout(drain_timeout, state.jobs.wait_idle())
+            .await
+            .is_err()
     {
         warn!(
-            "Shutdown timeout after {}s with {} active jobs and {} behavior shadows. Force closing.",
+            "Shutdown timeout after {}s with {} active jobs. Force closing.",
             drain_timeout.as_secs(),
-            state.jobs.count(),
-            state.shadow_jobs.count()
+            state.jobs.count()
         );
     }
     flush_logs(socket).await;
@@ -1058,9 +1154,9 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 
 /// Connect to the Globalping API with an optional trusted behavior controller.
 ///
-/// The controller supplies only verified/self-tested behavior executors. Shadows
-/// never replace the native result or progress path and are drained separately
-/// during shutdown.
+/// The controller supplies only verified/self-tested behavior executors. When
+/// enabled, WASM observes the same supervisor-owned native execution; native
+/// result/progress remain authoritative until the behavior authority switch.
 ///
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
@@ -1511,20 +1607,20 @@ mod tests {
                 "request": {"method": "GET", "path": "/", "query": "", "headers": {}}
             }),
         ];
-        let shadow_jobs = ActiveJobs::new();
-
         for (index, measurement) in cases.into_iter().enumerate() {
             let measurement_type = measurement["type"]
                 .as_str()
                 .unwrap_or_else(|| panic!("test measurement is missing type"));
-            spawn_behavior_shadow(
-                Some(Arc::clone(&controller)),
+            let shared = run_behavior_measurement(
+                Some(&controller),
                 &measurement,
                 &format!("health-{index}-{measurement_type}"),
                 measurement_type,
-                &shadow_jobs,
-            );
-            shadow_jobs.wait_idle().await;
+                None,
+            )
+            .await
+            .unwrap_or_else(|| panic!("active behavior executor must exist"));
+            shared.unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
 
             if index < 5 {
                 assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
@@ -1571,6 +1667,61 @@ mod tests {
         assert_eq!(persisted.active().manifest.build_id, "health-normal");
         assert_eq!(persisted.accepted_sequence(), 2);
         assert!(persisted.previous().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus a post-start-fault WASIp2 behavior fixture"]
+    async fn live_post_start_behavior_fault_preserves_native_without_fallback() {
+        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_FAULT_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_FAULT_COMPONENT must point to the fault fixture")
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key());
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+        let (manifest, component) =
+            signed_health_test_component(&component_path, 1, "post-start-fault");
+        controller
+            .activate_candidate(manifest, component)
+            .await
+            .unwrap_or_else(|error| panic!("fault fixture activation failed: {error}"));
+
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        let measurement = json!({
+            "type": "ping",
+            "target": "1.1.1.1",
+            "protocol": "TCP",
+            "port": 443,
+            "packets": 1,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": false
+        });
+        let result = run_measurement(
+            &CommandKind::Ping,
+            measurement,
+            Some(&controller),
+            "post-start-fault",
+            "ping",
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("shared native execution failed: {error}"));
+
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        assert!(result.get("status").is_some());
+        assert!(result.get("rawOutput").is_some());
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(1));
+        assert_eq!(health.consecutive_faults, 1);
+        assert_eq!(health.runtime_faults, 1);
+        assert_eq!(health.divergences, 0);
+        assert_eq!(health.inconclusive, 0);
     }
 
     // ── Error message parsing via reconnect ───────────────────────────────────

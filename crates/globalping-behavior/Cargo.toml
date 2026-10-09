@@ -20,6 +20,10 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+[features]
+default = []
+post-start-fault-fixture = []
+
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

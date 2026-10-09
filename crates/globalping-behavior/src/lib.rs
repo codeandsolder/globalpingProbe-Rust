@@ -153,6 +153,7 @@ mod component {
     struct Behavior;
 
     impl Guest for Behavior {
+        #[cfg(not(feature = "post-start-fault-fixture"))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
                 return Err(BehaviorError::InvalidJob(
@@ -199,6 +200,58 @@ mod component {
                     )
                 }
             }
+        }
+
+        #[cfg(feature = "post-start-fault-fixture")]
+        fn handle(job: Job) -> Result<String, BehaviorError> {
+            if job.measurement_json.is_empty() {
+                return Err(BehaviorError::InvalidJob(
+                    "measurement request is empty".to_string(),
+                ));
+            }
+            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
+                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
+            if measurement.target.is_empty() {
+                return Err(BehaviorError::InvalidJob(
+                    "measurement target is empty".to_string(),
+                ));
+            }
+
+            let _ = match job.kind {
+                MeasurementKind::Dns => dns::run(
+                    &job.token,
+                    measurement.trace,
+                    measurement.in_progress_updates,
+                ),
+                MeasurementKind::Ping => ping::run(
+                    &job.token,
+                    measurement.in_progress_updates,
+                    measurement
+                        .protocol
+                        .as_deref()
+                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
+                ),
+                MeasurementKind::Traceroute => {
+                    traceroute::run(&job.token, measurement.in_progress_updates)
+                }
+                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
+                MeasurementKind::Http => {
+                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
+                    let method = measurement
+                        .request
+                        .as_ref()
+                        .map_or("HEAD", |request| request.method.as_str());
+                    http::run(
+                        &job.token,
+                        protocol,
+                        method,
+                        measurement.in_progress_updates,
+                    )
+                }
+            }?;
+            Err(BehaviorError::InvalidJob(
+                "intentional post-start health-test fault".to_string(),
+            ))
         }
 
         fn self_test() -> Result<(), String> {

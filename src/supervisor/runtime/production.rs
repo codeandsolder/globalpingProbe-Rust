@@ -6,40 +6,27 @@ use super::{
 #[derive(Debug)]
 pub struct BehaviorShadowResult {
     pub native: serde_json::Value,
-    pub component: serde_json::Value,
+    pub native_error: Option<String>,
+    pub component: Result<serde_json::Value, RuntimeError>,
     pub progress: Vec<(serde_json::Value, bool)>,
     pub progress_during_native_execution: bool,
 }
 
-#[derive(Clone, Debug)]
-enum ShadowOracle {
-    Ready(serde_json::Value),
-    Ping {
-        raw: String,
-        timed_out: bool,
-        target: crate::util::resolve_target::ResolvedTarget,
-    },
-    Traceroute {
-        raw: String,
-        stderr: String,
-        timed_out: bool,
-        succeeded: Option<bool>,
-        target: crate::util::resolve_target::ResolvedTarget,
-    },
-    Mtr {
-        raw: String,
-        stderr: String,
-        timed_out: bool,
-        target: crate::util::resolve_target::ResolvedTarget,
-    },
+type OracleResult = Result<serde_json::Value, String>;
+
+#[derive(Default)]
+struct OracleSlot {
+    result: std::sync::Mutex<Option<OracleResult>>,
+    ready: tokio::sync::Notify,
 }
 
-type OracleSlot = std::sync::Arc<std::sync::Mutex<Option<Result<ShadowOracle, String>>>>;
+type SharedOracleSlot = std::sync::Arc<OracleSlot>;
 
 struct StartedExecution {
     start: wit_host::ExecutionStartResult,
     events: tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>,
-    oracle: OracleSlot,
+    oracle: SharedOracleSlot,
+    traceroute_enrichment: Option<crate::command::traceroute::TracerouteEnrichmentBroker>,
     mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
 }
 
@@ -50,10 +37,9 @@ struct ProductionHost {
     native_progress_tx: Option<crate::command::ProgressTx>,
     progress: Vec<(serde_json::Value, bool)>,
     progress_during_native_execution: bool,
-    reverse_results: std::collections::HashMap<std::net::IpAddr, String>,
-    asn_results: std::collections::HashMap<std::net::IpAddr, Vec<u32>>,
+    traceroute_enrichment: Option<crate::command::traceroute::TracerouteEnrichmentBroker>,
     mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
-    oracle: Option<OracleSlot>,
+    oracle: Option<SharedOracleSlot>,
 }
 
 impl ProductionHost {
@@ -68,8 +54,7 @@ impl ProductionHost {
             native_progress_tx,
             progress: Vec::new(),
             progress_during_native_execution: false,
-            reverse_results: std::collections::HashMap::new(),
-            asn_results: std::collections::HashMap::new(),
+            traceroute_enrichment: None,
             mtr_enrichment: None,
             oracle: None,
         }
@@ -87,70 +72,6 @@ impl ProductionHost {
                 wit_host::HostErrorCode::InvalidToken,
                 "capability token mismatch",
             ))
-        }
-    }
-
-    fn oracle_result(&self) -> Result<serde_json::Value, String> {
-        let slot = self
-            .oracle
-            .as_ref()
-            .ok_or_else(|| "native shadow oracle was not initialized".to_string())?;
-        let oracle = {
-            let guard = slot
-                .lock()
-                .map_err(|_| "native shadow oracle lock was poisoned".to_string())?;
-            guard
-                .as_ref()
-                .ok_or_else(|| "native shadow oracle was not ready at terminal event".to_string())?
-                .clone()?
-        };
-        match &oracle {
-            ShadowOracle::Ready(value) => Ok(value.clone()),
-            ShadowOracle::Ping {
-                raw,
-                timed_out,
-                target,
-            } => serde_json::to_value(crate::command::ping::shape_ping_output(
-                raw,
-                &target.address.to_string(),
-                &target.hostname,
-                *timed_out,
-            ))
-            .map_err(|error| error.to_string()),
-            ShadowOracle::Traceroute {
-                raw,
-                stderr,
-                timed_out,
-                succeeded,
-                target,
-            } => serde_json::to_value(crate::command::traceroute::shape_traceroute_output(
-                raw,
-                stderr,
-                *timed_out,
-                *succeeded,
-                target,
-                &self.reverse_results,
-            ))
-            .map_err(|error| error.to_string()),
-            ShadowOracle::Mtr {
-                raw,
-                stderr,
-                timed_out,
-                target,
-            } => {
-                let enrichment = self.mtr_enrichment.as_ref().map_or_else(
-                    Default::default,
-                    crate::command::mtr::MtrEnrichmentBroker::snapshot,
-                );
-                serde_json::to_value(crate::command::mtr::shape_mtr_output(
-                    raw,
-                    stderr,
-                    *timed_out,
-                    target,
-                    &enrichment,
-                ))
-                .map_err(|error| error.to_string())
-            }
         }
     }
 }
@@ -226,8 +147,30 @@ fn execution_start(
     }
 }
 
-fn new_oracle_slot() -> OracleSlot {
-    std::sync::Arc::new(std::sync::Mutex::new(None))
+fn new_oracle_slot() -> SharedOracleSlot {
+    std::sync::Arc::new(OracleSlot::default())
+}
+
+fn read_oracle(slot: &SharedOracleSlot) -> Result<Option<OracleResult>, String> {
+    slot.result
+        .lock()
+        .map_err(|_| "native shadow oracle lock was poisoned".to_string())
+        .map(|guard| guard.clone())
+}
+
+fn oracle_pending(slot: &SharedOracleSlot) -> bool {
+    read_oracle(slot).is_ok_and(|result| result.is_none())
+}
+
+async fn wait_oracle(slot: &SharedOracleSlot) -> OracleResult {
+    loop {
+        let notified = slot.ready.notified();
+        match read_oracle(slot) {
+            Ok(Some(result)) => return result,
+            Ok(None) => notified.await,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 const fn resolution_failure_kind(
@@ -249,7 +192,7 @@ fn resolution_failed_execution_with_message(
 ) -> StartedExecution {
     let (_tx, events) = crate::command::RawExecutionTx::channel();
     let oracle = new_oracle_slot();
-    store_oracle(&oracle, Ok(ShadowOracle::Ready(native)));
+    store_oracle(&oracle, Ok(native));
     StartedExecution {
         start: wit_host::ExecutionStartResult::ResolutionFailed(wit_host::ResolutionFailure {
             kind: reason,
@@ -257,6 +200,7 @@ fn resolution_failed_execution_with_message(
         }),
         events,
         oracle,
+        traceroute_enrichment: None,
         mtr_enrichment: None,
     }
 }
@@ -268,9 +212,11 @@ fn resolution_failed_execution(
     resolution_failed_execution_with_message(reason, None, native)
 }
 
-fn store_oracle(slot: &OracleSlot, oracle: Result<ShadowOracle, String>) {
-    if let Ok(mut guard) = slot.lock() {
+fn store_oracle(slot: &SharedOracleSlot, oracle: OracleResult) {
+    if let Ok(mut guard) = slot.result.lock() {
         *guard = Some(oracle);
+        drop(guard);
+        slot.ready.notify_waiters();
     }
 }
 
@@ -340,17 +286,22 @@ async fn prepare_ping(
         match native {
             Ok(native) => {
                 let timed_out = native.timed_out;
-                store_oracle(
-                    &task_oracle,
-                    Ok(ShadowOracle::Ping {
-                        raw: native.raw,
-                        timed_out,
-                        target: task_target,
-                    }),
-                );
+                let shaped = serde_json::to_value(ping::shape_ping_output(
+                    &native.raw,
+                    &task_target.address.to_string(),
+                    &task_target.hostname,
+                    timed_out,
+                ));
+                match shaped {
+                    Ok(value) => store_oracle(&task_oracle, Ok(value)),
+                    Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+                }
                 send_terminal(&tx, timed_out, native.exit_code).await;
             }
-            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+            Err(error) => {
+                store_oracle(&task_oracle, Err(error.to_string()));
+                send_terminal(&tx, false, Some(1)).await;
+            }
         }
     });
     Ok(StartedExecution {
@@ -362,6 +313,7 @@ async fn prepare_ping(
         )),
         events,
         oracle,
+        traceroute_enrichment: None,
         mtr_enrichment: None,
     })
 }
@@ -404,7 +356,7 @@ fn prepare_dns(
                 };
                 match shaped {
                     Ok(value) => {
-                        store_oracle(&task_oracle, Ok(ShadowOracle::Ready(value)));
+                        store_oracle(&task_oracle, Ok(value));
                         send_terminal(
                             &tx,
                             native.timed_out,
@@ -419,7 +371,10 @@ fn prepare_dns(
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
                 }
             }
-            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+            Err(error) => {
+                store_oracle(&task_oracle, Err(error.to_string()));
+                send_terminal(&tx, false, Some(1)).await;
+            }
         }
     });
     Ok(StartedExecution {
@@ -431,6 +386,7 @@ fn prepare_dns(
         )),
         events,
         oracle,
+        traceroute_enrichment: None,
         mtr_enrichment: None,
     })
 }
@@ -466,6 +422,8 @@ async fn prepare_traceroute(
     let oracle = new_oracle_slot();
     let task_oracle = std::sync::Arc::clone(&oracle);
     let task_target = target.clone();
+    let shared_enrichment = traceroute::TracerouteEnrichmentBroker::default();
+    let task_enrichment = shared_enrichment.clone();
     tokio::spawn(async move {
         match traceroute::run_native_traceroute_stream(
             &args,
@@ -479,16 +437,21 @@ async fn prepare_traceroute(
             Ok(native) => {
                 let timed_out = native.timed_out;
                 let status = native.status;
-                store_oracle(
-                    &task_oracle,
-                    Ok(ShadowOracle::Traceroute {
-                        raw: native.raw,
-                        stderr: native.stderr,
-                        timed_out,
-                        succeeded: status.map(|status| status.success()),
-                        target: task_target,
-                    }),
-                );
+                let hostnames = task_enrichment
+                    .enrich_raw(&native.raw, &task_target, deadline.remaining())
+                    .await;
+                let shaped = serde_json::to_value(traceroute::shape_traceroute_output(
+                    &native.raw,
+                    &native.stderr,
+                    timed_out,
+                    status.map(|status| status.success()),
+                    &task_target,
+                    &hostnames,
+                ));
+                match shaped {
+                    Ok(value) => store_oracle(&task_oracle, Ok(value)),
+                    Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+                }
                 send_terminal(
                     &tx,
                     timed_out,
@@ -500,7 +463,10 @@ async fn prepare_traceroute(
                 )
                 .await;
             }
-            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+            Err(error) => {
+                store_oracle(&task_oracle, Err(error.to_string()));
+                send_terminal(&tx, false, Some(1)).await;
+            }
         }
     });
     Ok(StartedExecution {
@@ -512,6 +478,7 @@ async fn prepare_traceroute(
         )),
         events,
         oracle,
+        traceroute_enrichment: Some(shared_enrichment),
         mtr_enrichment: None,
     })
 }
@@ -564,18 +531,23 @@ async fn prepare_mtr(
             Ok(native) => {
                 enrichment.wait().await;
                 let timed_out = native.timed_out;
-                store_oracle(
-                    &task_oracle,
-                    Ok(ShadowOracle::Mtr {
-                        raw: native.stdout,
-                        stderr: native.stderr,
-                        timed_out,
-                        target: task_target,
-                    }),
-                );
+                let shaped = serde_json::to_value(mtr::shape_mtr_output(
+                    &native.stdout,
+                    &native.stderr,
+                    timed_out,
+                    &task_target,
+                    &enrichment.broker().snapshot(),
+                ));
+                match shaped {
+                    Ok(value) => store_oracle(&task_oracle, Ok(value)),
+                    Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+                }
                 send_terminal(&tx, timed_out, native.exit_code).await;
             }
-            Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
+            Err(error) => {
+                store_oracle(&task_oracle, Err(error.to_string()));
+                send_terminal(&tx, false, Some(1)).await;
+            }
         }
     });
     Ok(StartedExecution {
@@ -587,6 +559,7 @@ async fn prepare_mtr(
         )),
         events,
         oracle,
+        traceroute_enrichment: None,
         mtr_enrichment: Some(shared_enrichment),
     })
 }
@@ -650,7 +623,7 @@ async fn prepare_http(
         .await;
         match serde_json::to_value(raw.native) {
             Ok(native) => {
-                store_oracle(&task_oracle, Ok(ShadowOracle::Ready(native)));
+                store_oracle(&task_oracle, Ok(native));
                 send_terminal(&tx, raw.timed_out, raw.exit_code).await;
             }
             Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
@@ -667,6 +640,7 @@ async fn prepare_http(
         start: wit_host::ExecutionStartResult::Started(start),
         events,
         oracle,
+        traceroute_enrichment: None,
         mtr_enrichment: None,
     })
 }
@@ -703,6 +677,8 @@ impl wit_host::Host for ProductionHost {
             .map_err(policy_error)?;
         let scope = self.lease.scope.clone();
         let started = prepare_native_execution(&scope, self.native_progress_tx.clone()).await?;
+        self.traceroute_enrichment
+            .clone_from(&started.traceroute_enrichment);
         self.mtr_enrichment.clone_from(&started.mtr_enrichment);
         self.events = Some(started.events);
         self.oracle = Some(started.oracle);
@@ -733,11 +709,8 @@ impl wit_host::Host for ProductionHost {
                     let message = self
                         .oracle
                         .as_ref()
-                        .and_then(|slot| slot.lock().ok())
-                        .and_then(|guard| match guard.as_ref() {
-                            Some(Err(error)) => Some(error.clone()),
-                            _ => None,
-                        })
+                        .and_then(|slot| read_oracle(slot).ok().flatten())
+                        .and_then(Result::err)
                         .unwrap_or_else(|| {
                             "native execution event stream closed before a terminal event"
                                 .to_string()
@@ -827,6 +800,8 @@ impl wit_host::Host for ProductionHost {
                 .lookup(address, self.lease.remaining(now))
                 .await
                 .hostname
+        } else if let Some(broker) = &self.traceroute_enrichment {
+            broker.lookup(address, self.lease.remaining(now)).await
         } else {
             crate::util::resolve_target::reverse_lookup(
                 address,
@@ -836,9 +811,6 @@ impl wit_host::Host for ProductionHost {
             )
             .await
         };
-        if let Some(hostname) = &hostname {
-            self.reverse_results.insert(address, hostname.clone());
-        }
         Ok(hostname)
     }
 
@@ -860,9 +832,6 @@ impl wit_host::Host for ProductionHost {
         } else {
             crate::command::mtr::lookup_asn(address, self.lease.remaining(now)).await
         };
-        if !asn.is_empty() {
-            self.asn_results.insert(address, asn.clone());
-        }
         Ok(asn)
     }
 
@@ -880,11 +849,7 @@ impl wit_host::Host for ProductionHost {
             let value: serde_json::Value = serde_json::from_str(&result_json).map_err(|error| {
                 host_error(wit_host::HostErrorCode::InvalidRequest, error.to_string())
             })?;
-            if self
-                .oracle
-                .as_ref()
-                .is_some_and(|slot| slot.lock().is_ok_and(|guard| guard.is_none()))
-            {
+            if self.oracle.as_ref().is_some_and(oracle_pending) {
                 self.progress_during_native_execution = true;
             }
             self.progress.push((value, overwrite));
@@ -943,33 +908,64 @@ impl BehaviorRuntime {
             measurement_json: serde_json::to_string(&measurement)
                 .map_err(|error| RuntimeError::Job(error.to_string()))?,
         };
-        let result = bindings
-            .codeandsolder_globalping_behavior_guest()
-            .call_handle(&mut store, &job)
-            .await
-            .map_err(RuntimeError::Call)?;
-        let result = match result {
-            Ok(result) => result,
-            Err(exports::codeandsolder::globalping_behavior::guest::BehaviorError::InvalidJob(
-                message,
-            )) => return Err(RuntimeError::GuestInvalidJob(message)),
-            Err(exports::codeandsolder::globalping_behavior::guest::BehaviorError::Internal(
-                message,
-            )) => return Err(RuntimeError::GuestInternal(message)),
+
+        let component_result: Result<serde_json::Value, RuntimeError> =
+            async {
+                let result = bindings
+                    .codeandsolder_globalping_behavior_guest()
+                    .call_handle(&mut store, &job)
+                    .await
+                    .map_err(RuntimeError::Call)?;
+                let result = match result {
+                Ok(result) => result,
+                Err(exports::codeandsolder::globalping_behavior::guest::BehaviorError::InvalidJob(
+                    message,
+                )) => return Err(RuntimeError::GuestInvalidJob(message)),
+                Err(exports::codeandsolder::globalping_behavior::guest::BehaviorError::Internal(
+                    message,
+                )) => return Err(RuntimeError::GuestInternal(message)),
+            };
+                store
+                    .data()
+                    .lease
+                    .authorize_final_result(&result, std::time::Instant::now())
+                    .map_err(|error| RuntimeError::Policy(error.to_string()))?;
+                serde_json::from_str::<serde_json::Value>(&result)
+                    .map_err(|error| RuntimeError::GuestInvalidOutput(error.to_string()))
+            }
+            .await;
+
+        let oracle = store.data().oracle.clone();
+        let progress = store.data().progress.clone();
+        let progress_during_native_execution = store.data().progress_during_native_execution;
+        drop(store);
+
+        let Some(oracle) = oracle else {
+            return match component_result {
+                Err(error) => Err(error),
+                Ok(_) => Err(RuntimeError::Policy(
+                    "behavior completed without starting native execution".to_string(),
+                )),
+            };
         };
-        store
-            .data()
-            .lease
-            .authorize_final_result(&result, std::time::Instant::now())
-            .map_err(|error| RuntimeError::Policy(error.to_string()))?;
-        let component_result = serde_json::from_str(&result)
-            .map_err(|error| RuntimeError::GuestInvalidOutput(error.to_string()))?;
-        let native = store.data().oracle_result().map_err(RuntimeError::Job)?;
+
+        let (native, native_error) = match wait_oracle(&oracle).await {
+            Ok(native) => (native, None),
+            Err(error) => (
+                serde_json::json!({
+                    "status": "failed",
+                    "failureSource": "internal",
+                    "rawOutput": error,
+                }),
+                Some(error),
+            ),
+        };
         Ok(BehaviorShadowResult {
             native,
+            native_error,
             component: component_result,
-            progress: store.data().progress.clone(),
-            progress_during_native_execution: store.data().progress_during_native_execution,
+            progress,
+            progress_during_native_execution,
         })
     }
 
@@ -978,8 +974,10 @@ impl BehaviorRuntime {
     /// an oracle. The component does not become authoritative here.
     ///
     /// # Errors
-    /// Returns an error for capability-policy, native-execution, Wasmtime,
-    /// guest, or result-serialization failures.
+    /// Returns an error only when setup or guest execution fails before native
+    /// execution starts. Once native execution starts, its authoritative result
+    /// is retained and any later guest failure is carried in the returned
+    /// `BehaviorShadowResult`.
     pub async fn shadow_measurement(
         &self,
         compiled: &CompiledBehavior,
@@ -1027,13 +1025,58 @@ impl BehaviorShadowExecutor {
     /// outside the executor; callers decide what to do with the parity result.
     ///
     /// # Errors
-    /// Returns any bounded host, Wasmtime, guest, or serialization failure.
+    /// Returns a failure only when the behavior fails before native execution
+    /// starts. Once native execution starts, its result is preserved even if
+    /// the guest later traps, rejects the job, or violates policy.
     pub async fn run(
         &self,
         measurement: serde_json::Value,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
+        self.run_with_native_progress(measurement, None).await
+    }
+
+    /// Run one behavior shadow while forwarding the authoritative native
+    /// execution's progress through the ordinary probe progress channel.
+    ///
+    /// # Errors
+    /// Returns a failure only when the behavior fails before native execution
+    /// starts; post-start guest failures are carried in `BehaviorShadowResult`.
+    pub(crate) async fn run_with_native_progress(
+        &self,
+        measurement: serde_json::Value,
+        native_progress_tx: Option<crate::command::ProgressTx>,
+    ) -> Result<BehaviorShadowResult, RuntimeError> {
         self.runtime
-            .shadow_measurement(&self.compiled, measurement, None)
+            .shadow_measurement(&self.compiled, measurement, native_progress_tx)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oracle_wait_observes_result_stored_before_wait() {
+        let slot = new_oracle_slot();
+        store_oracle(&slot, Ok(serde_json::json!({"status": "finished"})));
+        let value = wait_oracle(&slot)
+            .await
+            .unwrap_or_else(|error| panic!("oracle wait failed: {error}"));
+        assert_eq!(value["status"], "finished");
+    }
+
+    #[tokio::test]
+    async fn oracle_wait_is_notified_after_native_completion() {
+        let slot = new_oracle_slot();
+        let waiter_slot = std::sync::Arc::clone(&slot);
+        let waiter = tokio::spawn(async move { wait_oracle(&waiter_slot).await });
+        tokio::task::yield_now().await;
+        store_oracle(&slot, Ok(serde_json::json!({"status": "finished"})));
+        let value = waiter
+            .await
+            .unwrap_or_else(|error| panic!("oracle waiter task failed: {error}"))
+            .unwrap_or_else(|error| panic!("oracle wait failed: {error}"));
+        assert_eq!(value["status"], "finished");
     }
 }

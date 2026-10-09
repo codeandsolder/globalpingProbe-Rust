@@ -76,6 +76,8 @@ jobs:
         run: cargo +1.99.0 clippy --locked -p globalping-behavior-core -- -D warnings -D clippy::pedantic -D clippy::nursery
       - name: Clippy WASIp2 behavior component
         run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy post-start behavior fault fixture
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-fault-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
       - name: Unit tests
         run: cargo +1.99.0 test --locked --lib --bins
       - name: Shared behavior core unit tests

@@ -137,7 +137,7 @@ RUST_LOG=info \
 
 The probe UUID is persisted to `/.globalping-probe-uuid` (falls back to `$HOME/.globalping-probe-uuid` if the root path is not writable).
 
-Behavior bootstrap is opt-in and fail-closed. With no `GP_BEHAVIOR_*` variables, startup remains native-only. If any behavior option is set, `GP_BEHAVIOR_VERIFYING_KEY` is mandatory; persisted behavior is re-verified and self-tested before use. The update URL is only a transport/discovery source—the locally provisioned Ed25519 key, manifest signature, SHA-256 digest, ABI/supervisor compatibility, and monotonic sequence decide whether an artifact can activate. Put `GP_BEHAVIOR_ROOT` on persistent storage if active/rollback slots must survive container or host replacement. In this branch the WASM path remains diagnostic: native measurement results and progress are still authoritative.
+Behavior bootstrap is opt-in and fail-closed. With no `GP_BEHAVIOR_*` variables, startup remains native-only. If any behavior option is set, `GP_BEHAVIOR_VERIFYING_KEY` is mandatory; persisted behavior is re-verified and self-tested before use. The update URL is only a transport/discovery source—the locally provisioned Ed25519 key, manifest signature, SHA-256 digest, ABI/supervisor compatibility, and monotonic sequence decide whether an artifact can activate. Put `GP_BEHAVIOR_ROOT` on persistent storage if active/rollback slots must survive container or host replacement. In this branch the WASM path remains diagnostic: native measurement results and progress are still authoritative, but native execution is shared with the bounded WASM host rather than duplicated.
 
 ### Packaging signed behavior updates
 
