@@ -980,7 +980,6 @@ dependencies = [
  "globalping-behavior-core",
  "hex",
  "if-addrs",
- "ipnet",
  "mockall",
  "psl",
  "rand 0.9.4",

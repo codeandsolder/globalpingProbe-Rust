@@ -139,21 +139,6 @@ fn target_is_icann(target: &str) -> bool {
         .is_some_and(|suffix| suffix.typ() == Some(psl::Type::Icann))
 }
 
-fn local_addresses() -> Vec<String> {
-    if_addrs::get_if_addrs().map_or_else(
-        |_| Vec::new(),
-        |interfaces| {
-            let mut addresses = interfaces
-                .into_iter()
-                .map(|interface| interface.ip().to_string())
-                .collect::<Vec<_>>();
-            addresses.sort();
-            addresses.dedup();
-            addresses
-        },
-    )
-}
-
 fn execution_start(
     kind: wit_host::MeasurementKind,
     scope: &crate::supervisor::capability::MeasurementScope,
@@ -169,7 +154,7 @@ fn execution_start(
         resolved_hostname,
         dns_duration_ms: None,
         target_is_icann: target_is_icann(&scope.target),
-        local_addresses: local_addresses(),
+        local_addresses: crate::util::private_ip::local_address_strings(),
     }
 }
 
