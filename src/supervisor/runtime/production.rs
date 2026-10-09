@@ -1,3 +1,5 @@
+use crate::util::progress_buffer::BufferMode;
+
 use super::{
     BehaviorRuntime, CompiledBehavior, Component, Future, HasSelf, JOB_FUEL, Linker, ProbeBehavior,
     RuntimeError, Store, StoreLimits, exports, ready, wit_host,
@@ -8,7 +10,7 @@ pub struct BehaviorShadowResult {
     pub native: serde_json::Value,
     pub native_error: Option<String>,
     pub component: Result<serde_json::Value, RuntimeError>,
-    pub progress: Vec<(serde_json::Value, bool)>,
+    pub progress: Vec<(serde_json::Value, BufferMode)>,
     pub progress_during_native_execution: bool,
 }
 
@@ -34,8 +36,9 @@ struct ProductionHost {
     limits: StoreLimits,
     lease: crate::supervisor::capability::CapabilityLease,
     events: Option<tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>>,
-    behavior_progress_tx: Option<crate::command::ProgressTx>,
-    progress: Vec<(serde_json::Value, bool)>,
+    behavior_progress_sink: Option<crate::command::ProgressSink>,
+    progress: Vec<(serde_json::Value, BufferMode)>,
+    progress_mode: Option<BufferMode>,
     progress_during_native_execution: bool,
     traceroute_enrichment: Option<crate::command::traceroute::TracerouteEnrichmentBroker>,
     mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
@@ -45,14 +48,15 @@ struct ProductionHost {
 impl ProductionHost {
     fn new(
         lease: crate::supervisor::capability::CapabilityLease,
-        behavior_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_sink: Option<crate::command::ProgressSink>,
     ) -> Self {
         Self {
             limits: BehaviorRuntime::store_limits(),
             lease,
             events: None,
-            behavior_progress_tx,
+            behavior_progress_sink,
             progress: Vec::new(),
+            progress_mode: None,
             progress_during_native_execution: false,
             traceroute_enrichment: None,
             mtr_enrichment: None,
@@ -87,6 +91,14 @@ const fn wit_measurement_kind(
         }
         crate::supervisor::capability::MeasurementKind::Mtr => wit_host::MeasurementKind::Mtr,
         crate::supervisor::capability::MeasurementKind::Http => wit_host::MeasurementKind::Http,
+    }
+}
+
+const fn buffer_mode(mode: wit_host::ProgressMode) -> BufferMode {
+    match mode {
+        wit_host::ProgressMode::Append => BufferMode::Append,
+        wit_host::ProgressMode::Diff => BufferMode::Diff,
+        wit_host::ProgressMode::Overwrite => BufferMode::Overwrite,
     }
 }
 
@@ -853,7 +865,7 @@ impl wit_host::Host for ProductionHost {
         &mut self,
         token: wit_host::CapabilityToken,
         result_json: String,
-        overwrite: bool,
+        mode: wit_host::ProgressMode,
     ) -> impl Future<Output = Result<(), wit_host::HostError>> + Send {
         let result = (|| {
             self.check_token(&token)?;
@@ -863,21 +875,21 @@ impl wit_host::Host for ProductionHost {
             let value: serde_json::Value = serde_json::from_str(&result_json).map_err(|error| {
                 host_error(wit_host::HostErrorCode::InvalidRequest, error.to_string())
             })?;
-            let expected_overwrite =
-                self.lease.scope.kind == crate::supervisor::capability::MeasurementKind::Mtr;
-            if overwrite != expected_overwrite {
+            let mode = buffer_mode(mode);
+            if self.progress_mode.is_some_and(|current| current != mode) {
                 return Err(host_error(
                     wit_host::HostErrorCode::InvalidRequest,
-                    "behavior progress overwrite mode does not match measurement policy",
+                    "behavior progress mode changed during one measurement",
                 ));
             }
+            self.progress_mode = Some(mode);
             if self.oracle.as_ref().is_some_and(oracle_pending) {
                 self.progress_during_native_execution = true;
             }
-            if let Some(tx) = &self.behavior_progress_tx {
-                tx.send(value.clone()).ok();
+            if let Some(tx) = &self.behavior_progress_sink {
+                tx.send(value.clone(), mode).ok();
             }
-            self.progress.push((value, overwrite));
+            self.progress.push((value, mode));
             Ok(())
         })();
         ready(result)
@@ -889,7 +901,7 @@ impl BehaviorRuntime {
         &self,
         component: &Component,
         measurement: serde_json::Value,
-        behavior_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_sink: Option<crate::command::ProgressSink>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
         let scope = crate::supervisor::capability::MeasurementScope::from_server_measurement(
             measurement.clone(),
@@ -914,7 +926,7 @@ impl BehaviorRuntime {
             .map_err(RuntimeError::Linker)?;
         let mut store = Store::new(
             &self.engine,
-            ProductionHost::new(lease, behavior_progress_tx),
+            ProductionHost::new(lease, behavior_progress_sink),
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(JOB_FUEL).map_err(RuntimeError::Store)?;
@@ -999,13 +1011,13 @@ impl BehaviorRuntime {
     /// execution starts. Once native execution starts, its authoritative result
     /// is retained and any later guest failure is carried in the returned
     /// `BehaviorShadowResult`.
-    pub async fn shadow_measurement(
+    pub(crate) async fn shadow_measurement(
         &self,
         compiled: &CompiledBehavior,
         measurement: serde_json::Value,
-        behavior_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_sink: Option<crate::command::ProgressSink>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
-        self.shadow_component(&compiled.component, measurement, behavior_progress_tx)
+        self.shadow_component(&compiled.component, measurement, behavior_progress_sink)
             .await
     }
 }
@@ -1068,10 +1080,10 @@ impl BehaviorShadowExecutor {
     pub(crate) async fn run_with_behavior_progress(
         &self,
         measurement: serde_json::Value,
-        behavior_progress_tx: Option<crate::command::ProgressTx>,
+        behavior_progress_sink: Option<crate::command::ProgressSink>,
     ) -> Result<BehaviorShadowResult, RuntimeError> {
         self.runtime
-            .shadow_measurement(&self.compiled, measurement, behavior_progress_tx)
+            .shadow_measurement(&self.compiled, measurement, behavior_progress_sink)
             .await
     }
 }
@@ -1081,23 +1093,15 @@ mod tests {
     use super::*;
 
     fn progress_test_host(
-        kind: crate::supervisor::capability::MeasurementKind,
-        progress_tx: crate::command::ProgressTx,
+        progress_sink: crate::command::ProgressSink,
     ) -> (ProductionHost, wit_host::CapabilityToken) {
-        let measurement = match kind {
-            crate::supervisor::capability::MeasurementKind::Mtr => serde_json::json!({
-                "type": "mtr", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
-                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
-            }),
-            _ => serde_json::json!({
+        let scope = crate::supervisor::capability::MeasurementScope::from_server_measurement(
+            serde_json::json!({
                 "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
                 "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
             }),
-        };
-        let scope =
-            crate::supervisor::capability::MeasurementScope::from_server_measurement(measurement)
-                .unwrap_or_else(|error| panic!("test measurement scope failed: {error}"));
-        assert_eq!(scope.kind, kind);
+        )
+        .unwrap_or_else(|error| panic!("test measurement scope failed: {error}"));
         let token = crate::supervisor::capability::CapabilityToken { hi: 11, lo: 29 };
         let wit_token = wit_host::CapabilityToken {
             hi: token.hi,
@@ -1108,51 +1112,39 @@ mod tests {
         lease
             .authorize_start(now)
             .unwrap_or_else(|error| panic!("test capability start failed: {error}"));
-        (ProductionHost::new(lease, Some(progress_tx)), wit_token)
+        (ProductionHost::new(lease, Some(progress_sink)), wit_token)
     }
 
     #[tokio::test]
-    async fn behavior_progress_is_forwarded_and_overwrite_mode_is_enforced() {
-        let (tx, mut rx) = crate::command::ProgressTx::channel();
-        let (mut ping, ping_token) =
-            progress_test_host(crate::supervisor::capability::MeasurementKind::Ping, tx);
+    async fn behavior_progress_is_forwarded_and_mode_is_pinned() {
+        let (progress_sink, mut rx) = crate::command::ProgressSink::channel();
+        let (mut host, token) = progress_test_host(progress_sink);
         wit_host::Host::emit_progress(
-            &mut ping,
-            ping_token.clone(),
+            &mut host,
+            token.clone(),
             r#"{"rawOutput":"guest"}"#.to_string(),
-            false,
+            wit_host::ProgressMode::Diff,
         )
         .await
         .unwrap_or_else(|error| panic!("valid guest progress was rejected: {error:?}"));
         let forwarded = rx
             .try_recv()
-            .unwrap_or_else(|error| panic!("guest progress was not forwarded: {error}"))
-            .resolve();
-        assert_eq!(forwarded, serde_json::json!({"rawOutput": "guest"}));
+            .unwrap_or_else(|error| panic!("guest progress was not forwarded: {error}"));
+        assert_eq!(forwarded.mode(), BufferMode::Diff);
+        assert_eq!(
+            forwarded.resolve(),
+            serde_json::json!({"rawOutput": "guest"})
+        );
 
         let error = wit_host::Host::emit_progress(
-            &mut ping,
-            ping_token,
+            &mut host,
+            token,
             r#"{"rawOutput":"wrong-mode"}"#.to_string(),
-            true,
+            wit_host::ProgressMode::Append,
         )
         .await
         .err()
-        .unwrap_or_else(|| panic!("invalid ping overwrite mode unexpectedly succeeded"));
-        assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
-
-        let (tx, _rx) = crate::command::ProgressTx::channel();
-        let (mut mtr, mtr_token) =
-            progress_test_host(crate::supervisor::capability::MeasurementKind::Mtr, tx);
-        let error = wit_host::Host::emit_progress(
-            &mut mtr,
-            mtr_token,
-            r#"{"rawOutput":"wrong-mode"}"#.to_string(),
-            false,
-        )
-        .await
-        .err()
-        .unwrap_or_else(|| panic!("invalid MTR overwrite mode unexpectedly succeeded"));
+        .unwrap_or_else(|| panic!("mid-measurement progress mode change unexpectedly succeeded"));
         assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
     }
 

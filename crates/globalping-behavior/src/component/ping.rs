@@ -238,7 +238,12 @@ pub fn run(
         };
         let payload = serde_json::to_string(&serde_json::json!({ "rawOutput": progress }))
             .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-        execution::emit_progress(token, &payload, false)
+        let mode = if tcp_progress {
+            execution::ProgressMode::Diff
+        } else {
+            execution::ProgressMode::Append
+        };
+        execution::emit_progress(token, &payload, mode)
     })?;
     let payload = match outcome {
         ExecutionOutcome::Executed(native) => shape(&native),

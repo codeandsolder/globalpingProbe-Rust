@@ -1,6 +1,7 @@
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 
+pub use super::codeandsolder::globalping_behavior::host::ProgressMode;
 use super::codeandsolder::globalping_behavior::host::{
     self, CapabilityToken, ExecutionEvent, HostError, HostErrorCode, MeasurementKind,
     ResolutionFailure, ResolutionFailureKind,
@@ -188,9 +189,9 @@ pub fn resolution_failure_message(failure: &ResolutionFailure) -> String {
 pub fn emit_progress(
     token: &CapabilityToken,
     result_json: &str,
-    overwrite: bool,
+    mode: ProgressMode,
 ) -> Result<(), BehaviorError> {
-    host::emit_progress(copy_token(token), result_json, overwrite).map_err(map_host_error)
+    host::emit_progress(copy_token(token), result_json, mode).map_err(map_host_error)
 }
 
 pub fn reverse_lookup(

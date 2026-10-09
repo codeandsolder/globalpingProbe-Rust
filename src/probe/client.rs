@@ -16,8 +16,8 @@ use rust_socketio::{
 };
 
 use crate::command::{
-    ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
-    traceroute::TracerouteCommand,
+    ProgressSink, ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand,
+    ping::PingCommand, traceroute::TracerouteCommand,
 };
 use crate::probe::progress::ProgressEmitter;
 use crate::probe::{
@@ -396,14 +396,14 @@ async fn run_behavior_measurement(
     measurement: &Value,
     measurement_id: &str,
     measurement_type: &str,
-    behavior_progress_tx: Option<ProgressTx>,
+    behavior_progress_sink: Option<ProgressSink>,
 ) -> Option<Result<Value, RuntimeError>> {
     let controller = behavior_controller?;
     let shadow = controller.executor().await?;
     let sequence = shadow.sequence();
     let build_id = shadow.build_id().to_string();
     let shadow_result = shadow
-        .run_with_behavior_progress(measurement.clone(), behavior_progress_tx)
+        .run_with_behavior_progress(measurement.clone(), behavior_progress_sink)
         .await;
 
     #[cfg(test)]
@@ -462,14 +462,14 @@ async fn run_measurement(
     behavior_controller: Option<&Arc<BehaviorController>>,
     measurement_id: &str,
     measurement_type: &str,
-    progress_tx: Option<ProgressTx>,
+    progress_sink: Option<ProgressSink>,
 ) -> Result<Value> {
     if let Some(shared) = run_behavior_measurement(
         behavior_controller,
         &measurement,
         measurement_id,
         measurement_type,
-        progress_tx.clone(),
+        progress_sink.clone(),
     )
     .await
     {
@@ -489,8 +489,11 @@ async fn run_measurement(
         }
     }
 
-    match progress_tx {
-        Some(tx) => cmd.run_with_progress(measurement, tx).await,
+    match progress_sink {
+        Some(sink) => {
+            let mode = cmd.progress_mode(&measurement);
+            cmd.run_with_progress(measurement, sink.fixed(mode)).await
+        }
         None => cmd.run(measurement).await,
     }
 }
@@ -538,9 +541,8 @@ pub async fn dispatch(
 
     let measurement_fut = async {
         if in_progress {
-            let (tx, rx) = ProgressTx::channel();
-            let mode = cmd.progress_mode(&req.measurement);
-            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone(), mode);
+            let (progress_sink, rx) = ProgressSink::channel();
+            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone());
             let emitter_task = tokio::spawn(emitter.forward(rx));
             let result = run_measurement(
                 &cmd,
@@ -548,7 +550,7 @@ pub async fn dispatch(
                 behavior_controller.as_ref(),
                 &mid,
                 mtype,
-                Some(tx),
+                Some(progress_sink),
             )
             .await;
             let _ = emitter_task.await;
@@ -1859,14 +1861,14 @@ mod tests {
             "timeout": 10,
             "inProgressUpdates": true
         });
-        let (progress_tx, mut progress_rx) = ProgressTx::channel();
+        let (progress_sink, mut progress_rx) = ProgressSink::channel();
         let result = run_measurement(
             &CommandKind::Ping,
             measurement,
             Some(&controller),
             "post-start-fault",
             "ping",
-            Some(progress_tx),
+            Some(progress_sink),
         )
         .await
         .unwrap_or_else(|error| panic!("shared native execution failed: {error}"));

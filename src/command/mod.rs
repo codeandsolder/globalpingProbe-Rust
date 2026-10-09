@@ -7,6 +7,8 @@ pub mod traceroute;
 use std::net::IpAddr;
 
 use serde_json::Value;
+
+use crate::util::progress_buffer::BufferMode;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, error::SendError};
 
 pub(crate) const RAW_EXECUTION_EVENT_CAPACITY: usize = 32;
@@ -61,34 +63,80 @@ impl RawExecutionTx {
 
 pub type LazyProgress = Box<dyn FnOnce() -> Value + Send + 'static>;
 
-/// One pending progress update.
-///
-/// Lazy updates mirror upstream's `pushLazyProgress`: expensive parsing and
-/// rendering is deferred until the coalescing window actually emits.
+/// One pending progress update plus the coalescing policy chosen by its producer.
 pub enum ProgressUpdate {
-    Value(Value),
-    Lazy(LazyProgress),
+    Value {
+        value: Value,
+        mode: BufferMode,
+    },
+    Lazy {
+        render: LazyProgress,
+        mode: BufferMode,
+    },
 }
 
 impl ProgressUpdate {
     #[must_use]
+    pub const fn mode(&self) -> BufferMode {
+        match self {
+            Self::Value { mode, .. } | Self::Lazy { mode, .. } => *mode,
+        }
+    }
+
+    #[must_use]
     pub fn resolve(self) -> Value {
         match self {
-            Self::Value(value) => value,
-            Self::Lazy(render) => render(),
+            Self::Value { value, .. } => value,
+            Self::Lazy { render, .. } => render(),
         }
     }
 }
 
-/// Partial-result channel used for in-progress streaming.
+/// Neutral progress sink. The behavior host supplies a mode per event; native
+/// commands are given a fixed-mode `ProgressTx` only when the native path runs.
 #[derive(Clone)]
-pub struct ProgressTx(UnboundedSender<ProgressUpdate>);
+pub(crate) struct ProgressSink(UnboundedSender<ProgressUpdate>);
+
+impl ProgressSink {
+    #[must_use]
+    pub(crate) fn channel() -> (Self, UnboundedReceiver<ProgressUpdate>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self(tx), rx)
+    }
+
+    #[must_use]
+    pub(crate) fn fixed(&self, mode: BufferMode) -> ProgressTx {
+        ProgressTx {
+            tx: self.0.clone(),
+            mode,
+        }
+    }
+
+    /// Queue an explicitly-mode-tagged behavior progress update.
+    ///
+    /// # Errors
+    /// Returns an error if the progress receiver has already been dropped.
+    pub(crate) fn send(
+        &self,
+        value: Value,
+        mode: BufferMode,
+    ) -> Result<(), SendError<ProgressUpdate>> {
+        self.0.send(ProgressUpdate::Value { value, mode })
+    }
+}
+
+/// Fixed-mode progress sender used by native command implementations.
+#[derive(Clone)]
+pub struct ProgressTx {
+    tx: UnboundedSender<ProgressUpdate>,
+    mode: BufferMode,
+}
 
 impl ProgressTx {
     #[must_use]
-    pub fn channel() -> (Self, UnboundedReceiver<ProgressUpdate>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Self(tx), rx)
+    pub fn channel(mode: BufferMode) -> (Self, UnboundedReceiver<ProgressUpdate>) {
+        let (sink, rx) = ProgressSink::channel();
+        (sink.fixed(mode), rx)
     }
 
     /// Queue an already-materialized progress update.
@@ -96,7 +144,10 @@ impl ProgressTx {
     /// # Errors
     /// Returns an error if the progress receiver has already been dropped.
     pub fn send(&self, value: Value) -> Result<(), SendError<ProgressUpdate>> {
-        self.0.send(ProgressUpdate::Value(value))
+        self.tx.send(ProgressUpdate::Value {
+            value,
+            mode: self.mode,
+        })
     }
 
     /// Queue a progress update that is rendered only when the coalescer emits.
@@ -107,6 +158,9 @@ impl ProgressTx {
     where
         F: FnOnce() -> Value + Send + 'static,
     {
-        self.0.send(ProgressUpdate::Lazy(Box::new(render)))
+        self.tx.send(ProgressUpdate::Lazy {
+            render: Box::new(render),
+            mode: self.mode,
+        })
     }
 }

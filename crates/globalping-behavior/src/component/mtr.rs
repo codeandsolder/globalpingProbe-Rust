@@ -83,7 +83,7 @@ fn emit_snapshot(token: &CapabilityToken, raw: &str, state: &State) -> Result<()
         "rawOutput": render_progress(raw, &state.enrichment),
     }))
     .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-    execution::emit_progress(token, &payload, true)
+    execution::emit_progress(token, &payload, execution::ProgressMode::Overwrite)
 }
 
 pub fn run(token: &CapabilityToken, in_progress_updates: bool) -> Result<String, BehaviorError> {

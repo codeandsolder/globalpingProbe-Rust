@@ -24,6 +24,11 @@ impl ProgressBuffer {
     }
 
     #[must_use]
+    pub const fn mode(&self) -> BufferMode {
+        self.mode
+    }
+
+    #[must_use]
     pub const fn overwrite(&self) -> bool {
         matches!(self.mode, BufferMode::Overwrite)
     }

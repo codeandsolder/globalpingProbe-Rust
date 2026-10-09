@@ -228,7 +228,7 @@ impl wit_host::Host for SelfTestState {
         &mut self,
         _token: wit_host::CapabilityToken,
         _result_json: String,
-        _overwrite: bool,
+        _mode: wit_host::ProgressMode,
     ) -> impl Future<Output = Result<(), wit_host::HostError>> + Send {
         ready(Self::denied())
     }
@@ -306,7 +306,7 @@ mod differential_tests {
         dns_duration_ms: Option<u64>,
         resolution_failure: Option<wit_host::ResolutionFailureKind>,
         resolution_public_message: Option<String>,
-        progress: Vec<(String, bool)>,
+        progress: Vec<(String, wit_host::ProgressMode)>,
         reverse_requests: Vec<String>,
         asn_requests: Vec<String>,
         started: bool,
@@ -467,10 +467,10 @@ mod differential_tests {
             &mut self,
             token: wit_host::CapabilityToken,
             result_json: String,
-            overwrite: bool,
+            mode: wit_host::ProgressMode,
         ) -> impl Future<Output = Result<(), wit_host::HostError>> + Send {
             let result = if self.valid_token(&token) {
-                self.progress.push((result_json, overwrite));
+                self.progress.push((result_json, mode));
                 Ok(())
             } else {
                 Err(Self::error(
@@ -484,7 +484,7 @@ mod differential_tests {
 
     struct FixtureResult {
         final_json: Value,
-        progress: Vec<(Value, bool)>,
+        progress: Vec<(Value, wit_host::ProgressMode)>,
         reverse_requests: Vec<String>,
         asn_requests: Vec<String>,
     }
@@ -655,12 +655,12 @@ mod differential_tests {
             .data()
             .progress
             .iter()
-            .map(|(payload, overwrite)| {
+            .map(|(payload, mode)| {
                 (
                     serde_json::from_str(payload).unwrap_or_else(|error| {
                         panic!("guest emitted invalid progress JSON: {error}: {payload}")
                     }),
-                    *overwrite,
+                    *mode,
                 )
             })
             .collect();
@@ -733,7 +733,7 @@ mod differential_tests {
         .await
     }
 
-    fn dns_progress(raw: &str, opts: &DnsOptions) -> Vec<(Value, bool)> {
+    fn dns_progress(raw: &str, opts: &DnsOptions) -> Vec<(Value, wit_host::ProgressMode)> {
         let mut cumulative = String::new();
         let mut progress = Vec::new();
         for line in raw.lines() {
@@ -743,21 +743,29 @@ mod differential_tests {
                 DnsProgress::Ignore => {}
                 DnsProgress::Private => break,
                 DnsProgress::Emit(output) => {
-                    progress.push((json!({ "rawOutput": output }), false));
+                    progress.push((json!({ "rawOutput": output }), wit_host::ProgressMode::Diff));
                 }
             }
         }
         progress
     }
 
-    fn ping_progress(raw: &str, address: &str, hostname: &str) -> Vec<(Value, bool)> {
+    fn ping_progress(
+        raw: &str,
+        address: &str,
+        hostname: &str,
+    ) -> Vec<(Value, wit_host::ProgressMode)> {
         raw.lines().map(|line| (
             json!({"rawOutput": format!("{}\n", normalize_ping_output(line, address, hostname))}),
-            false,
+            wit_host::ProgressMode::Append,
         )).collect()
     }
 
-    fn tcp_ping_progress(raw: &str, address: &str, hostname: &str) -> Vec<(Value, bool)> {
+    fn tcp_ping_progress(
+        raw: &str,
+        address: &str,
+        hostname: &str,
+    ) -> Vec<(Value, wit_host::ProgressMode)> {
         let mut lines = Vec::new();
         let mut progress = Vec::new();
         for line in raw.lines() {
@@ -767,18 +775,21 @@ mod differential_tests {
                     json!({
                         "rawOutput": normalize_ping_output(&lines.join("\n"), address, hostname)
                     }),
-                    false,
+                    wit_host::ProgressMode::Diff,
                 ));
             }
         }
         progress
     }
 
-    fn traceroute_progress(raw: &str, target: &ResolvedTarget) -> Vec<(Value, bool)> {
+    fn traceroute_progress(
+        raw: &str,
+        target: &ResolvedTarget,
+    ) -> Vec<(Value, wit_host::ProgressMode)> {
         let lines = raw.lines().collect::<Vec<_>>();
         (1..=lines.len()).map(|count| {
             let current = lines[..count].join("\n");
-            (json!({"rawOutput": normalize_numeric_output(&current, target, &HashMap::new())}), false)
+            (json!({"rawOutput": normalize_numeric_output(&current, target, &HashMap::new())}), wit_host::ProgressMode::Diff)
         }).collect()
     }
 
@@ -852,7 +863,10 @@ mod differential_tests {
         );
         assert_eq!(
             actual.progress[1],
-            (json!({"rawBody":"llo","rawOutput":"llo"}), false)
+            (
+                json!({"rawBody":"llo","rawOutput":"llo"}),
+                wit_host::ProgressMode::Append
+            )
         );
     }
 
@@ -1058,7 +1072,12 @@ mod differential_tests {
         let expected = serde_json::to_value(shape_mtr_output(RAW, "", false, &target, &enrichment))
             .unwrap_or_else(|error| panic!("native MTR serialization failed: {error}"));
         assert_eq!(actual.final_json, expected);
-        assert!(actual.progress.iter().all(|(_, overwrite)| *overwrite));
+        assert!(
+            actual
+                .progress
+                .iter()
+                .all(|(_, mode)| *mode == wit_host::ProgressMode::Overwrite)
+        );
         assert_eq!(
             actual.progress.last().map(|(value, _)| value),
             Some(&json!({ "rawOutput": render_progress(RAW, &enrichment) }))
@@ -1429,7 +1448,7 @@ no answer yet for icmp_seq=1\n\
                     "timeout": 10,
                     "inProgressUpdates": true
                 }),
-                false,
+                crate::util::progress_buffer::BufferMode::Append,
             ),
             (
                 json!({
@@ -1442,7 +1461,7 @@ no answer yet for icmp_seq=1\n\
                     "timeout": 10,
                     "inProgressUpdates": true
                 }),
-                false,
+                crate::util::progress_buffer::BufferMode::Diff,
             ),
             (
                 json!({
@@ -1457,7 +1476,7 @@ no answer yet for icmp_seq=1\n\
                     "timeout": 10,
                     "inProgressUpdates": true
                 }),
-                false,
+                crate::util::progress_buffer::BufferMode::Diff,
             ),
             (
                 json!({
@@ -1469,7 +1488,7 @@ no answer yet for icmp_seq=1\n\
                     "timeout": 10,
                     "inProgressUpdates": true
                 }),
-                false,
+                crate::util::progress_buffer::BufferMode::Diff,
             ),
             (
                 json!({
@@ -1482,7 +1501,7 @@ no answer yet for icmp_seq=1\n\
                     "timeout": 10,
                     "inProgressUpdates": true
                 }),
-                true,
+                crate::util::progress_buffer::BufferMode::Overwrite,
             ),
             (
                 json!({
@@ -1499,11 +1518,11 @@ no answer yet for icmp_seq=1\n\
                         "headers": {}
                     }
                 }),
-                false,
+                crate::util::progress_buffer::BufferMode::Append,
             ),
         ];
 
-        for (measurement, overwrite) in cases {
+        for (measurement, expected_mode) in cases {
             let kind = measurement["type"]
                 .as_str()
                 .unwrap_or("unknown")
@@ -1522,8 +1541,8 @@ no answer yet for icmp_seq=1\n\
                 shadow
                     .progress
                     .iter()
-                    .all(|(_, actual)| *actual == overwrite),
-                "{kind} emitted the wrong overwrite mode"
+                    .all(|(_, actual)| *actual == expected_mode),
+                "{kind} emitted the wrong progress mode"
             );
             if kind == "http" {
                 assert!(

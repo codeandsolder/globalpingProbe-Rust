@@ -1,4 +1,4 @@
-package codeandsolder:globalping-behavior@0.5.0;
+package codeandsolder:globalping-behavior@0.6.0;
 
 interface host {
     record capability-token {
@@ -12,6 +12,12 @@ interface host {
         traceroute,
         mtr,
         http,
+    }
+
+    enum progress-mode {
+        append,
+        diff,
+        overwrite,
     }
 
     enum host-error-code {
@@ -88,7 +94,7 @@ interface host {
     poll: func(token: capability-token) -> result<option<execution-event>, host-error>;
     reverse-lookup: func(token: capability-token, address: string) -> result<option<string>, host-error>;
     lookup-asn: func(token: capability-token, address: string) -> result<list<u32>, host-error>;
-    emit-progress: func(token: capability-token, result-json: string, overwrite: bool) -> result<_, host-error>;
+    emit-progress: func(token: capability-token, result-json: string, mode: progress-mode) -> result<_, host-error>;
 }
 
 interface guest {

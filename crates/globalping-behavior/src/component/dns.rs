@@ -488,7 +488,7 @@ pub fn run(
             Progress::Emit(output) => {
                 let payload = serde_json::to_string(&serde_json::json!({ "rawOutput": output }))
                     .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-                execution::emit_progress(token, &payload, false)
+                execution::emit_progress(token, &payload, execution::ProgressMode::Diff)
             }
         }
     })?;

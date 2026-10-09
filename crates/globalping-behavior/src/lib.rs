@@ -260,7 +260,7 @@ mod component {
                     "rawOutput": "__post_start_fault_fixture_progress__"
                 }))
                 .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-                execution::emit_progress(&job.token, &payload, false)?;
+                execution::emit_progress(&job.token, &payload, execution::ProgressMode::Diff)?;
             }
             Err(BehaviorError::InvalidJob(
                 "intentional post-start health-test fault".to_string(),

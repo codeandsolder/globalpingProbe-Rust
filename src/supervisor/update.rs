@@ -6,7 +6,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
-pub const SUPPORTED_ABI_MAJOR: u16 = 5;
+pub const SUPPORTED_ABI_MAJOR: u16 = 6;
 pub const SUPPORTED_ABI_MINOR: u16 = 0;
 pub const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;

@@ -108,7 +108,7 @@ fn emit_body_progress(
     };
     let payload = serde_json::to_string(&payload)
         .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-    execution::emit_progress(token, &payload, false)
+    execution::emit_progress(token, &payload, execution::ProgressMode::Append)
 }
 
 fn collect_http(
