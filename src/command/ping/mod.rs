@@ -14,7 +14,8 @@ use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
 use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, resolve_command_target};
 use crate::util::tcp_ping::{TcpPingProbe, compute_tcp_stats, tcp_ping_single};
 use crate::util::validate::is_safe_host;
-use parse::{ParsedPing, PingStats, PingStatus, parse};
+use parse::{ParsedPing, failed_ping};
+pub(crate) use parse::{normalize_ping_output, shape_ping_output};
 
 // ── Options (deserialised from the socket.io job payload) ───────────────────
 
@@ -110,15 +111,7 @@ impl PingCommand {
 }
 
 pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
-    ParsedPing {
-        status: PingStatus::Failed,
-        failure_source: Some(error.failure_source_or("internal").to_string()),
-        raw_output: error.public_message(),
-        resolved_address: None,
-        resolved_hostname: None,
-        timings: vec![],
-        stats: PingStats::default(),
-    }
+    failed_ping(error.failure_source_or("internal"), error.public_message())
 }
 
 async fn run_ping(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<ParsedPing> {
@@ -144,70 +137,6 @@ async fn run_ping(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
         )
         .await
     }
-}
-
-pub(crate) fn normalize_ping_output(output: &str, address: &str, hostname: &str) -> String {
-    if address == hostname {
-        return output.to_string();
-    }
-    output
-        .lines()
-        .map(|line| {
-            if line.starts_with(&format!("PING {address} ({address})")) {
-                line.replacen(
-                    &format!("PING {address} ({address})"),
-                    &format!("PING {hostname} ({address})"),
-                    1,
-                )
-            } else if line.contains(&format!(" bytes from {address}:")) {
-                line.replacen(
-                    &format!(" bytes from {address}:"),
-                    &format!(" bytes from {hostname} ({address}):"),
-                    1,
-                )
-            } else if line.starts_with(&format!("From {address} ")) {
-                line.replacen(
-                    &format!("From {address} "),
-                    &format!("From {hostname} ({address}) "),
-                    1,
-                )
-            } else if line == format!("--- {address} ping statistics ---") {
-                format!("--- {hostname} ping statistics ---")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub(crate) fn shape_ping_output(
-    raw_output: &str,
-    address: &str,
-    hostname: &str,
-    timed_out: bool,
-) -> ParsedPing {
-    let normalized = normalize_ping_output(raw_output, address, hostname);
-    let mut parsed = parse(&normalized);
-    parsed.resolved_address = Some(address.to_string());
-    parsed.resolved_hostname = Some(hostname.to_string());
-    if timed_out {
-        parsed.status = PingStatus::Failed;
-        parsed.failure_source = Some(
-            if parsed.timings.is_empty()
-                && (normalized.contains("no answer yet for ")
-                    || normalized.contains("100% packet loss"))
-            {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-    } else if parsed.status == PingStatus::Failed {
-        parsed.failure_source = Some("internal".to_string());
-    }
-    parsed
 }
 
 pub(crate) struct NativePingRaw {

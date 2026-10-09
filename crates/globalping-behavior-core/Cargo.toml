@@ -17,6 +17,10 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+[features]
+default = ["ping-standalone"]
+ping-standalone = []
+
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
