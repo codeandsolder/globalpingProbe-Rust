@@ -148,6 +148,8 @@ type TracerouteLookupMap = Arc<RwLock<HashMap<IpAddr, TracerouteLookupCell>>>;
 #[derive(Clone, Default)]
 pub(crate) struct TracerouteEnrichmentBroker {
     lookups: TracerouteLookupMap,
+    #[cfg(test)]
+    oracle_network_lookups: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl TracerouteEnrichmentBroker {
@@ -181,6 +183,40 @@ impl TracerouteEnrichmentBroker {
             .clone()
     }
 
+    pub(crate) fn ready_hostnames(&self) -> HashMap<IpAddr, String> {
+        self.lookups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|(address, cell)| {
+                cell.get()
+                    .and_then(Clone::clone)
+                    .map(|hostname| (*address, hostname))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    async fn lookup_oracle(&self, address: IpAddr, budget: Duration) -> Option<String> {
+        if is_ip_private(address) {
+            return None;
+        }
+        let cell = self.lookup_cell(address);
+        let oracle_network_lookups = Arc::clone(&self.oracle_network_lookups);
+        cell.get_or_init(|| async move {
+            oracle_network_lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            reverse_lookup(address, budget.min(Duration::from_secs(2))).await
+        })
+        .await
+        .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oracle_network_lookups(&self) -> u64 {
+        self.oracle_network_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) async fn enrich_raw(
         &self,
         raw: &str,
@@ -203,9 +239,11 @@ impl TracerouteEnrichmentBroker {
         }
         let per_lookup = budget.min(Duration::from_secs(2));
         futures::future::join_all(addresses.into_iter().map(|address| async move {
-            self.lookup(address, per_lookup)
-                .await
-                .map(|hostname| (address, hostname))
+            #[cfg(test)]
+            let hostname = self.lookup_oracle(address, per_lookup).await;
+            #[cfg(not(test))]
+            let hostname = self.lookup(address, per_lookup).await;
+            hostname.map(|hostname| (address, hostname))
         }))
         .await
         .into_iter()

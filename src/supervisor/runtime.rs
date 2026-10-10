@@ -1632,12 +1632,18 @@ no answer yet for icmp_seq=1\n\
                     .component
                     .as_ref()
                     .unwrap_or_else(|error| panic!("{case} component failed: {error}"));
-                let oracle_ready_at_authority = execution.oracle_handle().try_resolve().is_some();
+                let oracle_handle = execution.oracle_handle();
+                let oracle_ready_at_authority = oracle_handle.try_resolve().is_some();
                 let cpu_before_oracle = process_cpu_ticks();
                 let oracle_started = std::time::Instant::now();
                 let oracle = execution.resolve_oracle().await;
                 let oracle_residual_ms = oracle_started.elapsed().as_secs_f64() * 1_000.0;
                 let oracle_cpu_ticks = process_cpu_ticks().saturating_sub(cpu_before_oracle);
+                let oracle_work = oracle_handle.work_profile();
+                assert_eq!(
+                    oracle_work.oracle_network_lookups, 0,
+                    "{case} successful diagnostic oracle initiated network enrichment"
+                );
                 assert!(
                     oracle.error.is_none(),
                     "{case} oracle failed: {:?}",
@@ -1656,6 +1662,10 @@ no answer yet for icmp_seq=1\n\
                         "oracleReadyAtAuthority": oracle_ready_at_authority,
                         "oracleResidualMs": oracle_residual_ms,
                         "oracleCpuTicks": oracle_cpu_ticks,
+                        "oraclePhaseMs": oracle_work.phase_ns as f64 / 1_000_000.0,
+                        "oracleEnrichmentMs": oracle_work.enrichment_ns as f64 / 1_000_000.0,
+                        "oracleShapeUs": oracle_work.shape_ns as f64 / 1_000.0,
+                        "oracleNetworkLookups": oracle_work.oracle_network_lookups,
                         "progressEvents": execution.progress.len(),
                         "streamedProgress": execution.progress_during_native_execution,
                     })

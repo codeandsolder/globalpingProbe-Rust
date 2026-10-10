@@ -31,6 +31,16 @@ struct OracleSlot {
     result: std::sync::Mutex<Option<OracleResult>>,
     ready: tokio::sync::Notify,
     native_complete: std::sync::atomic::AtomicBool,
+    component_outcome: std::sync::atomic::AtomicU8,
+    component_ready: tokio::sync::Notify,
+    #[cfg(test)]
+    phase_ns: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    enrichment_ns: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    shape_ns: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    oracle_network_lookups: std::sync::atomic::AtomicU64,
 }
 
 type SharedOracleSlot = std::sync::Arc<OracleSlot>;
@@ -46,6 +56,15 @@ pub struct ResolvedBehaviorOracle {
     pub error: Option<String>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OracleWorkProfile {
+    pub(crate) phase_ns: u64,
+    pub(crate) enrichment_ns: u64,
+    pub(crate) shape_ns: u64,
+    pub(crate) oracle_network_lookups: u64,
+}
+
 impl BehaviorOracle {
     pub fn try_resolve(&self) -> Option<ResolvedBehaviorOracle> {
         match read_oracle(&self.slot) {
@@ -57,6 +76,28 @@ impl BehaviorOracle {
 
     pub async fn resolve(&self) -> ResolvedBehaviorOracle {
         resolve_oracle_result(wait_oracle(&self.slot).await)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn work_profile(&self) -> OracleWorkProfile {
+        OracleWorkProfile {
+            phase_ns: self
+                .slot
+                .phase_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            enrichment_ns: self
+                .slot
+                .enrichment_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            shape_ns: self
+                .slot
+                .shape_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            oracle_network_lookups: self
+                .slot
+                .oracle_network_lookups
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 }
 
@@ -93,6 +134,14 @@ struct ProductionHost {
     traceroute_enrichment: Option<crate::command::traceroute::TracerouteEnrichmentBroker>,
     mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
     oracle: Option<SharedOracleSlot>,
+}
+
+impl Drop for ProductionHost {
+    fn drop(&mut self) {
+        if let Some(oracle) = &self.oracle {
+            mark_component_outcome(oracle, ComponentOutcome::Cancelled);
+        }
+    }
 }
 
 impl ProductionHost {
@@ -387,9 +436,64 @@ fn resolution_failed_execution(
     resolution_failed_execution_with_message(reason, None, native)
 }
 
+const COMPONENT_PENDING: u8 = 0;
+const COMPONENT_SUCCESS: u8 = 1;
+const COMPONENT_FAULT: u8 = 2;
+const COMPONENT_CANCELLED: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComponentOutcome {
+    Success,
+    Fault,
+    Cancelled,
+}
+
+impl ComponentOutcome {
+    const fn encoded(self) -> u8 {
+        match self {
+            Self::Success => COMPONENT_SUCCESS,
+            Self::Fault => COMPONENT_FAULT,
+            Self::Cancelled => COMPONENT_CANCELLED,
+        }
+    }
+}
+
 fn mark_native_complete(slot: &SharedOracleSlot) {
     slot.native_complete
         .store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn mark_component_outcome(slot: &SharedOracleSlot, outcome: ComponentOutcome) {
+    if slot
+        .component_outcome
+        .compare_exchange(
+            COMPONENT_PENDING,
+            outcome.encoded(),
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        slot.component_ready.notify_waiters();
+    }
+}
+
+async fn wait_component_outcome(slot: &SharedOracleSlot) -> ComponentOutcome {
+    loop {
+        let notified = slot.component_ready.notified();
+        let outcome = slot
+            .component_outcome
+            .load(std::sync::atomic::Ordering::Acquire);
+        if outcome == COMPONENT_PENDING {
+            notified.await;
+            continue;
+        }
+        return match outcome {
+            COMPONENT_SUCCESS => ComponentOutcome::Success,
+            COMPONENT_FAULT => ComponentOutcome::Fault,
+            _ => ComponentOutcome::Cancelled,
+        };
+    }
 }
 
 fn native_execution_pending(slot: &SharedOracleSlot) -> bool {
@@ -404,6 +508,31 @@ fn store_oracle(slot: &SharedOracleSlot, oracle: OracleResult) {
         drop(guard);
         slot.ready.notify_waiters();
     }
+}
+
+#[cfg(test)]
+fn duration_ns(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+fn record_oracle_work(
+    slot: &SharedOracleSlot,
+    phase: std::time::Duration,
+    enrichment: std::time::Duration,
+    shape: std::time::Duration,
+    oracle_network_lookups: u64,
+) {
+    slot.phase_ns
+        .store(duration_ns(phase), std::sync::atomic::Ordering::Relaxed);
+    slot.enrichment_ns.store(
+        duration_ns(enrichment),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    slot.shape_ns
+        .store(duration_ns(shape), std::sync::atomic::Ordering::Relaxed);
+    slot.oracle_network_lookups
+        .store(oracle_network_lookups, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -492,13 +621,25 @@ async fn prepare_ping(
             Ok(native) => {
                 let timed_out = native.timed_out;
                 send_terminal(&tx, &task_oracle, timed_out, native.exit_code).await;
+                #[cfg(test)]
+                let oracle_phase_started = std::time::Instant::now();
                 delay_oracle_completion_for_test().await;
+                #[cfg(test)]
+                let shape_started = std::time::Instant::now();
                 let shaped = serde_json::to_value(ping::shape_ping_output(
                     &native.raw,
                     &task_target.address.to_string(),
                     &task_target.hostname,
                     timed_out,
                 ));
+                #[cfg(test)]
+                record_oracle_work(
+                    &task_oracle,
+                    oracle_phase_started.elapsed(),
+                    std::time::Duration::ZERO,
+                    shape_started.elapsed(),
+                    0,
+                );
                 match shaped {
                     Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
@@ -552,7 +693,11 @@ fn prepare_dns(
                     }),
                 )
                 .await;
+                #[cfg(test)]
+                let oracle_phase_started = std::time::Instant::now();
                 delay_oracle_completion_for_test().await;
+                #[cfg(test)]
+                let shape_started = std::time::Instant::now();
                 let shaped = if opts.trace {
                     serde_json::to_value(dns::shape_trace_output(
                         &native.raw,
@@ -572,6 +717,14 @@ fn prepare_dns(
                         &opts.target,
                     ))
                 };
+                #[cfg(test)]
+                record_oracle_work(
+                    &task_oracle,
+                    oracle_phase_started.elapsed(),
+                    std::time::Duration::ZERO,
+                    shape_started.elapsed(),
+                    0,
+                );
                 match shaped {
                     Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
@@ -595,6 +748,50 @@ fn prepare_dns(
         traceroute_enrichment: None,
         mtr_enrichment: None,
     })
+}
+
+async fn finish_traceroute_oracle(
+    oracle: &SharedOracleSlot,
+    enrichment: &crate::command::traceroute::TracerouteEnrichmentBroker,
+    native: crate::command::traceroute::NativeTraceOutput,
+    target: &crate::util::resolve_target::ResolvedTarget,
+    remaining: std::time::Duration,
+) {
+    delay_oracle_completion_for_test().await;
+    let component_outcome = wait_component_outcome(oracle).await;
+    #[cfg(test)]
+    let oracle_phase_started = std::time::Instant::now();
+    #[cfg(test)]
+    let enrichment_started = std::time::Instant::now();
+    let hostnames = if component_outcome == ComponentOutcome::Fault {
+        enrichment.enrich_raw(&native.raw, target, remaining).await
+    } else {
+        enrichment.ready_hostnames()
+    };
+    #[cfg(test)]
+    let enrichment_elapsed = enrichment_started.elapsed();
+    #[cfg(test)]
+    let shape_started = std::time::Instant::now();
+    let shaped = serde_json::to_value(crate::command::traceroute::shape_traceroute_output(
+        &native.raw,
+        &native.stderr,
+        native.timed_out,
+        native.status.map(|status| status.success()),
+        target,
+        &hostnames,
+    ));
+    #[cfg(test)]
+    record_oracle_work(
+        oracle,
+        oracle_phase_started.elapsed(),
+        enrichment_elapsed,
+        shape_started.elapsed(),
+        enrichment.oracle_network_lookups(),
+    );
+    match shaped {
+        Ok(value) => store_oracle(oracle, Ok(value)),
+        Err(error) => store_oracle(oracle, Err(error.to_string())),
+    }
 }
 
 async fn prepare_traceroute(
@@ -654,22 +851,14 @@ async fn prepare_traceroute(
                     }),
                 )
                 .await;
-                delay_oracle_completion_for_test().await;
-                let hostnames = task_enrichment
-                    .enrich_raw(&native.raw, &task_target, deadline.remaining())
-                    .await;
-                let shaped = serde_json::to_value(traceroute::shape_traceroute_output(
-                    &native.raw,
-                    &native.stderr,
-                    timed_out,
-                    status.map(|status| status.success()),
+                finish_traceroute_oracle(
+                    &task_oracle,
+                    &task_enrichment,
+                    native,
                     &task_target,
-                    &hostnames,
-                ));
-                match shaped {
-                    Ok(value) => store_oracle(&task_oracle, Ok(value)),
-                    Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
-                }
+                    deadline.remaining(),
+                )
+                .await;
             }
             Err(error) => {
                 store_oracle(&task_oracle, Err(error.to_string()));
@@ -739,8 +928,16 @@ async fn prepare_mtr(
             Ok(native) => {
                 let timed_out = native.timed_out;
                 send_terminal(&tx, &task_oracle, timed_out, native.exit_code).await;
+                #[cfg(test)]
+                let oracle_phase_started = std::time::Instant::now();
                 delay_oracle_completion_for_test().await;
+                #[cfg(test)]
+                let enrichment_started = std::time::Instant::now();
                 enrichment.wait().await;
+                #[cfg(test)]
+                let enrichment_elapsed = enrichment_started.elapsed();
+                #[cfg(test)]
+                let shape_started = std::time::Instant::now();
                 let shaped = serde_json::to_value(mtr::shape_mtr_output(
                     &native.stdout,
                     &native.stderr,
@@ -748,6 +945,14 @@ async fn prepare_mtr(
                     &task_target,
                     &enrichment.broker().snapshot(),
                 ));
+                #[cfg(test)]
+                record_oracle_work(
+                    &task_oracle,
+                    oracle_phase_started.elapsed(),
+                    enrichment_elapsed,
+                    shape_started.elapsed(),
+                    0,
+                );
                 match shaped {
                     Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
@@ -831,8 +1036,21 @@ async fn prepare_http(
         )
         .await;
         send_terminal(&tx, &task_oracle, raw.timed_out, raw.exit_code).await;
+        #[cfg(test)]
+        let oracle_phase_started = std::time::Instant::now();
         delay_oracle_completion_for_test().await;
-        match serde_json::to_value(raw.native) {
+        #[cfg(test)]
+        let shape_started = std::time::Instant::now();
+        let shaped = serde_json::to_value(raw.native);
+        #[cfg(test)]
+        record_oracle_work(
+            &task_oracle,
+            oracle_phase_started.elapsed(),
+            std::time::Duration::ZERO,
+            shape_started.elapsed(),
+            0,
+        );
+        match shaped {
             Ok(native) => store_oracle(&task_oracle, Ok(native)),
             Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
         }
@@ -1108,6 +1326,16 @@ impl BehaviorRuntime {
             .await;
 
         let oracle = store.data().oracle.clone();
+        if let Some(oracle) = &oracle {
+            mark_component_outcome(
+                oracle,
+                if component_result.is_err() {
+                    ComponentOutcome::Fault
+                } else {
+                    ComponentOutcome::Success
+                },
+            );
+        }
         let progress = store.data().progress.clone();
         let progress_during_native_execution = store.data().progress_during_native_execution;
         drop(store);
@@ -1556,6 +1784,30 @@ mod tests {
             oracle.error
         );
         assert!(oracle.value.get("status").is_some());
+    }
+
+    #[tokio::test]
+    async fn dropping_host_releases_only_pending_component_outcomes() {
+        let (progress_sink, _rx) = crate::command::ProgressSink::channel();
+        let (mut pending_host, _pending_token) = progress_test_host(progress_sink);
+        let pending_oracle = new_oracle_slot();
+        pending_host.oracle = Some(std::sync::Arc::clone(&pending_oracle));
+        drop(pending_host);
+        assert_eq!(
+            wait_component_outcome(&pending_oracle).await,
+            ComponentOutcome::Cancelled
+        );
+
+        let (progress_sink, _rx) = crate::command::ProgressSink::channel();
+        let (mut successful_host, _successful_token) = progress_test_host(progress_sink);
+        let successful_oracle = new_oracle_slot();
+        mark_component_outcome(&successful_oracle, ComponentOutcome::Success);
+        successful_host.oracle = Some(std::sync::Arc::clone(&successful_oracle));
+        drop(successful_host);
+        assert_eq!(
+            wait_component_outcome(&successful_oracle).await,
+            ComponentOutcome::Success
+        );
     }
 
     #[cfg(target_os = "linux")]
