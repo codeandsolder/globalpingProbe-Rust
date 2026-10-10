@@ -1,10 +1,11 @@
 //! Health accounting for behavior execution health.
 //!
 //! Only failures that are attributable to the behavior component advance the
-//! rollback streak. Structurally valid divergence from the native oracle is
-//! diagnostic-only and resets the hard-fault streak; host/native failures are
-//! inconclusive so unrelated machine/network problems cannot roll back a healthy
-//! component.
+//! rollback streak. A structurally valid component success resets that streak
+//! immediately, before any native-oracle comparison finishes. Match/divergence
+//! diagnostics are tracked separately and never mutate rollback state; this makes
+//! late oracle results harmless. Host/native failures remain inconclusive so
+//! unrelated machine/network problems cannot roll back a healthy component.
 
 use std::num::NonZeroU32;
 
@@ -37,8 +38,7 @@ impl BehaviorHealthPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BehaviorHealthEvent {
-    Match,
-    Divergence,
+    Success,
     RuntimeFault,
     Inconclusive,
 }
@@ -46,8 +46,21 @@ pub enum BehaviorHealthEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HealthDecision {
     None,
-    FirstDivergence,
     RollbackRecommended,
+    IgnoredStaleSequence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BehaviorDiagnosticEvent {
+    Match,
+    Divergence,
+    OracleFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticDecision {
+    None,
+    FirstDivergence,
     IgnoredStaleSequence,
 }
 
@@ -112,18 +125,9 @@ impl BehaviorHealthState {
         }
 
         match event {
-            BehaviorHealthEvent::Match => {
-                self.snapshot.matches = self.snapshot.matches.saturating_add(1);
+            BehaviorHealthEvent::Success => {
                 self.snapshot.consecutive_faults = 0;
                 self.rollback_recommended = false;
-            }
-            BehaviorHealthEvent::Divergence => {
-                self.snapshot.divergences = self.snapshot.divergences.saturating_add(1);
-                self.snapshot.consecutive_faults = 0;
-                self.rollback_recommended = false;
-                if self.snapshot.divergences == 1 {
-                    return HealthDecision::FirstDivergence;
-                }
             }
             BehaviorHealthEvent::RuntimeFault => {
                 self.snapshot.runtime_faults = self.snapshot.runtime_faults.saturating_add(1);
@@ -145,6 +149,35 @@ impl BehaviorHealthState {
             HealthDecision::None
         }
     }
+
+    pub fn observe_diagnostic(
+        &mut self,
+        sequence: u64,
+        event: BehaviorDiagnosticEvent,
+    ) -> DiagnosticDecision {
+        if self.snapshot.active_sequence != Some(sequence) {
+            return DiagnosticDecision::IgnoredStaleSequence;
+        }
+
+        match event {
+            BehaviorDiagnosticEvent::Match => {
+                self.snapshot.matches = self.snapshot.matches.saturating_add(1);
+                DiagnosticDecision::None
+            }
+            BehaviorDiagnosticEvent::Divergence => {
+                self.snapshot.divergences = self.snapshot.divergences.saturating_add(1);
+                if self.snapshot.divergences == 1 {
+                    DiagnosticDecision::FirstDivergence
+                } else {
+                    DiagnosticDecision::None
+                }
+            }
+            BehaviorDiagnosticEvent::OracleFailure => {
+                self.snapshot.inconclusive = self.snapshot.inconclusive.saturating_add(1);
+                DiagnosticDecision::None
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -158,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_matches_reset_the_fault_streak() {
+    fn valid_component_success_resets_the_fault_streak() {
         let mut health = BehaviorHealthState::new(policy(2), Some(7));
         assert_eq!(
             health.observe(7, BehaviorHealthEvent::RuntimeFault),
@@ -166,7 +199,7 @@ mod tests {
         );
         assert_eq!(health.snapshot().consecutive_faults, 1);
         assert_eq!(
-            health.observe(7, BehaviorHealthEvent::Match),
+            health.observe(7, BehaviorHealthEvent::Success),
             HealthDecision::None
         );
         assert_eq!(health.snapshot().consecutive_faults, 0);
@@ -178,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn divergence_is_diagnostic_and_resets_the_fault_streak() {
+    fn late_oracle_diagnostics_never_mutate_the_fault_streak() {
         let mut health = BehaviorHealthState::new(policy(2), Some(8));
         assert_eq!(
             health.observe(8, BehaviorHealthEvent::RuntimeFault),
@@ -186,11 +219,17 @@ mod tests {
         );
         assert_eq!(health.snapshot().consecutive_faults, 1);
         assert_eq!(
-            health.observe(8, BehaviorHealthEvent::Divergence),
-            HealthDecision::FirstDivergence
+            health.observe_diagnostic(8, BehaviorDiagnosticEvent::Divergence),
+            DiagnosticDecision::FirstDivergence
+        );
+        assert_eq!(health.snapshot().consecutive_faults, 1);
+        assert_eq!(
+            health.observe_diagnostic(8, BehaviorDiagnosticEvent::Match),
+            DiagnosticDecision::None
         );
         let snapshot = health.snapshot();
-        assert_eq!(snapshot.consecutive_faults, 0);
+        assert_eq!(snapshot.consecutive_faults, 1);
+        assert_eq!(snapshot.matches, 1);
         assert_eq!(snapshot.divergences, 1);
         assert_eq!(snapshot.runtime_faults, 1);
     }
@@ -208,6 +247,22 @@ mod tests {
         );
         assert_eq!(health.snapshot().consecutive_faults, 1);
         assert_eq!(health.snapshot().inconclusive, 1);
+    }
+
+    #[test]
+    fn oracle_failure_is_diagnostic_only() {
+        let mut health = BehaviorHealthState::new(policy(2), Some(9));
+        assert_eq!(
+            health.observe(9, BehaviorHealthEvent::RuntimeFault),
+            HealthDecision::None
+        );
+        assert_eq!(
+            health.observe_diagnostic(9, BehaviorDiagnosticEvent::OracleFailure),
+            DiagnosticDecision::None
+        );
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.consecutive_faults, 1);
+        assert_eq!(snapshot.inconclusive, 1);
     }
 
     #[test]
@@ -233,11 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_sequence_results_are_ignored() {
+    fn stale_sequence_health_and_diagnostics_are_ignored() {
         let mut health = BehaviorHealthState::new(policy(1), Some(11));
         assert_eq!(
-            health.observe(10, BehaviorHealthEvent::Divergence),
+            health.observe(10, BehaviorHealthEvent::Success),
             HealthDecision::IgnoredStaleSequence
+        );
+        assert_eq!(
+            health.observe_diagnostic(10, BehaviorDiagnosticEvent::Divergence),
+            DiagnosticDecision::IgnoredStaleSequence
         );
         assert_eq!(health.snapshot().consecutive_faults, 0);
         assert_eq!(health.snapshot().divergences, 0);

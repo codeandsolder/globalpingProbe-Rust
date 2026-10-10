@@ -34,9 +34,11 @@ use crate::status::{
     ping_test::PingTest,
     status_manager::StatusManager,
 };
-use crate::supervisor::bootstrap::{BehaviorController, BehaviorHealthAction};
-use crate::supervisor::health::BehaviorHealthEvent;
-use crate::supervisor::runtime::{BehaviorExecutionResult, RuntimeError};
+use crate::supervisor::bootstrap::{
+    BehaviorController, BehaviorDiagnosticAction, BehaviorHealthAction,
+};
+use crate::supervisor::health::{BehaviorDiagnosticEvent, BehaviorHealthEvent};
+use crate::supervisor::runtime::{BehaviorOracle, ResolvedBehaviorOracle, RuntimeError};
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -235,22 +237,9 @@ async fn apply_behavior_health(
     controller: &BehaviorController,
     sequence: u64,
     event: BehaviorHealthEvent,
-    measurement_id: &str,
-    measurement_type: &str,
-    build_id: &str,
 ) {
     match controller.observe_health(sequence, event).await {
         Ok(BehaviorHealthAction::None) => {}
-        Ok(BehaviorHealthAction::FirstDivergence) => {
-            warn!(
-                target: "behavior-runtime",
-                measurement_id,
-                measurement_type,
-                behavior_sequence = sequence,
-                behavior_build_id = build_id,
-                "Verified behavior produced its first structurally valid divergence from the native diagnostic oracle; divergence is diagnostic-only and does not advance rollback."
-            );
-        }
         Ok(BehaviorHealthAction::IgnoredStaleSequence) => {
             debug!(
                 target: "behavior-runtime",
@@ -287,6 +276,36 @@ async fn apply_behavior_health(
     }
 }
 
+async fn apply_behavior_diagnostic(
+    controller: &BehaviorController,
+    sequence: u64,
+    event: BehaviorDiagnosticEvent,
+    measurement_id: &str,
+    measurement_type: &str,
+    build_id: &str,
+) {
+    match controller.observe_diagnostic(sequence, event).await {
+        BehaviorDiagnosticAction::None => {}
+        BehaviorDiagnosticAction::FirstDivergence => {
+            warn!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                "Verified behavior produced its first structurally valid divergence from the native diagnostic oracle; divergence is diagnostic-only and does not advance rollback."
+            );
+        }
+        BehaviorDiagnosticAction::IgnoredStaleSequence => {
+            debug!(
+                target: "behavior-runtime",
+                behavior_sequence = sequence,
+                "Ignored oracle diagnostic from a behavior slot that is no longer active."
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 static FORCE_BEHAVIOR_DIVERGENCE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
@@ -295,6 +314,19 @@ static FORCED_BEHAVIOR_MATCHES: AtomicUsize = AtomicUsize::new(0);
 static BEHAVIOR_PRESTART_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static BEHAVIOR_COMPONENT_AUTHORITIES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BEHAVIOR_DIAGNOSTIC_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+async fn wait_for_behavior_diagnostics(expected: usize) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while BEHAVIOR_DIAGNOSTIC_COMPLETIONS.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected} behavior diagnostics"));
+}
 
 const fn behavior_error_health_event(error: &RuntimeError) -> BehaviorHealthEvent {
     if error.is_component_health_fault() {
@@ -310,98 +342,289 @@ enum BehaviorResultAuthority {
     OracleFallback,
 }
 
-fn select_behavior_result(result: BehaviorExecutionResult) -> (Value, BehaviorResultAuthority) {
-    let BehaviorExecutionResult {
-        oracle,
-        oracle_error,
-        component,
-        ..
-    } = result;
-    if oracle_error.is_none()
-        && let Ok(component) = component
-    {
-        return (component, BehaviorResultAuthority::Component);
-    }
-    (oracle, BehaviorResultAuthority::OracleFallback)
-}
-
-fn classify_behavior_health(
-    result: &Result<BehaviorExecutionResult, RuntimeError>,
+fn log_behavior_error(
+    error: &RuntimeError,
+    after_native_start: bool,
     measurement_id: &str,
     measurement_type: &str,
     sequence: u64,
     build_id: &str,
 ) -> BehaviorHealthEvent {
-    match result {
-        Ok(result) if result.oracle_error.is_some() => {
-            warn!(
-                target: "behavior-runtime",
-                measurement_id,
-                measurement_type,
-                behavior_sequence = sequence,
-                behavior_build_id = build_id,
-                oracle_error = result.oracle_error.as_deref().unwrap_or("unknown native failure"),
-                "Native execution failed while behavior diagnostics were active."
-            );
-            BehaviorHealthEvent::Inconclusive
-        }
-        Ok(result) => match &result.component {
-            Ok(component) if component == &result.oracle => {
+    let event = behavior_error_health_event(error);
+    warn!(
+        target: "behavior-runtime",
+        measurement_id,
+        measurement_type,
+        behavior_sequence = sequence,
+        behavior_build_id = build_id,
+        component_health_fault = error.is_component_health_fault(),
+        %error,
+        phase = if after_native_start { "post-start" } else { "pre-start" },
+        "Behavior execution failed."
+    );
+    event
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diagnostic task needs immutable measurement identity plus execution metadata"
+)]
+async fn record_behavior_diagnostic(
+    controller: &BehaviorController,
+    resolved: &ResolvedBehaviorOracle,
+    component: &Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+    progress_events: usize,
+    streamed_progress: bool,
+    #[cfg(test)] original_component: Option<&Value>,
+) {
+    #[cfg(test)]
+    if original_component
+        .is_some_and(|original| resolved.error.is_none() && original == &resolved.value)
+    {
+        FORCED_BEHAVIOR_MATCHES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let event = resolved.error.as_deref().map_or_else(
+        || {
+            if component == &resolved.value {
                 debug!(
                     target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
                     behavior_sequence = sequence,
                     behavior_build_id = build_id,
-                    progress_events = result.progress.len(),
-                    streamed_progress = result.progress_during_native_execution,
+                    progress_events,
+                    streamed_progress,
                     "Behavior result matched its native diagnostic oracle."
                 );
-                BehaviorHealthEvent::Match
-            }
-            Ok(_) => {
+                BehaviorDiagnosticEvent::Match
+            } else {
                 debug!(
                     target: "behavior-runtime",
                     measurement_id,
                     measurement_type,
                     behavior_sequence = sequence,
                     behavior_build_id = build_id,
-                    progress_events = result.progress.len(),
-                    streamed_progress = result.progress_during_native_execution,
+                    progress_events,
+                    streamed_progress,
                     "Behavior result diverged from its native diagnostic oracle; the result remains authoritative and divergence is diagnostic-only."
                 );
-                BehaviorHealthEvent::Divergence
-            }
-            Err(error) => {
-                let event = behavior_error_health_event(error);
-                warn!(
-                    target: "behavior-runtime",
-                    measurement_id,
-                    measurement_type,
-                    behavior_sequence = sequence,
-                    behavior_build_id = build_id,
-                    component_health_fault = error.is_component_health_fault(),
-                    %error,
-                    "Behavior execution failed after native execution started."
-                );
-                event
+                BehaviorDiagnosticEvent::Divergence
             }
         },
-        Err(error) => {
-            let event = behavior_error_health_event(error);
+        |error| {
             warn!(
                 target: "behavior-runtime",
                 measurement_id,
                 measurement_type,
                 behavior_sequence = sequence,
                 behavior_build_id = build_id,
-                component_health_fault = error.is_component_health_fault(),
-                %error,
-                "Behavior execution failed before native execution started."
+                oracle_error = error,
+                "Native execution failed after an authoritative behavior result was already available."
             );
-            event
+            BehaviorDiagnosticEvent::OracleFailure
+        },
+    );
+
+    apply_behavior_diagnostic(
+        controller,
+        sequence,
+        event,
+        measurement_id,
+        measurement_type,
+        build_id,
+    )
+    .await;
+
+    #[cfg(test)]
+    BEHAVIOR_DIAGNOSTIC_COMPLETIONS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diagnostic task owns immutable measurement identity plus execution metadata"
+)]
+async fn finish_behavior_diagnostic(
+    controller: Arc<BehaviorController>,
+    oracle: BehaviorOracle,
+    component: Value,
+    measurement_id: String,
+    measurement_type: String,
+    sequence: u64,
+    build_id: String,
+    progress_events: usize,
+    streamed_progress: bool,
+    #[cfg(test)] original_component: Option<Value>,
+) {
+    let resolved = oracle.resolve().await;
+    record_behavior_diagnostic(
+        &controller,
+        &resolved,
+        &component,
+        &measurement_id,
+        &measurement_type,
+        sequence,
+        &build_id,
+        progress_events,
+        streamed_progress,
+        #[cfg(test)]
+        original_component.as_ref(),
+    )
+    .await;
+}
+
+async fn finish_behavior_fault(
+    controller: &BehaviorController,
+    oracle: BehaviorOracle,
+    error: &RuntimeError,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+) -> Value {
+    let resolved = oracle.resolve().await;
+    let health_event = resolved.error.as_deref().map_or_else(
+        || {
+            log_behavior_error(
+                error,
+                true,
+                measurement_id,
+                measurement_type,
+                sequence,
+                build_id,
+            )
+        },
+        |oracle_error| {
+            warn!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                oracle_error,
+                "Native execution failed while behavior fault fallback was required."
+            );
+            BehaviorHealthEvent::Inconclusive
+        },
+    );
+    apply_behavior_health(controller, sequence, health_event).await;
+    let authority = BehaviorResultAuthority::OracleFallback;
+    debug!(
+        target: "behavior-runtime",
+        measurement_id,
+        measurement_type,
+        behavior_sequence = sequence,
+        behavior_build_id = build_id,
+        ?authority,
+        "Selected final measurement result after behavior fault."
+    );
+    resolved.value
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "success handling needs immutable measurement identity plus execution metadata"
+)]
+async fn finish_behavior_success(
+    controller: &Arc<BehaviorController>,
+    oracle: BehaviorOracle,
+    component: Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+    progress_events: usize,
+    streamed_progress: bool,
+) -> Value {
+    #[cfg(test)]
+    let (component, original_component) = if FORCE_BEHAVIOR_DIVERGENCE.load(Ordering::SeqCst) {
+        let original = component.clone();
+        let mut divergent = component;
+        divergent["__forcedHealthTestDivergence"] = Value::Bool(true);
+        (divergent, Some(original))
+    } else {
+        (component, None)
+    };
+
+    if let Some(resolved) = oracle.try_resolve() {
+        if resolved.error.is_some() {
+            record_behavior_diagnostic(
+                controller,
+                &resolved,
+                &component,
+                measurement_id,
+                measurement_type,
+                sequence,
+                build_id,
+                progress_events,
+                streamed_progress,
+                #[cfg(test)]
+                original_component.as_ref(),
+            )
+            .await;
+            let authority = BehaviorResultAuthority::OracleFallback;
+            debug!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                ?authority,
+                "Selected native failure result because the oracle had already failed."
+            );
+            return resolved.value;
         }
+
+        apply_behavior_health(controller, sequence, BehaviorHealthEvent::Success).await;
+        record_behavior_diagnostic(
+            controller,
+            &resolved,
+            &component,
+            measurement_id,
+            measurement_type,
+            sequence,
+            build_id,
+            progress_events,
+            streamed_progress,
+            #[cfg(test)]
+            original_component.as_ref(),
+        )
+        .await;
+    } else {
+        apply_behavior_health(controller, sequence, BehaviorHealthEvent::Success).await;
+        let diagnostic_component = component.clone();
+        tokio::spawn(finish_behavior_diagnostic(
+            Arc::clone(controller),
+            oracle,
+            diagnostic_component,
+            measurement_id.to_string(),
+            measurement_type.to_string(),
+            sequence,
+            build_id.to_string(),
+            progress_events,
+            streamed_progress,
+            #[cfg(test)]
+            original_component,
+        ));
     }
+
+    #[cfg(test)]
+    BEHAVIOR_COMPONENT_AUTHORITIES.fetch_add(1, Ordering::SeqCst);
+    let authority = BehaviorResultAuthority::Component;
+    debug!(
+        target: "behavior-runtime",
+        measurement_id,
+        measurement_type,
+        behavior_sequence = sequence,
+        behavior_build_id = build_id,
+        ?authority,
+        "Selected final measurement result without waiting for a pending diagnostic oracle."
+    );
+    component
 }
 
 async fn run_behavior_measurement(
@@ -419,64 +642,50 @@ async fn run_behavior_measurement(
         .run_with_behavior_progress(measurement.clone(), behavior_progress_sink)
         .await;
 
-    #[cfg(test)]
-    let execution_result = {
-        let mut execution_result = execution_result;
-        if let Ok(result) = &mut execution_result {
-            if FORCE_BEHAVIOR_DIVERGENCE.load(Ordering::SeqCst) {
-                if result.oracle_error.is_none()
-                    && result
-                        .component
-                        .as_ref()
-                        .is_ok_and(|component| component == &result.oracle)
-                {
-                    FORCED_BEHAVIOR_MATCHES.fetch_add(1, Ordering::SeqCst);
-                }
-                if let Ok(component) = &mut result.component {
-                    component["__forcedHealthTestDivergence"] = Value::Bool(true);
-                }
-            }
-        }
-        execution_result
-    };
-
-    let health_event = classify_behavior_health(
-        &execution_result,
-        measurement_id,
-        measurement_type,
-        sequence,
-        &build_id,
-    );
-    apply_behavior_health(
-        controller,
-        sequence,
-        health_event,
-        measurement_id,
-        measurement_type,
-        &build_id,
-    )
-    .await;
-
-    Some(match execution_result {
-        Ok(result) => {
-            let (value, authority) = select_behavior_result(result);
-            #[cfg(test)]
-            if authority == BehaviorResultAuthority::Component {
-                BEHAVIOR_COMPONENT_AUTHORITIES.fetch_add(1, Ordering::SeqCst);
-            }
-            debug!(
-                target: "behavior-runtime",
+    let result = match execution_result {
+        Ok(result) => result,
+        Err(error) => {
+            let health_event = log_behavior_error(
+                &error,
+                false,
                 measurement_id,
                 measurement_type,
-                behavior_sequence = sequence,
-                behavior_build_id = %build_id,
-                ?authority,
-                "Selected final measurement result."
+                sequence,
+                &build_id,
             );
-            Ok(value)
+            apply_behavior_health(controller, sequence, health_event).await;
+            return Some(Err(error));
         }
-        Err(error) => Err(error),
-    })
+    };
+
+    let oracle = result.oracle_handle();
+    let progress_events = result.progress.len();
+    let streamed_progress = result.progress_during_native_execution;
+
+    match result.component {
+        Ok(component) => Some(Ok(finish_behavior_success(
+            controller,
+            oracle,
+            component,
+            measurement_id,
+            measurement_type,
+            sequence,
+            &build_id,
+            progress_events,
+            streamed_progress,
+        )
+        .await)),
+        Err(error) => Some(Ok(finish_behavior_fault(
+            controller,
+            oracle,
+            &error,
+            measurement_id,
+            measurement_type,
+            sequence,
+            &build_id,
+        )
+        .await)),
+    }
 }
 
 async fn run_measurement(
@@ -523,9 +732,8 @@ async fn run_measurement(
 
 /// Run one measurement job and emit the result back to the API.
 ///
-/// `limiter` guards the concurrency cap; the acquired slot is held for the
-/// entire duration of the measurement and released automatically when this
-/// function returns.
+/// The `ActiveJob` guard tracks stats and graceful shutdown for the API-visible
+/// measurement lifetime; upstream-compatible dispatch imposes no local cap.
 pub async fn dispatch(
     req: MeasurementRequest,
     client: Client,
@@ -1220,11 +1428,13 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 ///
 /// The controller supplies only verified/self-tested behavior executors. When
 /// enabled, WASM and the native diagnostic oracle share one supervisor-owned
-/// execution. A successful component result is authoritative; component/native
-/// execution faults use the already-computed native result without rerunning
-/// the measurement. Verified WASM progress is API-facing when behavior is active;
-/// native progress is suppressed on that shared execution and is used only for
-/// native-only or pre-start fallback paths.
+/// execution. A successful structurally valid component result is authoritative
+/// and does not wait for pending native shaping/enrichment; the sequence-gated
+/// oracle comparison completes independently and cannot mutate rollback streak
+/// state. Post-start component faults wait for the same-run native result and
+/// fall back without rerunning the measurement. Verified WASM progress is
+/// API-facing when behavior is active; native progress is suppressed on that
+/// shared execution and is used only for native-only or pre-start fallback paths.
 ///
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
@@ -1575,61 +1785,20 @@ mod tests {
         ));
     }
 
-    fn behavior_result(
-        oracle: Value,
-        component: Result<Value, RuntimeError>,
-        oracle_error: Option<String>,
-    ) -> BehaviorExecutionResult {
-        BehaviorExecutionResult {
-            oracle,
-            oracle_error,
-            component,
-            progress: Vec::new(),
-            progress_during_native_execution: false,
-        }
+    #[test]
+    fn attributable_behavior_error_advances_fault_health() {
+        assert_eq!(
+            behavior_error_health_event(&RuntimeError::GuestInvalidOutput("bad shape".to_string())),
+            BehaviorHealthEvent::RuntimeFault
+        );
     }
 
     #[test]
-    fn exact_behavior_result_becomes_authoritative() {
-        let value = json!({"status": "finished", "rawOutput": "same"});
-        let (selected, authority) =
-            select_behavior_result(behavior_result(value.clone(), Ok(value.clone()), None));
-        assert_eq!(selected, value);
-        assert_eq!(authority, BehaviorResultAuthority::Component);
-    }
-
-    #[test]
-    fn divergent_behavior_result_remains_component_authoritative() {
-        let native = json!({"status": "finished", "rawOutput": "native"});
-        let component = json!({"status": "finished", "rawOutput": "component"});
-        let (selected, authority) =
-            select_behavior_result(behavior_result(native, Ok(component.clone()), None));
-        assert_eq!(selected, component);
-        assert_eq!(authority, BehaviorResultAuthority::Component);
-    }
-
-    #[test]
-    fn behavior_fault_uses_native_fallback() {
-        let native = json!({"status": "finished", "rawOutput": "native"});
-        let component = Err(RuntimeError::GuestInvalidJob("fixture fault".to_string()));
-        let (selected, authority) =
-            select_behavior_result(behavior_result(native.clone(), component, None));
-        assert_eq!(selected, native);
-        assert_eq!(authority, BehaviorResultAuthority::OracleFallback);
-    }
-
-    #[test]
-    fn oracle_failure_uses_oracle_fallback() {
-        let native = json!({
-            "status": "failed", "failureSource": "internal", "rawOutput": "native failed"
-        });
-        let (selected, authority) = select_behavior_result(behavior_result(
-            native.clone(),
-            Ok(native.clone()),
-            Some("native failed".to_string()),
-        ));
-        assert_eq!(selected, native);
-        assert_eq!(authority, BehaviorResultAuthority::OracleFallback);
+    fn ambiguous_guest_internal_error_is_inconclusive() {
+        assert_eq!(
+            behavior_error_health_event(&RuntimeError::GuestInternal("fixture".to_string())),
+            BehaviorHealthEvent::Inconclusive
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1718,6 +1887,7 @@ mod tests {
 
         BEHAVIOR_COMPONENT_AUTHORITIES.store(0, Ordering::SeqCst);
         BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
         for (index, measurement) in live_behavior_cases().into_iter().enumerate() {
             let measurement_type = measurement["type"]
                 .as_str()
@@ -1737,6 +1907,7 @@ mod tests {
 
         assert_eq!(BEHAVIOR_COMPONENT_AUTHORITIES.load(Ordering::SeqCst), 6);
         assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        wait_for_behavior_diagnostics(6).await;
         let health = controller.health_snapshot().await;
         assert_eq!(health.active_sequence, Some(1));
         assert_eq!(health.matches, 6);
@@ -1785,6 +1956,7 @@ mod tests {
             }
         }
         FORCED_BEHAVIOR_MATCHES.store(0, Ordering::SeqCst);
+        BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
         FORCE_BEHAVIOR_DIVERGENCE.store(true, Ordering::SeqCst);
         let _forced_divergence = ForcedDivergenceGuard;
 
@@ -1803,6 +1975,7 @@ mod tests {
             .await
             .unwrap_or_else(|| panic!("active behavior executor must exist"));
             shared.unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+            wait_for_behavior_diagnostics(index + 1).await;
 
             assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
             let health = controller.health_snapshot().await;
@@ -1964,6 +2137,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("divergent behavior activation failed: {error}"));
 
         BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
         let result = run_measurement(
             &CommandKind::Ping,
             json!({
@@ -1977,6 +2151,7 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+        wait_for_behavior_diagnostics(1).await;
 
         assert!(result.get("status").and_then(Value::as_str).is_some());
         assert!(

@@ -921,7 +921,12 @@ mod tests {
                 .run(tcp_ping_measurement())
                 .await
                 .unwrap_or_else(|error| panic!("healthy behavior execution failed: {error}"));
-            assert!(result.oracle_error.is_none());
+            let oracle = result.resolve_oracle().await;
+            assert!(
+                oracle.error.is_none(),
+                "healthy oracle failed: {:?}",
+                oracle.error
+            );
             assert!(result.component.is_ok());
             controller
         }
@@ -943,7 +948,12 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("bad behavior execution failed before native start: {error}")
                 });
-            assert!(result.oracle_error.is_none());
+            let oracle = result.resolve_oracle().await;
+            assert!(
+                oracle.error.is_none(),
+                "fault fallback oracle failed: {:?}",
+                oracle.error
+            );
             let component_error = result
                 .component
                 .err()

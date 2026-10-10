@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 
 use ed25519_dalek::{Signer as _, SigningKey};
 use globalping_probe::supervisor::bootstrap::{
-    BehaviorBootstrapConfig, BehaviorController, BehaviorHealthAction, BootstrapError,
+    BehaviorBootstrapConfig, BehaviorController, BehaviorDiagnosticAction, BehaviorHealthAction,
+    BootstrapError,
 };
-use globalping_probe::supervisor::health::{BehaviorHealthEvent, BehaviorHealthPolicy};
+use globalping_probe::supervisor::health::{
+    BehaviorDiagnosticEvent, BehaviorHealthEvent, BehaviorHealthPolicy,
+};
 use globalping_probe::supervisor::runtime::{BehaviorExecutor, BehaviorRuntime};
 use globalping_probe::supervisor::storage::{PersistentBehaviorSlots, StorageError};
 use globalping_probe::supervisor::update::{
@@ -215,10 +218,16 @@ async fn behavior_controller_auto_rolls_back_after_hard_fault_threshold() {
 
     assert_eq!(
         controller
-            .observe_health(2, BehaviorHealthEvent::Divergence)
+            .observe_health(2, BehaviorHealthEvent::Success)
             .await
-            .unwrap_or_else(|error| panic!("health accounting failed: {error}")),
-        BehaviorHealthAction::FirstDivergence
+            .unwrap_or_else(|error| panic!("success health accounting failed: {error}")),
+        BehaviorHealthAction::None
+    );
+    assert_eq!(
+        controller
+            .observe_diagnostic(2, BehaviorDiagnosticEvent::Divergence)
+            .await,
+        BehaviorDiagnosticAction::FirstDivergence
     );
     let divergent_health = controller.health_snapshot().await;
     assert_eq!(divergent_health.consecutive_faults, 0);
@@ -232,6 +241,17 @@ async fn behavior_controller_auto_rolls_back_after_hard_fault_threshold() {
         BehaviorHealthAction::None
     );
     assert_eq!(controller.health_snapshot().await.consecutive_faults, 1);
+    assert_eq!(
+        controller
+            .observe_diagnostic(2, BehaviorDiagnosticEvent::Match)
+            .await,
+        BehaviorDiagnosticAction::None
+    );
+    assert_eq!(
+        controller.health_snapshot().await.consecutive_faults,
+        1,
+        "a late oracle diagnostic must not erase a newer component fault"
+    );
 
     assert_eq!(
         controller

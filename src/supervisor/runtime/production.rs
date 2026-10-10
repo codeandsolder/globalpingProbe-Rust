@@ -7,22 +7,72 @@ use super::{
 
 #[derive(Debug)]
 pub struct BehaviorExecutionResult {
-    pub oracle: serde_json::Value,
-    pub oracle_error: Option<String>,
+    oracle: BehaviorOracle,
     pub component: Result<serde_json::Value, RuntimeError>,
     pub progress: Vec<(serde_json::Value, BufferMode)>,
     pub progress_during_native_execution: bool,
 }
 
+impl BehaviorExecutionResult {
+    pub(crate) fn oracle_handle(&self) -> BehaviorOracle {
+        self.oracle.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn resolve_oracle(&self) -> ResolvedBehaviorOracle {
+        self.oracle.resolve().await
+    }
+}
+
 type OracleResult = Result<serde_json::Value, String>;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct OracleSlot {
     result: std::sync::Mutex<Option<OracleResult>>,
     ready: tokio::sync::Notify,
+    native_complete: std::sync::atomic::AtomicBool,
 }
 
 type SharedOracleSlot = std::sync::Arc<OracleSlot>;
+
+#[derive(Clone, Debug)]
+pub struct BehaviorOracle {
+    slot: SharedOracleSlot,
+}
+
+#[derive(Debug)]
+pub struct ResolvedBehaviorOracle {
+    pub value: serde_json::Value,
+    pub error: Option<String>,
+}
+
+impl BehaviorOracle {
+    pub fn try_resolve(&self) -> Option<ResolvedBehaviorOracle> {
+        match read_oracle(&self.slot) {
+            Ok(Some(result)) => Some(resolve_oracle_result(result)),
+            Ok(None) => None,
+            Err(error) => Some(resolve_oracle_result(Err(error))),
+        }
+    }
+
+    pub async fn resolve(&self) -> ResolvedBehaviorOracle {
+        resolve_oracle_result(wait_oracle(&self.slot).await)
+    }
+}
+
+fn resolve_oracle_result(result: OracleResult) -> ResolvedBehaviorOracle {
+    match result {
+        Ok(value) => ResolvedBehaviorOracle { value, error: None },
+        Err(error) => ResolvedBehaviorOracle {
+            value: serde_json::json!({
+                "status": "failed",
+                "failureSource": "internal",
+                "rawOutput": error,
+            }),
+            error: Some(error),
+        },
+    }
+}
 
 struct StartedExecution {
     start: wit_host::ExecutionStartResult,
@@ -213,10 +263,6 @@ fn read_oracle(slot: &SharedOracleSlot) -> Result<Option<OracleResult>, String> 
         .map(|guard| guard.clone())
 }
 
-fn oracle_pending(slot: &SharedOracleSlot) -> bool {
-    read_oracle(slot).is_ok_and(|result| result.is_none())
-}
-
 async fn wait_oracle(slot: &SharedOracleSlot) -> OracleResult {
     loop {
         let notified = slot.ready.notified();
@@ -248,6 +294,7 @@ fn resolution_failed_execution_with_message(
     let (_tx, events) = crate::command::RawExecutionTx::channel();
     let oracle = new_oracle_slot();
     store_oracle(&oracle, Ok(native));
+    mark_native_complete(&oracle);
     StartedExecution {
         start: wit_host::ExecutionStartResult::ResolutionFailed(wit_host::ResolutionFailure {
             kind: reason,
@@ -267,6 +314,17 @@ fn resolution_failed_execution(
     resolution_failed_execution_with_message(reason, None, native)
 }
 
+fn mark_native_complete(slot: &SharedOracleSlot) {
+    slot.native_complete
+        .store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn native_execution_pending(slot: &SharedOracleSlot) -> bool {
+    !slot
+        .native_complete
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn store_oracle(slot: &SharedOracleSlot, oracle: OracleResult) {
     if let Ok(mut guard) = slot.result.lock() {
         *guard = Some(oracle);
@@ -275,11 +333,30 @@ fn store_oracle(slot: &SharedOracleSlot, oracle: OracleResult) {
     }
 }
 
+#[cfg(test)]
+static ORACLE_COMPLETION_DELAY_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+async fn delay_oracle_completion_for_test() {
+    let delay_ms = ORACLE_COMPLETION_DELAY_MS.load(std::sync::atomic::Ordering::SeqCst);
+    if delay_ms != 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+}
+
+#[cfg(not(test))]
+fn delay_oracle_completion_for_test() -> std::future::Ready<()> {
+    std::future::ready(())
+}
+
 async fn send_terminal(
     tx: &crate::command::RawExecutionTx,
+    oracle: &SharedOracleSlot,
     timed_out: bool,
     exit_code: Option<i32>,
 ) {
+    mark_native_complete(oracle);
     let event = if timed_out {
         crate::command::RawExecutionEvent::TimedOut
     } else {
@@ -341,6 +418,8 @@ async fn prepare_ping(
         match native {
             Ok(native) => {
                 let timed_out = native.timed_out;
+                send_terminal(&tx, &task_oracle, timed_out, native.exit_code).await;
+                delay_oracle_completion_for_test().await;
                 let shaped = serde_json::to_value(ping::shape_ping_output(
                     &native.raw,
                     &task_target.address.to_string(),
@@ -351,11 +430,10 @@ async fn prepare_ping(
                     Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
                 }
-                send_terminal(&tx, timed_out, native.exit_code).await;
             }
             Err(error) => {
                 store_oracle(&task_oracle, Err(error.to_string()));
-                send_terminal(&tx, false, Some(1)).await;
+                send_terminal(&tx, &task_oracle, false, Some(1)).await;
             }
         }
     });
@@ -390,6 +468,18 @@ fn prepare_dns(
         match dns::run_dig_stream(&opts, native_progress.as_ref(), &tx).await {
             Ok(native) => {
                 let process_failed = native.status.is_some_and(|status| !status.success());
+                send_terminal(
+                    &tx,
+                    &task_oracle,
+                    native.timed_out,
+                    native.status.map(|status| {
+                        status
+                            .code()
+                            .unwrap_or_else(|| i32::from(!status.success()))
+                    }),
+                )
+                .await;
+                delay_oracle_completion_for_test().await;
                 let shaped = if opts.trace {
                     serde_json::to_value(dns::shape_trace_output(
                         &native.raw,
@@ -410,25 +500,13 @@ fn prepare_dns(
                     ))
                 };
                 match shaped {
-                    Ok(value) => {
-                        store_oracle(&task_oracle, Ok(value));
-                        send_terminal(
-                            &tx,
-                            native.timed_out,
-                            native.status.map(|status| {
-                                status
-                                    .code()
-                                    .unwrap_or_else(|| i32::from(!status.success()))
-                            }),
-                        )
-                        .await;
-                    }
+                    Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
                 }
             }
             Err(error) => {
                 store_oracle(&task_oracle, Err(error.to_string()));
-                send_terminal(&tx, false, Some(1)).await;
+                send_terminal(&tx, &task_oracle, false, Some(1)).await;
             }
         }
     });
@@ -492,6 +570,18 @@ async fn prepare_traceroute(
             Ok(native) => {
                 let timed_out = native.timed_out;
                 let status = native.status;
+                send_terminal(
+                    &tx,
+                    &task_oracle,
+                    timed_out,
+                    status.map(|status| {
+                        status
+                            .code()
+                            .unwrap_or_else(|| i32::from(!status.success()))
+                    }),
+                )
+                .await;
+                delay_oracle_completion_for_test().await;
                 let hostnames = task_enrichment
                     .enrich_raw(&native.raw, &task_target, deadline.remaining())
                     .await;
@@ -507,20 +597,10 @@ async fn prepare_traceroute(
                     Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
                 }
-                send_terminal(
-                    &tx,
-                    timed_out,
-                    status.map(|status| {
-                        status
-                            .code()
-                            .unwrap_or_else(|| i32::from(!status.success()))
-                    }),
-                )
-                .await;
             }
             Err(error) => {
                 store_oracle(&task_oracle, Err(error.to_string()));
-                send_terminal(&tx, false, Some(1)).await;
+                send_terminal(&tx, &task_oracle, false, Some(1)).await;
             }
         }
     });
@@ -584,8 +664,10 @@ async fn prepare_mtr(
         .await
         {
             Ok(native) => {
-                enrichment.wait().await;
                 let timed_out = native.timed_out;
+                send_terminal(&tx, &task_oracle, timed_out, native.exit_code).await;
+                delay_oracle_completion_for_test().await;
+                enrichment.wait().await;
                 let shaped = serde_json::to_value(mtr::shape_mtr_output(
                     &native.stdout,
                     &native.stderr,
@@ -597,11 +679,10 @@ async fn prepare_mtr(
                     Ok(value) => store_oracle(&task_oracle, Ok(value)),
                     Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
                 }
-                send_terminal(&tx, timed_out, native.exit_code).await;
             }
             Err(error) => {
                 store_oracle(&task_oracle, Err(error.to_string()));
-                send_terminal(&tx, false, Some(1)).await;
+                send_terminal(&tx, &task_oracle, false, Some(1)).await;
             }
         }
     });
@@ -676,11 +757,10 @@ async fn prepare_http(
             &tx,
         )
         .await;
+        send_terminal(&tx, &task_oracle, raw.timed_out, raw.exit_code).await;
+        delay_oracle_completion_for_test().await;
         match serde_json::to_value(raw.native) {
-            Ok(native) => {
-                store_oracle(&task_oracle, Ok(native));
-                send_terminal(&tx, raw.timed_out, raw.exit_code).await;
-            }
+            Ok(native) => store_oracle(&task_oracle, Ok(native)),
             Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
         }
     });
@@ -912,7 +992,7 @@ impl wit_host::Host for ProductionHost {
                 ));
             }
             self.progress_mode = Some(mode);
-            if self.oracle.as_ref().is_some_and(oracle_pending) {
+            if self.oracle.as_ref().is_some_and(native_execution_pending) {
                 self.progress_during_native_execution = true;
             }
             if let Some(tx) = &self.behavior_progress_sink {
@@ -1013,20 +1093,8 @@ impl BehaviorRuntime {
             };
         };
 
-        let (oracle, oracle_error) = match wait_oracle(&oracle).await {
-            Ok(native) => (native, None),
-            Err(error) => (
-                serde_json::json!({
-                    "status": "failed",
-                    "failureSource": "internal",
-                    "rawOutput": error,
-                }),
-                Some(error),
-            ),
-        };
         Ok(BehaviorExecutionResult {
-            oracle,
-            oracle_error,
+            oracle: BehaviorOracle { slot: oracle },
             component: component_result,
             progress,
             progress_during_native_execution,
@@ -1068,7 +1136,8 @@ impl BehaviorExecutor {
 
     /// Run one behavior execution without an external progress sink. Guest
     /// progress remains bounded and recorded in the result for diagnostics and
-    /// parity checks.
+    /// parity checks. A structurally valid component result may return before the
+    /// same-run native diagnostic oracle finishes shaping or enrichment.
     ///
     /// # Errors
     /// Returns a failure only when the behavior fails before native execution
@@ -1089,6 +1158,7 @@ impl BehaviorExecutor {
     /// # Errors
     /// Returns a failure only when the behavior fails before native execution
     /// starts; post-start guest failures are carried in `BehaviorExecutionResult`.
+    /// Successful component results do not wait for native diagnostic shaping.
     pub(crate) async fn run_with_behavior_progress(
         &self,
         measurement: serde_json::Value,
@@ -1321,6 +1391,104 @@ mod tests {
         .err()
         .unwrap_or_else(|| panic!("mid-measurement progress mode change unexpectedly succeeded"));
         assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn progress_streaming_flag_tracks_native_completion_not_oracle() {
+        let (before_sink, _before_rx) = crate::command::ProgressSink::channel();
+        let (mut before_host, before_token) = progress_test_host(before_sink);
+        let before_oracle = new_oracle_slot();
+        before_host.oracle = Some(std::sync::Arc::clone(&before_oracle));
+        wit_host::Host::emit_progress(
+            &mut before_host,
+            before_token,
+            r#"{"rawOutput":"before-completion"}"#.to_string(),
+            wit_host::ProgressMode::Diff,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("pre-completion progress failed: {error:?}"));
+        assert!(before_host.progress_during_native_execution);
+
+        let (after_sink, _after_rx) = crate::command::ProgressSink::channel();
+        let (mut after_host, after_token) = progress_test_host(after_sink);
+        let (tx, events) = crate::command::RawExecutionTx::channel();
+        let after_oracle = new_oracle_slot();
+        after_host.events = Some(events);
+        after_host.oracle = Some(std::sync::Arc::clone(&after_oracle));
+        send_terminal(&tx, &after_oracle, false, Some(0)).await;
+        assert!(
+            after_oracle
+                .result
+                .lock()
+                .is_ok_and(|guard| guard.is_none()),
+            "terminal delivery must not imply oracle completion"
+        );
+        wit_host::Host::emit_progress(
+            &mut after_host,
+            after_token,
+            r#"{"rawOutput":"after-completion-before-terminal-poll"}"#.to_string(),
+            wit_host::ProgressMode::Diff,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("post-completion progress failed: {error:?}"));
+        assert!(
+            !after_host.progress_during_native_execution,
+            "queued terminal must mark native execution complete before the guest polls it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus a prebuilt WASIp2 behavior component"]
+    async fn valid_behavior_returns_before_delayed_oracle_completion() {
+        struct OracleDelayGuard;
+        impl Drop for OracleDelayGuard {
+            fn drop(&mut self) {
+                ORACLE_COMPLETION_DELAY_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT").map_or_else(
+            || panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT is required"),
+            std::path::PathBuf::from,
+        );
+        let runtime = BehaviorRuntime::new()
+            .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let component = Component::from_binary(runtime.engine(), &bytes)
+            .unwrap_or_else(|error| panic!("component compilation failed: {error}"));
+
+        ORACLE_COMPLETION_DELAY_MS.store(2_000, std::sync::atomic::Ordering::SeqCst);
+        let _delay_guard = OracleDelayGuard;
+        let execution = runtime
+            .execute_component(
+                &component,
+                serde_json::json!({
+                    "type": "ping",
+                    "target": "1.1.1.1",
+                    "protocol": "TCP",
+                    "port": 443,
+                    "packets": 1,
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": false
+                }),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("behavior execution failed: {error}"));
+        let component_result = execution
+            .component
+            .as_ref()
+            .unwrap_or_else(|error| panic!("component failed: {error}"));
+        assert!(
+            execution.oracle.try_resolve().is_none(),
+            "valid behavior waited for the deliberately delayed diagnostic oracle"
+        );
+        let oracle = execution.resolve_oracle().await;
+        assert!(oracle.error.is_none(), "oracle failed: {:?}", oracle.error);
+        assert_eq!(component_result, &oracle.value);
     }
 
     #[tokio::test]

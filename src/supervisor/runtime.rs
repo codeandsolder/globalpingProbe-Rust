@@ -243,6 +243,7 @@ wasmtime::component::bindgen!({
 
 mod production;
 pub use production::{BehaviorExecutionResult, BehaviorExecutor};
+pub(crate) use production::{BehaviorOracle, ResolvedBehaviorOracle};
 
 #[cfg(test)]
 mod differential_tests {
@@ -1540,10 +1541,13 @@ no answer yet for icmp_seq=1\n\
                 .component
                 .as_ref()
                 .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
-            assert_eq!(
-                component, &execution.oracle,
-                "{kind} behavior/oracle mismatch"
+            let oracle = execution.resolve_oracle().await;
+            assert!(
+                oracle.error.is_none(),
+                "{kind} oracle failed: {:?}",
+                oracle.error
             );
+            assert_eq!(component, &oracle.value, "{kind} behavior/oracle mismatch");
             assert!(
                 !execution.progress.is_empty(),
                 "{kind} should emit progress through the real host adapter"
@@ -1618,8 +1622,14 @@ no answer yet for icmp_seq=1\n\
                 .component
                 .as_ref()
                 .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
+            let oracle = execution.resolve_oracle().await;
+            assert!(
+                oracle.error.is_none(),
+                "{kind} oracle failed: {:?}",
+                oracle.error
+            );
             assert_eq!(
-                component, &execution.oracle,
+                component, &oracle.value,
                 "{kind} resolution failure mismatch"
             );
             assert_eq!(component["status"], "failed");
@@ -1651,7 +1661,9 @@ no answer yet for icmp_seq=1\n\
             .component
             .as_ref()
             .unwrap_or_else(|error| panic!("component failed: {error}"));
-        assert_eq!(component, &execution.oracle);
+        let oracle = execution.resolve_oracle().await;
+        assert!(oracle.error.is_none(), "oracle failed: {:?}", oracle.error);
+        assert_eq!(component, &oracle.value);
         assert!(!execution.progress.is_empty());
         assert!(
             execution.progress_during_native_execution,

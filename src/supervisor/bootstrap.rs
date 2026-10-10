@@ -15,8 +15,8 @@ use semver::Version;
 use tokio::sync::{Mutex, RwLock};
 
 use super::health::{
-    BehaviorHealthEvent, BehaviorHealthPolicy, BehaviorHealthSnapshot, BehaviorHealthState,
-    HealthDecision,
+    BehaviorDiagnosticEvent, BehaviorHealthEvent, BehaviorHealthPolicy, BehaviorHealthSnapshot,
+    BehaviorHealthState, DiagnosticDecision, HealthDecision,
 };
 use super::runtime::{BehaviorExecutor, RuntimeError};
 use super::storage::{PersistentBehaviorSlots, StorageError};
@@ -118,13 +118,19 @@ impl From<RuntimeError> for BootstrapError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BehaviorHealthAction {
     None,
-    FirstDivergence,
     IgnoredStaleSequence,
     ThresholdReachedNoPrevious,
     RolledBack {
         from_sequence: u64,
         to_sequence: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BehaviorDiagnosticAction {
+    None,
+    FirstDivergence,
+    IgnoredStaleSequence,
 }
 
 struct ExecutorSlots {
@@ -233,9 +239,6 @@ impl BehaviorController {
         };
         match decision {
             HealthDecision::None => return Ok(BehaviorHealthAction::None),
-            HealthDecision::FirstDivergence => {
-                return Ok(BehaviorHealthAction::FirstDivergence);
-            }
             HealthDecision::IgnoredStaleSequence => {
                 return Ok(BehaviorHealthAction::IgnoredStaleSequence);
             }
@@ -263,6 +266,22 @@ impl BehaviorController {
             from_sequence: sequence,
             to_sequence,
         })
+    }
+
+    /// Record one native-oracle diagnostic without mutating rollback streak state.
+    pub async fn observe_diagnostic(
+        &self,
+        sequence: u64,
+        event: BehaviorDiagnosticEvent,
+    ) -> BehaviorDiagnosticAction {
+        let decision = self.health.lock().await.observe_diagnostic(sequence, event);
+        match decision {
+            DiagnosticDecision::None => BehaviorDiagnosticAction::None,
+            DiagnosticDecision::FirstDivergence => BehaviorDiagnosticAction::FirstDivergence,
+            DiagnosticDecision::IgnoredStaleSequence => {
+                BehaviorDiagnosticAction::IgnoredStaleSequence
+            }
+        }
     }
 
     /// Highest network sequence ever accepted, including after local rollback.
