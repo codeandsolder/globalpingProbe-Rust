@@ -25,6 +25,7 @@ default = []
 post-start-fault-fixture = []
 post-start-divergence-fixture = []
 post-start-invalid-output-fixture = []
+pre-completion-final-fixture = []
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }

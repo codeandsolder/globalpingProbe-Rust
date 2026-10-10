@@ -1,4 +1,12 @@
 #![no_std]
+#![cfg_attr(
+    feature = "pre-completion-final-fixture",
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
+    )
+)]
 
 //! Updateable Globalping measurement behavior component.
 //!
@@ -156,7 +164,8 @@ mod component {
         #[cfg(not(any(
             feature = "post-start-fault-fixture",
             feature = "post-start-divergence-fixture",
-            feature = "post-start-invalid-output-fixture"
+            feature = "post-start-invalid-output-fixture",
+            feature = "pre-completion-final-fixture"
         )))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
@@ -209,7 +218,8 @@ mod component {
         #[cfg(all(
             feature = "post-start-fault-fixture",
             not(feature = "post-start-divergence-fixture"),
-            not(feature = "post-start-invalid-output-fixture")
+            not(feature = "post-start-invalid-output-fixture"),
+            not(feature = "pre-completion-final-fixture")
         ))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
@@ -271,7 +281,8 @@ mod component {
 
         #[cfg(all(
             feature = "post-start-divergence-fixture",
-            not(feature = "post-start-invalid-output-fixture")
+            not(feature = "post-start-invalid-output-fixture"),
+            not(feature = "pre-completion-final-fixture")
         ))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
@@ -341,7 +352,10 @@ mod component {
                 .map_err(|error| BehaviorError::Internal(error.to_string()))
         }
 
-        #[cfg(feature = "post-start-invalid-output-fixture")]
+        #[cfg(all(
+            feature = "post-start-invalid-output-fixture",
+            not(feature = "pre-completion-final-fixture")
+        ))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
             if job.measurement_json.is_empty() {
                 return Err(BehaviorError::InvalidJob(
@@ -389,6 +403,18 @@ mod component {
                 }
             }?;
             Ok(r#"{"__intentionalInvalidOutput":true}"#.to_string())
+        }
+
+        #[cfg(feature = "pre-completion-final-fixture")]
+        fn handle(job: Job) -> Result<String, BehaviorError> {
+            if job.measurement_json.is_empty() {
+                return Err(BehaviorError::InvalidJob(
+                    "measurement request is empty".to_string(),
+                ));
+            }
+            codeandsolder::globalping_behavior::host::start(job.token)
+                .map_err(|error| BehaviorError::Internal(error.message))?;
+            Ok("{}".to_string())
         }
 
         fn self_test() -> Result<(), String> {

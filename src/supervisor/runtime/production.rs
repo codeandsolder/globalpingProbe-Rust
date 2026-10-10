@@ -1502,6 +1502,64 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires live network access plus the pre-completion final WASIp2 fixture"]
+    async fn pre_completion_final_result_is_policy_fault_and_native_oracle_drains() {
+        let path = std::env::var_os("GLOBALPING_BEHAVIOR_PRE_COMPLETION_COMPONENT").map_or_else(
+            || panic!("GLOBALPING_BEHAVIOR_PRE_COMPLETION_COMPONENT is required"),
+            std::path::PathBuf::from,
+        );
+        let runtime = BehaviorRuntime::new()
+            .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let component = Component::from_binary(runtime.engine(), &bytes)
+            .unwrap_or_else(|error| panic!("component compilation failed: {error}"));
+
+        let execution = runtime
+            .execute_component(
+                &component,
+                serde_json::json!({
+                    "type": "ping",
+                    "target": "1.1.1.1",
+                    "protocol": "TCP",
+                    "port": 443,
+                    "packets": 2,
+                    "ipVersion": 4,
+                    "timeout": 10,
+                    "inProgressUpdates": false
+                }),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("fixture execution failed before component result: {error}")
+            });
+        let component_error = execution.component.as_ref().err().unwrap_or_else(|| {
+            panic!("pre-completion final result unexpectedly became authoritative")
+        });
+        assert!(
+            matches!(component_error, RuntimeError::Policy(message) if message == "native execution has not completed"),
+            "unexpected component error: {component_error}"
+        );
+
+        let oracle = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            execution.resolve_oracle(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("native oracle did not drain after rejected early final result")
+        });
+        assert!(
+            oracle.error.is_none(),
+            "native oracle failed after rejected early final result: {:?}",
+            oracle.error
+        );
+        assert!(oracle.value.get("status").is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires live network access plus a prebuilt WASIp2 behavior component"]
     async fn valid_behavior_returns_before_delayed_oracle_completion() {
         struct OracleDelayGuard;
