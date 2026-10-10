@@ -3,6 +3,8 @@ use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, Notify, watch};
 use tokio::time::Duration;
@@ -14,8 +16,8 @@ use rust_socketio::{
 };
 
 use crate::command::{
-    ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
-    traceroute::TracerouteCommand,
+    ProgressSink, ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand,
+    ping::PingCommand, traceroute::TracerouteCommand,
 };
 use crate::probe::progress::ProgressEmitter;
 use crate::probe::{
@@ -32,6 +34,11 @@ use crate::status::{
     ping_test::PingTest,
     status_manager::StatusManager,
 };
+use crate::supervisor::bootstrap::{
+    BehaviorController, BehaviorDiagnosticAction, BehaviorHealthAction,
+};
+use crate::supervisor::health::{BehaviorDiagnosticEvent, BehaviorHealthEvent};
+use crate::supervisor::runtime::{BehaviorOracle, ResolvedBehaviorOracle, RuntimeError};
 use crate::util::logger::{REGISTERED_SCOPES, log_scope_report_delay};
 use crate::util::logs_transport::{API_LOG_BUFFER, flush_logs, run_logs_loop};
 use crate::util::output_limit::limit_raw_output;
@@ -226,16 +233,513 @@ fn make_command(mtype: &str) -> Option<CommandKind> {
     }
 }
 
+async fn apply_behavior_health(
+    controller: &BehaviorController,
+    sequence: u64,
+    event: BehaviorHealthEvent,
+) {
+    match controller.observe_health(sequence, event).await {
+        Ok(BehaviorHealthAction::None) => {}
+        Ok(BehaviorHealthAction::IgnoredStaleSequence) => {
+            debug!(
+                target: "behavior-runtime",
+                behavior_sequence = sequence,
+                "Ignored health result from a behavior slot that is no longer active."
+            );
+        }
+        Ok(BehaviorHealthAction::ThresholdReachedNoPrevious) => {
+            warn!(
+                target: "behavior-runtime",
+                behavior_sequence = sequence,
+                "Behavior health threshold reached, but no previous verified slot exists for rollback."
+            );
+        }
+        Ok(BehaviorHealthAction::RolledBack {
+            from_sequence,
+            to_sequence,
+        }) => {
+            warn!(
+                target: "behavior-runtime",
+                from_sequence,
+                to_sequence,
+                "Behavior health threshold triggered automatic local rollback."
+            );
+        }
+        Err(error) => {
+            warn!(
+                target: "behavior-runtime",
+                behavior_sequence = sequence,
+                %error,
+                "Behavior health accounting could not complete rollback."
+            );
+        }
+    }
+}
+
+async fn apply_behavior_diagnostic(
+    controller: &BehaviorController,
+    sequence: u64,
+    event: BehaviorDiagnosticEvent,
+    measurement_id: &str,
+    measurement_type: &str,
+    build_id: &str,
+) {
+    match controller.observe_diagnostic(sequence, event).await {
+        BehaviorDiagnosticAction::None => {}
+        BehaviorDiagnosticAction::FirstDivergence => {
+            warn!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                "Verified behavior produced its first structurally valid divergence from the native diagnostic oracle; divergence is diagnostic-only and does not advance rollback."
+            );
+        }
+        BehaviorDiagnosticAction::IgnoredStaleSequence => {
+            debug!(
+                target: "behavior-runtime",
+                behavior_sequence = sequence,
+                "Ignored oracle diagnostic from a behavior slot that is no longer active."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+static FORCE_BEHAVIOR_DIVERGENCE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static FORCED_BEHAVIOR_MATCHES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BEHAVIOR_PRESTART_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BEHAVIOR_COMPONENT_AUTHORITIES: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BEHAVIOR_DIAGNOSTIC_COMPLETIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+async fn wait_for_behavior_diagnostics(expected: usize) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while BEHAVIOR_DIAGNOSTIC_COMPLETIONS.load(Ordering::SeqCst) < expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected} behavior diagnostics"));
+}
+
+const fn behavior_error_health_event(error: &RuntimeError) -> BehaviorHealthEvent {
+    if error.is_component_health_fault() {
+        BehaviorHealthEvent::RuntimeFault
+    } else {
+        BehaviorHealthEvent::Inconclusive
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BehaviorResultAuthority {
+    Component,
+    OracleFallback,
+}
+
+fn log_behavior_error(
+    error: &RuntimeError,
+    after_native_start: bool,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+) -> BehaviorHealthEvent {
+    let event = behavior_error_health_event(error);
+    warn!(
+        target: "behavior-runtime",
+        measurement_id,
+        measurement_type,
+        behavior_sequence = sequence,
+        behavior_build_id = build_id,
+        component_health_fault = error.is_component_health_fault(),
+        %error,
+        phase = if after_native_start { "post-start" } else { "pre-start" },
+        "Behavior execution failed."
+    );
+    event
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diagnostic task needs immutable measurement identity plus execution metadata"
+)]
+async fn record_behavior_diagnostic(
+    controller: &BehaviorController,
+    resolved: &ResolvedBehaviorOracle,
+    component: &Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+    progress_events: usize,
+    streamed_progress: bool,
+    #[cfg(test)] original_component: Option<&Value>,
+) {
+    #[cfg(test)]
+    if original_component
+        .is_some_and(|original| resolved.error.is_none() && original == &resolved.value)
+    {
+        FORCED_BEHAVIOR_MATCHES.fetch_add(1, Ordering::SeqCst);
+    }
+
+    let event = resolved.error.as_deref().map_or_else(
+        || {
+            if component == &resolved.value {
+                debug!(
+                    target: "behavior-runtime",
+                    measurement_id,
+                    measurement_type,
+                    behavior_sequence = sequence,
+                    behavior_build_id = build_id,
+                    progress_events,
+                    streamed_progress,
+                    "Behavior result matched its native diagnostic oracle."
+                );
+                BehaviorDiagnosticEvent::Match
+            } else {
+                debug!(
+                    target: "behavior-runtime",
+                    measurement_id,
+                    measurement_type,
+                    behavior_sequence = sequence,
+                    behavior_build_id = build_id,
+                    progress_events,
+                    streamed_progress,
+                    "Behavior result diverged from its native diagnostic oracle; the result remains authoritative and divergence is diagnostic-only."
+                );
+                BehaviorDiagnosticEvent::Divergence
+            }
+        },
+        |error| {
+            warn!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                oracle_error = error,
+                "Native execution failed after an authoritative behavior result was already available."
+            );
+            BehaviorDiagnosticEvent::OracleFailure
+        },
+    );
+
+    apply_behavior_diagnostic(
+        controller,
+        sequence,
+        event,
+        measurement_id,
+        measurement_type,
+        build_id,
+    )
+    .await;
+
+    #[cfg(test)]
+    BEHAVIOR_DIAGNOSTIC_COMPLETIONS.fetch_add(1, Ordering::SeqCst);
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "diagnostic task owns immutable measurement identity plus execution metadata"
+)]
+async fn finish_behavior_diagnostic(
+    controller: Arc<BehaviorController>,
+    oracle: BehaviorOracle,
+    component: Value,
+    measurement_id: String,
+    measurement_type: String,
+    sequence: u64,
+    build_id: String,
+    progress_events: usize,
+    streamed_progress: bool,
+    #[cfg(test)] original_component: Option<Value>,
+) {
+    let resolved = oracle.resolve().await;
+    record_behavior_diagnostic(
+        &controller,
+        &resolved,
+        &component,
+        &measurement_id,
+        &measurement_type,
+        sequence,
+        &build_id,
+        progress_events,
+        streamed_progress,
+        #[cfg(test)]
+        original_component.as_ref(),
+    )
+    .await;
+}
+
+async fn finish_behavior_fault(
+    controller: &BehaviorController,
+    oracle: BehaviorOracle,
+    error: &RuntimeError,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+) -> Value {
+    let resolved = oracle.resolve().await;
+    let health_event = resolved.error.as_deref().map_or_else(
+        || {
+            log_behavior_error(
+                error,
+                true,
+                measurement_id,
+                measurement_type,
+                sequence,
+                build_id,
+            )
+        },
+        |oracle_error| {
+            warn!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                oracle_error,
+                "Native execution failed while behavior fault fallback was required."
+            );
+            BehaviorHealthEvent::Inconclusive
+        },
+    );
+    apply_behavior_health(controller, sequence, health_event).await;
+    let authority = BehaviorResultAuthority::OracleFallback;
+    debug!(
+        target: "behavior-runtime",
+        measurement_id,
+        measurement_type,
+        behavior_sequence = sequence,
+        behavior_build_id = build_id,
+        ?authority,
+        "Selected final measurement result after behavior fault."
+    );
+    resolved.value
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "success handling needs immutable measurement identity plus execution metadata"
+)]
+async fn finish_behavior_success(
+    controller: &Arc<BehaviorController>,
+    oracle: BehaviorOracle,
+    component: Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    sequence: u64,
+    build_id: &str,
+    progress_events: usize,
+    streamed_progress: bool,
+) -> Value {
+    #[cfg(test)]
+    let (component, original_component) = if FORCE_BEHAVIOR_DIVERGENCE.load(Ordering::SeqCst) {
+        let original = component.clone();
+        let mut divergent = component;
+        divergent["__forcedHealthTestDivergence"] = Value::Bool(true);
+        (divergent, Some(original))
+    } else {
+        (component, None)
+    };
+
+    if let Some(resolved) = oracle.try_resolve() {
+        if resolved.error.is_some() {
+            record_behavior_diagnostic(
+                controller,
+                &resolved,
+                &component,
+                measurement_id,
+                measurement_type,
+                sequence,
+                build_id,
+                progress_events,
+                streamed_progress,
+                #[cfg(test)]
+                original_component.as_ref(),
+            )
+            .await;
+            let authority = BehaviorResultAuthority::OracleFallback;
+            debug!(
+                target: "behavior-runtime",
+                measurement_id,
+                measurement_type,
+                behavior_sequence = sequence,
+                behavior_build_id = build_id,
+                ?authority,
+                "Selected native failure result because the oracle had already failed."
+            );
+            return resolved.value;
+        }
+
+        apply_behavior_health(controller, sequence, BehaviorHealthEvent::Success).await;
+        record_behavior_diagnostic(
+            controller,
+            &resolved,
+            &component,
+            measurement_id,
+            measurement_type,
+            sequence,
+            build_id,
+            progress_events,
+            streamed_progress,
+            #[cfg(test)]
+            original_component.as_ref(),
+        )
+        .await;
+    } else {
+        apply_behavior_health(controller, sequence, BehaviorHealthEvent::Success).await;
+        let diagnostic_component = component.clone();
+        tokio::spawn(finish_behavior_diagnostic(
+            Arc::clone(controller),
+            oracle,
+            diagnostic_component,
+            measurement_id.to_string(),
+            measurement_type.to_string(),
+            sequence,
+            build_id.to_string(),
+            progress_events,
+            streamed_progress,
+            #[cfg(test)]
+            original_component,
+        ));
+    }
+
+    #[cfg(test)]
+    BEHAVIOR_COMPONENT_AUTHORITIES.fetch_add(1, Ordering::SeqCst);
+    let authority = BehaviorResultAuthority::Component;
+    debug!(
+        target: "behavior-runtime",
+        measurement_id,
+        measurement_type,
+        behavior_sequence = sequence,
+        behavior_build_id = build_id,
+        ?authority,
+        "Selected final measurement result without waiting for a pending diagnostic oracle."
+    );
+    component
+}
+
+async fn run_behavior_measurement(
+    behavior_controller: Option<&Arc<BehaviorController>>,
+    measurement: &Value,
+    measurement_id: &str,
+    measurement_type: &str,
+    behavior_progress_sink: Option<ProgressSink>,
+) -> Option<Result<Value, RuntimeError>> {
+    let controller = behavior_controller?;
+    let executor = controller.executor().await?;
+    let sequence = executor.sequence();
+    let build_id = executor.build_id().to_string();
+    let execution_result = executor
+        .run_with_behavior_progress(measurement.clone(), behavior_progress_sink)
+        .await;
+
+    let result = match execution_result {
+        Ok(result) => result,
+        Err(error) => {
+            let health_event = log_behavior_error(
+                &error,
+                false,
+                measurement_id,
+                measurement_type,
+                sequence,
+                &build_id,
+            );
+            apply_behavior_health(controller, sequence, health_event).await;
+            return Some(Err(error));
+        }
+    };
+
+    let oracle = result.oracle_handle();
+    let progress_events = result.progress.len();
+    let streamed_progress = result.progress_during_native_execution;
+
+    match result.component {
+        Ok(component) => Some(Ok(finish_behavior_success(
+            controller,
+            oracle,
+            component,
+            measurement_id,
+            measurement_type,
+            sequence,
+            &build_id,
+            progress_events,
+            streamed_progress,
+        )
+        .await)),
+        Err(error) => Some(Ok(finish_behavior_fault(
+            controller,
+            oracle,
+            &error,
+            measurement_id,
+            measurement_type,
+            sequence,
+            &build_id,
+        )
+        .await)),
+    }
+}
+
+async fn run_measurement(
+    cmd: &CommandKind,
+    measurement: Value,
+    behavior_controller: Option<&Arc<BehaviorController>>,
+    measurement_id: &str,
+    measurement_type: &str,
+    progress_sink: Option<ProgressSink>,
+) -> Result<Value> {
+    if let Some(shared) = run_behavior_measurement(
+        behavior_controller,
+        &measurement,
+        measurement_id,
+        measurement_type,
+        progress_sink.clone(),
+    )
+    .await
+    {
+        match shared {
+            Ok(native) => return Ok(native),
+            Err(error) => {
+                #[cfg(test)]
+                BEHAVIOR_PRESTART_FALLBACKS.fetch_add(1, Ordering::SeqCst);
+                warn!(
+                    target: "behavior-runtime",
+                    measurement_id,
+                    measurement_type,
+                    %error,
+                    "Behavior failed before native execution started; falling back to the ordinary native path."
+                );
+            }
+        }
+    }
+
+    match progress_sink {
+        Some(sink) => {
+            let mode = cmd.progress_mode(&measurement);
+            cmd.run_with_progress(measurement, sink.fixed(mode)).await
+        }
+        None => cmd.run(measurement).await,
+    }
+}
+
 /// Run one measurement job and emit the result back to the API.
 ///
-/// `limiter` guards the concurrency cap; the acquired slot is held for the
-/// entire duration of the measurement and released automatically when this
-/// function returns.
+/// The `ActiveJob` guard tracks stats and graceful shutdown for the API-visible
+/// measurement lifetime; upstream-compatible dispatch imposes no local cap.
 pub async fn dispatch(
     req: MeasurementRequest,
     client: Client,
     status_manager: Arc<Mutex<StatusManager>>,
     jobs: ActiveJobs,
+    behavior_controller: Option<Arc<BehaviorController>>,
 ) {
     let mid = req.measurement_id.clone();
     let tid = req.test_id.clone();
@@ -268,15 +772,30 @@ pub async fn dispatch(
 
     let measurement_fut = async {
         if in_progress {
-            let (tx, rx) = ProgressTx::channel();
-            let mode = cmd.progress_mode(&req.measurement);
-            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone(), mode);
+            let (progress_sink, rx) = ProgressSink::channel();
+            let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone());
             let emitter_task = tokio::spawn(emitter.forward(rx));
-            let result = cmd.run_with_progress(req.measurement.clone(), tx).await;
+            let result = run_measurement(
+                &cmd,
+                req.measurement.clone(),
+                behavior_controller.as_ref(),
+                &mid,
+                mtype,
+                Some(progress_sink),
+            )
+            .await;
             let _ = emitter_task.await;
             result
         } else {
-            cmd.run(req.measurement.clone()).await
+            run_measurement(
+                &cmd,
+                req.measurement.clone(),
+                behavior_controller.as_ref(),
+                &mid,
+                mtype,
+                None,
+            )
+            .await
         }
     };
 
@@ -470,6 +989,7 @@ struct ConnectionHandlers {
     adoption: Arc<AdoptionServer>,
     is_hardware: bool,
     jobs: ActiveJobs,
+    behavior_controller: Option<Arc<BehaviorController>>,
     signal: OutcomeSignal,
     already_connected: Arc<AtomicBool>,
 }
@@ -480,6 +1000,7 @@ impl ConnectionHandlers {
         settings: Arc<ProbeSettingsStore>,
         adoption: Arc<AdoptionServer>,
         is_hardware: bool,
+        behavior_controller: Option<Arc<BehaviorController>>,
     ) -> Self {
         Self {
             status_manager,
@@ -487,6 +1008,7 @@ impl ConnectionHandlers {
             adoption,
             is_hardware,
             jobs: ActiveJobs::new(),
+            behavior_controller,
             signal: OutcomeSignal::new(),
             already_connected: Arc::new(AtomicBool::new(false)),
         }
@@ -712,7 +1234,13 @@ fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Clie
     };
     match serde_json::from_value::<MeasurementRequest>(data) {
         Ok(request) => {
-            tokio::spawn(dispatch(request, client, state.status_manager, state.jobs));
+            tokio::spawn(dispatch(
+                request,
+                client,
+                state.status_manager,
+                state.jobs,
+                state.behavior_controller,
+            ));
         }
         Err(error) => warn!("Bad measurement request: {error}"),
     }
@@ -824,7 +1352,8 @@ async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_ti
         .emit("probe:status:update", json!("sigterm"))
         .await
         .ok();
-    if state.jobs.count() > 0
+    let active_jobs = state.jobs.count();
+    if active_jobs > 0
         && tokio::time::timeout(drain_timeout, state.jobs.wait_idle())
             .await
             .is_err()
@@ -844,6 +1373,7 @@ async fn connect_once(
     status_manager: Arc<Mutex<StatusManager>>,
     settings: Arc<ProbeSettingsStore>,
     adoption: Arc<AdoptionServer>,
+    behavior_controller: Option<Arc<BehaviorController>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> ConnectOutcome {
     let state = ConnectionHandlers::new(
@@ -851,6 +1381,7 @@ async fn connect_once(
         settings,
         adoption,
         cfg.is_hardware.is_some(),
+        behavior_controller,
     );
     let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
@@ -890,6 +1421,27 @@ async fn connect_once(
 /// # Errors
 /// Returns an error if process-signal setup or a fatal client operation fails.
 pub async fn run(cfg: ClientConfig) -> Result<()> {
+    run_with_behavior_controller(cfg, None).await
+}
+
+/// Connect to the Globalping API with an optional trusted behavior controller.
+///
+/// The controller supplies only verified/self-tested behavior executors. When
+/// enabled, WASM and the native diagnostic oracle share one supervisor-owned
+/// execution. A successful structurally valid component result is authoritative
+/// and does not wait for pending native shaping/enrichment; the sequence-gated
+/// oracle comparison completes independently and cannot mutate rollback streak
+/// state. Post-start component faults wait for the same-run native result and
+/// fall back without rerunning the measurement. Verified WASM progress is
+/// API-facing when behavior is active; native progress is suppressed on that
+/// shared execution and is used only for native-only or pre-start fallback paths.
+///
+/// # Errors
+/// Returns an error if process-signal setup or a fatal client operation fails.
+pub async fn run_with_behavior_controller(
+    cfg: ClientConfig,
+    behavior_controller: Option<Arc<BehaviorController>>,
+) -> Result<()> {
     let status = Arc::new(Mutex::new(StatusManager::with_api_host(&cfg.ping_target)));
     let settings = Arc::new(ProbeSettingsStore::production());
     let adoption = Arc::new(AdoptionServer::production());
@@ -932,6 +1484,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
             Arc::clone(&status),
             Arc::clone(&settings),
             Arc::clone(&adoption),
+            behavior_controller.clone(),
             shutdown_rx.clone(),
         )
         .await;
@@ -1036,6 +1589,27 @@ fn parse_connect_error(payload: &Payload) -> (String, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    use std::num::NonZeroU32;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    use ed25519_dalek::{Signer as _, SigningKey};
+    #[cfg(target_os = "linux")]
+    use semver::Version;
+    #[cfg(target_os = "linux")]
+    use sha2::{Digest as _, Sha256};
+
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::bootstrap::BehaviorBootstrapConfig;
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::health::BehaviorHealthPolicy;
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::storage::PersistentBehaviorSlots;
+    #[cfg(target_os = "linux")]
+    use crate::supervisor::update::{BehaviorManifest, SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR};
 
     fn cfg(uuid: &str) -> ClientConfig {
         ClientConfig {
@@ -1195,6 +1769,513 @@ mod tests {
             mtype,
             "ping" | "dns" | "traceroute" | "mtr" | "http"
         ));
+    }
+
+    #[test]
+    fn tcp_ping_uses_diff_progress_buffering() {
+        let options = json!({ "type": "ping", "protocol": "TCP" });
+        assert!(matches!(
+            CommandKind::Ping.progress_mode(&options),
+            BufferMode::Diff
+        ));
+        let icmp = json!({ "type": "ping", "protocol": "ICMP" });
+        assert!(matches!(
+            CommandKind::Ping.progress_mode(&icmp),
+            BufferMode::Append
+        ));
+    }
+
+    #[test]
+    fn attributable_behavior_error_advances_fault_health() {
+        assert_eq!(
+            behavior_error_health_event(&RuntimeError::GuestInvalidOutput("bad shape".to_string())),
+            BehaviorHealthEvent::RuntimeFault
+        );
+    }
+
+    #[test]
+    fn ambiguous_guest_internal_error_is_inconclusive() {
+        assert_eq!(
+            behavior_error_health_event(&RuntimeError::GuestInternal("fixture".to_string())),
+            BehaviorHealthEvent::Inconclusive
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn live_behavior_cases() -> [Value; 6] {
+        [
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "ICMP",
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "dns", "target": "example.com", "protocol": "UDP", "port": 53,
+                "resolver": null, "trace": false, "query": {"type": "A"},
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "traceroute", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "mtr", "target": "1.1.1.1", "protocol": "ICMP", "port": 80,
+                "packets": 2, "ipVersion": 4, "timeout": 10, "inProgressUpdates": true
+            }),
+            json!({
+                "type": "http", "target": "example.com", "protocol": "HTTPS",
+                "ipVersion": 4, "timeout": 10, "inProgressUpdates": true,
+                "request": {"method": "GET", "path": "/", "query": "", "headers": {}}
+            }),
+        ]
+    }
+
+    #[cfg(target_os = "linux")]
+    fn health_test_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x47; 32])
+    }
+
+    #[cfg(target_os = "linux")]
+    fn signed_health_test_component(
+        path: &Path,
+        sequence: u64,
+        build_id: &str,
+    ) -> (BehaviorManifest, Vec<u8>) {
+        let component = std::fs::read(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let signing_key = health_test_signing_key();
+        let digest = Sha256::digest(&component);
+        let mut manifest = BehaviorManifest {
+            sequence,
+            abi_major: SUPPORTED_ABI_MAJOR,
+            abi_minor: SUPPORTED_ABI_MINOR,
+            min_supervisor_version: env!("CARGO_PKG_VERSION").to_string(),
+            size: u64::try_from(component.len())
+                .unwrap_or_else(|error| panic!("component size does not fit in u64: {error}")),
+            sha256: hex::encode(digest),
+            build_id: build_id.to_string(),
+            signature: String::new(),
+        };
+        manifest.signature = hex::encode(signing_key.sign(&manifest.signing_payload()).to_bytes());
+        (manifest, component)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
+    async fn live_exact_behavior_results_are_selected_for_all_six_measurements() {
+        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key());
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+        let (manifest, component) =
+            signed_health_test_component(&component_path, 1, "authority-healthy");
+        controller
+            .activate_candidate(manifest, component)
+            .await
+            .unwrap_or_else(|error| panic!("behavior activation failed: {error}"));
+
+        BEHAVIOR_COMPONENT_AUTHORITIES.store(0, Ordering::SeqCst);
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
+        for (index, measurement) in live_behavior_cases().into_iter().enumerate() {
+            let measurement_type = measurement["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("test measurement is missing type"));
+            let selected = run_behavior_measurement(
+                Some(&controller),
+                &measurement,
+                &format!("authority-{index}-{measurement_type}"),
+                measurement_type,
+                None,
+            )
+            .await
+            .unwrap_or_else(|| panic!("active behavior executor must exist"))
+            .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+            assert!(selected.get("status").is_some());
+        }
+
+        assert_eq!(BEHAVIOR_COMPONENT_AUTHORITIES.load(Ordering::SeqCst), 6);
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        wait_for_behavior_diagnostics(6).await;
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(1));
+        assert_eq!(health.matches, 6);
+        assert_eq!(health.consecutive_faults, 0);
+        assert_eq!(health.divergences, 0);
+        assert_eq!(health.runtime_faults, 0);
+        assert_eq!(health.inconclusive, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
+    async fn live_behavior_health_records_all_six_divergences_without_rollback() {
+        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let threshold =
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
+                .with_health_policy(BehaviorHealthPolicy::new(threshold));
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+
+        let (normal_manifest, normal_component) =
+            signed_health_test_component(&component_path, 1, "health-normal");
+        controller
+            .activate_candidate(normal_manifest, normal_component)
+            .await
+            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
+        let (active_manifest, active_component) =
+            signed_health_test_component(&component_path, 2, "health-test-active");
+        controller
+            .activate_candidate(active_manifest, active_component)
+            .await
+            .unwrap_or_else(|error| panic!("test behavior activation failed: {error}"));
+
+        struct ForcedDivergenceGuard;
+        impl Drop for ForcedDivergenceGuard {
+            fn drop(&mut self) {
+                FORCE_BEHAVIOR_DIVERGENCE.store(false, Ordering::SeqCst);
+            }
+        }
+        FORCED_BEHAVIOR_MATCHES.store(0, Ordering::SeqCst);
+        BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
+        FORCE_BEHAVIOR_DIVERGENCE.store(true, Ordering::SeqCst);
+        let _forced_divergence = ForcedDivergenceGuard;
+
+        let cases = live_behavior_cases();
+        for (index, measurement) in cases.into_iter().enumerate() {
+            let measurement_type = measurement["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("test measurement is missing type"));
+            let shared = run_behavior_measurement(
+                Some(&controller),
+                &measurement,
+                &format!("health-{index}-{measurement_type}"),
+                measurement_type,
+                None,
+            )
+            .await
+            .unwrap_or_else(|| panic!("active behavior executor must exist"));
+            shared.unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+            wait_for_behavior_diagnostics(index + 1).await;
+
+            assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+            let health = controller.health_snapshot().await;
+            assert_eq!(health.active_sequence, Some(2));
+            assert_eq!(health.consecutive_faults, 0);
+            assert_eq!(
+                health.divergences,
+                u64::try_from(index + 1).unwrap_or(u64::MAX)
+            );
+            assert_eq!(health.runtime_faults, 0);
+            assert_eq!(health.inconclusive, 0);
+        }
+
+        assert_eq!(FORCED_BEHAVIOR_MATCHES.load(Ordering::SeqCst), 6);
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        assert!(controller.has_previous().unwrap_or(false));
+        let executor = controller
+            .executor()
+            .await
+            .unwrap_or_else(|| panic!("active executor must exist"));
+        assert_eq!(executor.sequence(), 2);
+        assert_eq!(executor.build_id(), "health-test-active");
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(2));
+        assert_eq!(health.consecutive_faults, 0);
+        assert_eq!(health.divergences, 6);
+        assert_eq!(health.runtime_faults, 0);
+        assert_eq!(health.inconclusive, 0);
+
+        let persisted = PersistentBehaviorSlots::load(
+            root.path(),
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        assert_eq!(persisted.active().manifest.sequence, 2);
+        assert_eq!(persisted.active().manifest.build_id, "health-test-active");
+        assert_eq!(persisted.accepted_sequence(), 2);
+        let previous = persisted
+            .previous()
+            .unwrap_or_else(|| panic!("previous verified slot must remain available"));
+        assert_eq!(previous.manifest.sequence, 1);
+        assert_eq!(previous.manifest.build_id, "health-normal");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus a post-start-fault WASIp2 behavior fixture"]
+    async fn live_post_start_behavior_fault_preserves_native_without_fallback() {
+        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_FAULT_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_FAULT_COMPONENT must point to the fault fixture")
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key());
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+        let (manifest, component) =
+            signed_health_test_component(&component_path, 1, "post-start-fault");
+        controller
+            .activate_candidate(manifest, component)
+            .await
+            .unwrap_or_else(|error| panic!("fault fixture activation failed: {error}"));
+
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        let measurement = json!({
+            "type": "ping",
+            "target": "1.1.1.1",
+            "protocol": "TCP",
+            "port": 443,
+            "packets": 1,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": true
+        });
+        let (progress_sink, mut progress_rx) = ProgressSink::channel();
+        let result = run_measurement(
+            &CommandKind::Ping,
+            measurement,
+            Some(&controller),
+            "post-start-fault",
+            "ping",
+            Some(progress_sink),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("shared native execution failed: {error}"));
+
+        let mut progress = Vec::new();
+        while let Ok(update) = progress_rx.try_recv() {
+            progress.push(update.resolve());
+        }
+        assert_eq!(
+            progress.len(),
+            2,
+            "native progress must not be mixed into the WASM stream"
+        );
+        assert!(
+            progress[0]["rawOutput"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("tcp_conn=1"))
+        );
+        assert_eq!(
+            progress[1]["rawOutput"],
+            "__post_start_fault_fixture_progress__"
+        );
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        assert!(result.get("status").is_some());
+        assert!(result.get("rawOutput").is_some());
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(1));
+        assert_eq!(health.consecutive_faults, 1);
+        assert_eq!(health.runtime_faults, 1);
+        assert_eq!(health.divergences, 0);
+        assert_eq!(health.inconclusive, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus normal and divergent WASIp2 behavior fixtures"]
+    async fn live_signed_valid_divergence_is_authoritative_and_remains_active() {
+        let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let divergent_path = std::env::var_os("GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT must point to the divergence fixture"
+                )
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let threshold =
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
+                .with_health_policy(BehaviorHealthPolicy::new(threshold));
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+
+        let (normal_manifest, normal_component) =
+            signed_health_test_component(&normal_path, 1, "divergence-normal");
+        controller
+            .activate_candidate(normal_manifest, normal_component)
+            .await
+            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
+        let (divergent_manifest, divergent_component) =
+            signed_health_test_component(&divergent_path, 2, "divergence-authoritative");
+        controller
+            .activate_candidate(divergent_manifest, divergent_component)
+            .await
+            .unwrap_or_else(|error| panic!("divergent behavior activation failed: {error}"));
+
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
+        let result = run_measurement(
+            &CommandKind::Ping,
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": false
+            }),
+            Some(&controller),
+            "signed-divergence",
+            "ping",
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+        wait_for_behavior_diagnostics(1).await;
+
+        assert!(result.get("status").and_then(Value::as_str).is_some());
+        assert!(
+            result["rawOutput"]
+                .as_str()
+                .is_some_and(|raw| raw.contains("__intentional_divergence__"))
+        );
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        let executor = controller
+            .executor()
+            .await
+            .unwrap_or_else(|| panic!("divergent executor must remain active"));
+        assert_eq!(executor.build_id(), "divergence-authoritative");
+        let health = controller.health_snapshot().await;
+        assert_eq!(health.active_sequence, Some(2));
+        assert_eq!(health.consecutive_faults, 0);
+        assert_eq!(health.divergences, 1);
+        assert_eq!(health.runtime_faults, 0);
+        assert_eq!(health.inconclusive, 0);
+
+        let persisted = PersistentBehaviorSlots::load(
+            root.path(),
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        assert_eq!(persisted.active().manifest.sequence, 2);
+        assert_eq!(
+            persisted.active().manifest.build_id,
+            "divergence-authoritative"
+        );
+        assert_eq!(persisted.accepted_sequence(), 2);
+        assert_eq!(
+            persisted
+                .previous()
+                .unwrap_or_else(|| panic!("previous verified slot must remain"))
+                .manifest
+                .sequence,
+            1
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus normal and invalid-output WASIp2 behavior fixtures"]
+    async fn live_signed_invalid_output_falls_back_and_rolls_back() {
+        let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
+            });
+        let invalid_path = std::env::var_os("GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!(
+                    "GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT must point to the invalid-output fixture"
+                )
+            });
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let threshold =
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        let config =
+            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
+                .with_health_policy(BehaviorHealthPolicy::new(threshold));
+        let controller = BehaviorController::load(config)
+            .await
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
+
+        let (normal_manifest, normal_component) =
+            signed_health_test_component(&normal_path, 1, "invalid-output-normal");
+        controller
+            .activate_candidate(normal_manifest, normal_component)
+            .await
+            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
+        let (invalid_manifest, invalid_component) =
+            signed_health_test_component(&invalid_path, 2, "invalid-output-active");
+        controller
+            .activate_candidate(invalid_manifest, invalid_component)
+            .await
+            .unwrap_or_else(|error| panic!("invalid-output behavior activation failed: {error}"));
+
+        BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
+        let result = run_measurement(
+            &CommandKind::Ping,
+            json!({
+                "type": "ping", "target": "1.1.1.1", "protocol": "TCP", "port": 443,
+                "packets": 1, "ipVersion": 4, "timeout": 10, "inProgressUpdates": false
+            }),
+            Some(&controller),
+            "signed-invalid-output",
+            "ping",
+            None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("shared behavior execution failed: {error}"));
+
+        assert!(result.get("status").is_some());
+        assert!(result.get("rawOutput").is_some());
+        assert!(result.get("__intentionalInvalidOutput").is_none());
+        assert_eq!(BEHAVIOR_PRESTART_FALLBACKS.load(Ordering::SeqCst), 0);
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        let executor = controller
+            .executor()
+            .await
+            .unwrap_or_else(|| panic!("rolled-back executor must exist"));
+        assert_eq!(executor.build_id(), "invalid-output-normal");
+
+        let persisted = PersistentBehaviorSlots::load(
+            root.path(),
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        assert_eq!(persisted.active().manifest.sequence, 1);
+        assert_eq!(
+            persisted.active().manifest.build_id,
+            "invalid-output-normal"
+        );
+        assert_eq!(persisted.accepted_sequence(), 2);
     }
 
     // ── Error message parsing via reconnect ───────────────────────────────────

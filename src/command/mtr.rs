@@ -2,7 +2,7 @@ pub mod parse;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-use super::ProgressTx;
+use super::{ProgressTx, RawExecutionTx};
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 
@@ -19,7 +20,10 @@ use crate::util::resolve_target::{
     ResolveTargetError, ResolvedTarget, resolve_command_target, reverse_lookup,
 };
 use crate::util::validate::is_safe_host;
-use parse::{MtrHop, MtrStatus, ParsedMtr, build_output, normalize_ip_text, parse_raw};
+use parse::{
+    MtrEnrichmentEntry, MtrEnrichmentMap, MtrStatus, ParsedMtr, normalize_ip_text, render_progress,
+    shape_result,
+};
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -55,7 +59,7 @@ const fn default_ip_version() -> u8 {
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-fn validate(opts: &MtrOptions) -> Result<()> {
+pub(crate) fn validate(opts: &MtrOptions) -> Result<()> {
     if !is_safe_host(&opts.target) {
         bail!("Invalid target.");
     }
@@ -135,7 +139,7 @@ impl MtrCommand {
 
 // ── Internal runner ───────────────────────────────────────────────────────────
 
-fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
+pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
     ParsedMtr {
         status: MtrStatus::Failed,
         failure_source: Some(error.failure_source_or("internal").to_string()),
@@ -146,21 +150,16 @@ fn resolution_failure(error: &ResolveTargetError) -> ParsedMtr {
     }
 }
 
-struct NativeMtrOutput {
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct HopEnrichment {
-    hostname: Option<String>,
-    asn: Vec<u32>,
+pub(crate) struct NativeMtrOutput {
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) timed_out: bool,
+    pub(crate) exit_code: Option<i32>,
 }
 
 #[derive(Clone, Default)]
 struct EnrichmentCache {
-    entries: Arc<RwLock<HashMap<IpAddr, HopEnrichment>>>,
+    entries: Arc<RwLock<HashMap<IpAddr, MtrEnrichmentEntry>>>,
 }
 
 impl EnrichmentCache {
@@ -172,74 +171,119 @@ impl EnrichmentCache {
         entries.entry(address).or_default().hostname = Some(hostname);
     }
 
-    fn has_hostname(&self, address: IpAddr) -> bool {
+    fn hostname(&self, address: IpAddr) -> Option<String> {
         self.entries
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&address)
-            .and_then(|entry| entry.hostname.as_ref())
-            .is_some()
+            .and_then(|entry| entry.hostname.clone())
     }
 
-    fn update(&self, address: IpAddr, hostname: Option<String>, asn: Vec<u32>) {
+    fn update(&self, address: IpAddr, entry: &MtrEnrichmentEntry) {
         let mut entries = self
             .entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = entries.entry(address).or_default();
-        if hostname.is_some() {
-            entry.hostname = hostname;
+        let current = entries.entry(address).or_default();
+        if entry.hostname.is_some() {
+            current.hostname.clone_from(&entry.hostname);
         }
-        if !asn.is_empty() {
-            entry.asn = asn;
+        if !entry.asn.is_empty() {
+            current.asn.clone_from(&entry.asn);
         }
         drop(entries);
     }
 
-    fn apply(&self, hops: &mut [MtrHop]) {
-        let entries = self
-            .entries
+    fn snapshot(&self) -> MtrEnrichmentMap {
+        self.entries
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        for hop in hops {
-            let Some(address) = hop
-                .resolved_address
-                .as_deref()
-                .and_then(|address| address.parse::<IpAddr>().ok())
-            else {
-                continue;
-            };
-            let Some(entry) = entries.get(&address) else {
-                continue;
-            };
-            if let Some(hostname) = &entry.hostname {
-                hop.resolved_hostname = Some(hostname.clone());
-            }
-            if !entry.asn.is_empty() {
-                hop.asn.clone_from(&entry.asn);
-            }
-        }
+            .iter()
+            .map(|(address, entry)| (address.to_string(), entry.clone()))
+            .collect()
     }
 }
 
-struct MtrEnrichment {
+#[derive(Clone)]
+pub(crate) struct MtrEnrichmentBroker {
     cache: EnrichmentCache,
-    seen: HashSet<IpAddr>,
-    tasks: JoinSet<()>,
+    lookups: Arc<RwLock<HashMap<IpAddr, Arc<OnceCell<MtrEnrichmentEntry>>>>>,
 }
 
-impl MtrEnrichment {
-    fn new(target: &ResolvedTarget) -> Self {
+impl MtrEnrichmentBroker {
+    pub(crate) fn new(target: &ResolvedTarget) -> Self {
         let cache = EnrichmentCache::default();
         if target.hostname != target.address.to_string() {
             cache.seed_hostname(target.address, target.hostname.clone());
         }
         Self {
             cache,
+            lookups: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn lookup_cell(&self, address: IpAddr) -> Arc<OnceCell<MtrEnrichmentEntry>> {
+        if let Some(cell) = self
+            .lookups
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&address)
+        {
+            return Arc::clone(cell);
+        }
+        let mut lookups = self
+            .lookups
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            lookups
+                .entry(address)
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        )
+    }
+
+    pub(crate) async fn lookup(&self, address: IpAddr, budget: Duration) -> MtrEnrichmentEntry {
+        if is_ip_private(address) {
+            return MtrEnrichmentEntry::default();
+        }
+        let cell = self.lookup_cell(address);
+        let cache = self.cache.clone();
+        cell.get_or_init(|| async move {
+            let hostname = match cache.hostname(address) {
+                Some(hostname) => Some(hostname),
+                None => reverse_lookup(address, budget.min(Duration::from_secs(3))).await,
+            };
+            let asn = lookup_asn(address, budget).await;
+            let entry = MtrEnrichmentEntry { hostname, asn };
+            cache.update(address, &entry);
+            entry
+        })
+        .await
+        .clone()
+    }
+
+    pub(crate) fn snapshot(&self) -> MtrEnrichmentMap {
+        self.cache.snapshot()
+    }
+}
+
+pub(crate) struct MtrEnrichment {
+    broker: MtrEnrichmentBroker,
+    seen: HashSet<IpAddr>,
+    tasks: JoinSet<()>,
+}
+
+impl MtrEnrichment {
+    pub(crate) fn new(target: &ResolvedTarget) -> Self {
+        Self {
+            broker: MtrEnrichmentBroker::new(target),
             seen: HashSet::new(),
             tasks: JoinSet::new(),
         }
+    }
+
+    pub(crate) fn broker(&self) -> MtrEnrichmentBroker {
+        self.broker.clone()
     }
 
     fn add(
@@ -253,37 +297,39 @@ impl MtrEnrichment {
             return;
         }
 
-        let cache = self.cache.clone();
-        let ptr_seeded = cache.has_hostname(address);
+        let broker = self.broker.clone();
         self.tasks.spawn(async move {
-            let ptr = async {
-                if ptr_seeded {
-                    None
-                } else {
-                    reverse_lookup(address, budget.min(Duration::from_secs(3))).await
-                }
-            };
-            let (hostname, asn) = tokio::join!(ptr, lookup_asn(address, budget));
-            cache.update(address, hostname, asn);
+            broker.lookup(address, budget).await;
             if let Some(tx) = progress {
-                queue_mtr_progress(&tx, raw, cache);
+                queue_mtr_progress(&tx, raw, broker.cache.clone());
             }
         });
     }
 
-    async fn wait(&mut self) {
+    pub(crate) async fn wait(&mut self) {
         while self.tasks.join_next().await.is_some() {}
-    }
-
-    fn apply(&self, hops: &mut [MtrHop]) {
-        self.cache.apply(hops);
     }
 }
 
 fn render_mtr_progress(raw: &str, cache: &EnrichmentCache) -> Value {
-    let mut hops = parse_raw(raw, false);
-    cache.apply(&mut hops);
-    json!({ "rawOutput": build_output(&hops) })
+    json!({ "rawOutput": render_progress(raw, &cache.snapshot()) })
+}
+
+pub(crate) fn shape_mtr_output(
+    stdout: &str,
+    stderr: &str,
+    timed_out: bool,
+    target: &ResolvedTarget,
+    enrichment: &MtrEnrichmentMap,
+) -> ParsedMtr {
+    shape_result(
+        stdout,
+        stderr,
+        timed_out,
+        &target.address.to_string(),
+        &target.hostname,
+        enrichment,
+    )
 }
 
 fn queue_mtr_progress(tx: &ProgressTx, raw: Arc<RwLock<String>>, cache: EnrichmentCache) {
@@ -306,12 +352,50 @@ fn hop_address_from_raw_line(line: &str) -> Option<IpAddr> {
     normalize_ip_text(parts.next()?).parse().ok()
 }
 
+pub(crate) async fn run_native_mtr_stream(
+    args: &[String],
+    process_timeout: Duration,
+    progress: Option<&ProgressTx>,
+    enrichment: &mut MtrEnrichment,
+    deadline: &MeasurementDeadline,
+    raw_events: &RawExecutionTx,
+) -> Result<NativeMtrOutput> {
+    run_native_mtr_inner(
+        args,
+        process_timeout,
+        progress,
+        Some(enrichment),
+        Some(deadline),
+        Some(raw_events),
+    )
+    .await
+}
+
 async fn run_native_mtr(
     args: &[String],
     process_timeout: Duration,
     progress: Option<&ProgressTx>,
     enrichment: &mut MtrEnrichment,
     deadline: &MeasurementDeadline,
+) -> Result<NativeMtrOutput> {
+    run_native_mtr_inner(
+        args,
+        process_timeout,
+        progress,
+        Some(enrichment),
+        Some(deadline),
+        None,
+    )
+    .await
+}
+
+async fn run_native_mtr_inner(
+    args: &[String],
+    process_timeout: Duration,
+    progress: Option<&ProgressTx>,
+    mut enrichment: Option<&mut MtrEnrichment>,
+    deadline: Option<&MeasurementDeadline>,
+    raw_events: Option<&RawExecutionTx>,
 ) -> Result<NativeMtrOutput> {
     use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
@@ -330,10 +414,22 @@ async fn run_native_mtr(
         .stderr
         .take()
         .ok_or_else(|| anyhow::anyhow!("mtr stderr pipe unavailable"))?;
+    let raw_stderr = raw_events.cloned();
     let stderr_task = tokio::spawn(async move {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text).await;
-        text
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(tx) = &raw_stderr {
+                        tx.stderr_chunk(&chunk[..read]).await;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     });
     let raw_stdout = Arc::new(RwLock::new(String::new()));
     let completed = timeout(process_timeout, async {
@@ -345,7 +441,16 @@ async fn run_native_mtr(
                 raw.push_str(&line);
                 raw.push('\n');
             }
-            if let Some(address) = hop_address_from_raw_line(&line) {
+            let observed = hop_address_from_raw_line(&line);
+            if let Some(tx) = raw_events {
+                tx.stdout_line(&line).await;
+                if let Some(address) = observed {
+                    tx.observe(address).await;
+                }
+            }
+            if let (Some(address), Some(enrichment), Some(deadline)) =
+                (observed, enrichment.as_deref_mut(), deadline)
+            {
                 enrichment.add(
                     address,
                     deadline.remaining(),
@@ -353,20 +458,28 @@ async fn run_native_mtr(
                     Arc::clone(&raw_stdout),
                 );
             }
-            if let Some(tx) = progress {
-                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.cache.clone());
+            if let (Some(tx), Some(enrichment)) = (progress, enrichment.as_deref()) {
+                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.broker.cache.clone());
             }
         }
-        child.wait().await.map(|_| ())
+        child.wait().await
     })
     .await;
-    let timed_out = completed.is_err();
-    if timed_out {
+    let (timed_out, exit_code) = if let Ok(result) = completed {
+        let status = result?;
+        (
+            false,
+            Some(
+                status
+                    .code()
+                    .unwrap_or_else(|| i32::from(!status.success())),
+            ),
+        )
+    } else {
         child.kill().await.ok();
         child.wait().await.ok();
-    } else {
-        completed??;
-    }
+        (true, None)
+    };
     let stdout = raw_stdout
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -375,6 +488,7 @@ async fn run_native_mtr(
         stdout,
         stderr: stderr_task.await.unwrap_or_default(),
         timed_out,
+        exit_code,
     })
 }
 
@@ -400,60 +514,13 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     .await?;
     enrichment.wait().await;
 
-    if native.stdout.trim().is_empty() {
-        return Ok(ParsedMtr {
-            status: MtrStatus::Failed,
-            failure_source: Some("internal".to_string()),
-            raw_output: if native.stderr.trim().is_empty() {
-                "Test failed. Please try again.".into()
-            } else {
-                native.stderr
-            },
-            resolved_address: None,
-            resolved_hostname: None,
-            hops: vec![],
-        });
-    }
-
-    let mut hops = parse_raw(&native.stdout, true);
-    enrichment.apply(&mut hops);
-    let target_address = target.address.to_string();
-    let target_responded = hops.last().is_some_and(|hop| {
-        hop.resolved_address.as_deref() == Some(target_address.as_str())
-            && hop.timings.iter().any(|timing| timing.rtt.is_some())
-    });
-    let has_drop = hops.iter().any(|hop| hop.stats.drop > 0);
-    let mut raw_output = build_output(&hops);
-    if let Some(first_hop) = hops.first_mut()
-        && first_hop.resolved_address.is_some()
-    {
-        first_hop.resolved_hostname = Some("_gateway".to_string());
-    }
-    let mut status = MtrStatus::Finished;
-    let mut failure_source = None;
-    if native.timed_out {
-        status = MtrStatus::Failed;
-        failure_source = Some(
-            if !target_responded && has_drop {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-        if !raw_output.is_empty() {
-            raw_output.push('\n');
-        }
-        raw_output.push_str("The measurement command timed out.");
-    }
-    Ok(ParsedMtr {
-        status,
-        failure_source,
-        raw_output,
-        resolved_address: Some(target_address),
-        resolved_hostname: Some(target.hostname),
-        hops,
-    })
+    Ok(shape_mtr_output(
+        &native.stdout,
+        &native.stderr,
+        native.timed_out,
+        &target,
+        &enrichment.broker.snapshot(),
+    ))
 }
 
 fn cymru_query_name(address: IpAddr) -> String {
@@ -500,7 +567,7 @@ fn parse_cymru_asns(stdout: &str) -> Vec<u32> {
     Vec::new()
 }
 
-async fn lookup_asn(address: IpAddr, budget: Duration) -> Vec<u32> {
+pub(crate) async fn lookup_asn(address: IpAddr, budget: Duration) -> Vec<u32> {
     if budget.is_zero() || is_ip_private(address) {
         return Vec::new();
     }
@@ -546,6 +613,7 @@ pub async fn run_measurement(target: &str, protocol: &str, ip_version: u8) -> Re
 mod tests {
     use super::*;
     use parse::{HopTiming, compute_stats};
+    use parse::{build_output, parse_raw};
 
     const RAW_3HOP: &str = "\
 h 0 192.168.1.1
@@ -789,7 +857,13 @@ x 3 1";
     fn progress_render_applies_completed_enrichment() {
         let cache = EnrichmentCache::default();
         let address = "1.1.1.1".parse().expect("valid address");
-        cache.update(address, Some("one.one.one.one".into()), vec![13335]);
+        cache.update(
+            address,
+            &MtrEnrichmentEntry {
+                hostname: Some("one.one.one.one".into()),
+                asn: vec![13335],
+            },
+        );
         let raw = "h 0 192.168.1.1\nx 0 0\np 0 1000 0\nh 1 1.1.1.1\nx 1 0\np 1 2000 0\n";
         let rendered = render_mtr_progress(raw, &cache);
         let output = rendered["rawOutput"].as_str().expect("raw output");

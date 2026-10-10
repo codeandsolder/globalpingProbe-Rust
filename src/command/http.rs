@@ -2,7 +2,7 @@ pub mod parse;
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-use super::ProgressTx;
+use super::{ProgressTx, RawExecutionEvent, RawExecutionTx};
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,8 +15,9 @@ use crate::util::measurement_timeout::{MeasurementDeadline, http_dns_timeout};
 use crate::util::private_ip::is_ip_private;
 use crate::util::validate::{is_safe_host, is_safe_url_component};
 use parse::{
-    HttpStatus, HttpTimings, ParsedHttp, TlsInfo, build_raw_output, dedup_headers,
-    parse_header_file, parse_status_text, parse_tls_verbose, truncate_headers,
+    BODY_SIZE_LIMIT, HttpMetrics, HttpSuccessInput, ParsedHttp, TlsEnrichment, TlsInfo,
+    apply_tls_enrichment, curl_timeout_message, failed_result, parse_header_file, parse_metrics,
+    parse_tls_verbose, shape_success_http_result,
 };
 
 // ── Options ───────────────────────────────────────────────────────────────────
@@ -66,7 +67,7 @@ const fn default_ip_version() -> u8 {
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
-fn validate(opts: &HttpOptions) -> Result<()> {
+pub(crate) fn validate(opts: &HttpOptions) -> Result<()> {
     // Target is embedded in the curl URL and in `--resolve`; reject metacharacters
     // and anything that isn't a clean hostname/IP.
     if !is_safe_host(&opts.target) {
@@ -122,21 +123,21 @@ fn validate(opts: &HttpOptions) -> Result<()> {
 // ── DNS pre-resolution ────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-enum HttpResolveError {
+pub(crate) enum HttpResolveError {
     TimedOut,
     PrivateIp,
     Failed(String),
 }
 
 impl HttpResolveError {
-    const fn failure_source(&self) -> &'static str {
+    pub(crate) const fn failure_source(&self) -> &'static str {
         match self {
             Self::TimedOut => "resolver",
             Self::PrivateIp | Self::Failed(_) => "target",
         }
     }
 
-    fn public_message(&self) -> String {
+    pub(crate) fn public_message(&self) -> String {
         match self {
             Self::TimedOut => "The measurement timed out during DNS resolution.".to_string(),
             Self::PrivateIp => "Private IP ranges are not allowed.".to_string(),
@@ -145,7 +146,7 @@ impl HttpResolveError {
     }
 }
 
-async fn resolve_target(
+pub(crate) async fn resolve_target(
     target: &str,
     resolver: Option<&str>,
     ip_version: u8,
@@ -224,19 +225,6 @@ const CURL_WRITE_FMT: &str = concat!(
     r#""http_version":"%{http_version}","response_code":%{response_code},"#,
     r#""ssl_verify_result":%{ssl_verify_result}}"#,
 );
-
-#[derive(Debug, serde::Deserialize)]
-struct CurlStats {
-    remote_ip: String,
-    time_namelookup: f64,
-    time_connect: f64,
-    time_appconnect: f64,
-    time_starttransfer: f64,
-    time_total: f64,
-    http_version: String,
-    response_code: u16,
-    ssl_verify_result: u32,
-}
 
 fn build_curl_args(
     opts: &HttpOptions,
@@ -376,13 +364,13 @@ async fn read_capped(path: &str, cap: usize) -> Vec<u8> {
 /// — there is NO shell and NO temp file. Earlier this used `sh -c` with the
 /// servername interpolated into the command string, which was a command-injection
 /// (RCE) vector because the Host-header override flows in here unvalidated-for-DNS.
-async fn enrich_tls(
-    tls: &mut TlsInfo,
+async fn collect_tls_enrichment(
     ip: &str,
     port: u16,
     servername: &str,
     deadline: MeasurementDeadline,
-) {
+) -> TlsEnrichment {
+    let mut enrichment = TlsEnrichment::default();
     let connect_addr = if ip.contains(':') {
         format!("[{ip}]:{port}")
     } else {
@@ -404,17 +392,17 @@ async fn enrich_tls(
     // handshake and exits instead of waiting for application data.
     let s_client_budget = deadline.remaining().min(Duration::from_secs(10));
     if s_client_budget.is_zero() {
-        return;
+        return enrichment;
     }
     let Some(sc_stdout) = run_capturing("openssl", &sc_args, b"\n", s_client_budget).await else {
-        return;
+        return enrichment;
     };
     let full_text = String::from_utf8_lossy(&sc_stdout);
 
     // Verify result, printed by s_client itself.
     for line in full_text.lines() {
         if line.contains("Verify return code:") {
-            tls.authorized = line.contains("Verify return code: 0 (ok)");
+            enrichment.authorized = Some(line.contains("Verify return code: 0 (ok)"));
             break;
         }
     }
@@ -422,7 +410,7 @@ async fn enrich_tls(
     // Extract the PEM block in-process (no `sed`, no temp file) and pipe it to
     // `openssl x509` over stdin (no `-in <path>`).
     let Some(pem) = extract_pem(&full_text) else {
-        return;
+        return enrichment;
     };
     let x509_args: Vec<String> = vec![
         "x509".into(),
@@ -434,11 +422,11 @@ async fn enrich_tls(
     ];
     let x509_budget = deadline.remaining().min(Duration::from_secs(4));
     if x509_budget.is_zero() {
-        return;
+        return enrichment;
     }
     let Some(x509_stdout) = run_capturing("openssl", &x509_args, pem.as_bytes(), x509_budget).await
     else {
-        return;
+        return enrichment;
     };
     let text = String::from_utf8_lossy(&x509_stdout);
 
@@ -451,7 +439,7 @@ async fn enrich_tls(
             .strip_prefix("sha256 Fingerprint=")
             .or_else(|| t.strip_prefix("SHA256 Fingerprint="))
         {
-            tls.fingerprint256 = Some(fp.trim().to_string());
+            enrichment.fingerprint256 = Some(fp.trim().to_string());
         }
         // "serial=AABB..." → "AA:BB:..."
         else if let Some(hex) = t.strip_prefix("serial=") {
@@ -463,15 +451,15 @@ async fn enrich_tls(
                 .map(|c| c.iter().collect())
                 .collect();
             if !fmt.is_empty() {
-                tls.serial_number = Some(fmt.join(":"));
+                enrichment.serial_number = Some(fmt.join(":"));
             }
         }
         // "Public Key Algorithm: id-ecPublicKey" / "rsaEncryption"
         else if t.starts_with("Public Key Algorithm:") {
             if t.contains("ecPublicKey") || t.contains("id-ec") {
-                tls.key_type = Some("EC".to_string());
+                enrichment.key_type = Some("EC".to_string());
             } else if t.contains("rsaEncryption") {
-                tls.key_type = Some("RSA".to_string());
+                enrichment.key_type = Some("RSA".to_string());
             }
         }
         // "Public-Key: (256 bit)"
@@ -479,39 +467,28 @@ async fn enrich_tls(
             if let Some(bits_str) = rest.strip_suffix(" bit)")
                 && let Ok(bits) = bits_str.parse::<u32>()
             {
-                tls.key_bits = Some(bits);
+                enrichment.key_bits = Some(bits);
             }
         }
         // "X509v3 Subject Alternative Name:" → next non-empty line has the SANs
         else if t.starts_with("X509v3 Subject Alternative Name") {
             next_is_san = true;
         } else if next_is_san && !t.is_empty() {
-            tls.subject.alt = Some(t.to_string());
+            enrichment.subject_alt = Some(t.to_string());
             next_is_san = false;
         }
     }
+    enrichment
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
-
-const BODY_LIMIT: usize = 10_000;
-
-fn rounded_millis(seconds: f64) -> u64 {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return 0;
-    }
-    let Ok(duration) = Duration::try_from_secs_f64(seconds) else {
-        return u64::MAX;
-    };
-    let millis = duration.as_nanos().saturating_add(500_000) / 1_000_000;
-    u64::try_from(millis).unwrap_or(u64::MAX)
-}
 
 struct CurlCapture {
     stats: String,
     verbose: String,
     raw_headers: String,
     raw_body: Vec<u8>,
+    exit_code: Option<i32>,
 }
 
 async fn remove_curl_files(headers_path: &str, body_path: &str) {
@@ -525,30 +502,14 @@ enum CurlRunError {
     Spawn(String),
 }
 
-fn curl_timeout_message(verbose: &str, is_https: bool) -> String {
-    if verbose.contains("< HTTP/") || verbose.contains("< HTTP/2") {
-        return "Request timed out while downloading the response.".to_string();
-    }
-    let tls_established = verbose.contains("SSL connection using")
-        || verbose.contains("ALPN: server accepted")
-        || verbose.contains("SSL certificate verify result");
-    if tls_established || (!is_https && verbose.contains("Connected to")) {
-        return "Request timed out while waiting for the first response byte.".to_string();
-    }
-    if is_https && verbose.contains("Connected to") {
-        return "Request timed out during the TLS handshake.".to_string();
-    }
-    "Request timed out while establishing the TCP connection.".to_string()
-}
-
 async fn emit_http_progress(
     headers_path: &str,
     body_path: &str,
     sent_body: &mut usize,
     tx: &ProgressTx,
 ) {
-    let body = read_capped(body_path, BODY_LIMIT).await;
-    let capped_len = body.len().min(BODY_LIMIT);
+    let body = read_capped(body_path, BODY_SIZE_LIMIT).await;
+    let capped_len = body.len().min(BODY_SIZE_LIMIT);
     if capped_len <= *sent_body {
         return;
     }
@@ -595,6 +556,109 @@ async fn emit_http_progress(
     }
 }
 
+async fn emit_http_raw_events(
+    headers_path: &str,
+    body_path: &str,
+    sent_body: &mut usize,
+    last_headers: &mut Vec<u8>,
+    tx: &RawExecutionTx,
+) {
+    let headers = fs::read(headers_path).await.unwrap_or_default();
+    if headers != *last_headers {
+        last_headers.clone_from(&headers);
+        if !headers.is_empty() {
+            tx.send(RawExecutionEvent::HttpResponseHeaders(headers))
+                .await;
+        }
+    }
+
+    let body = read_capped(body_path, BODY_SIZE_LIMIT).await;
+    if body.len() > *sent_body {
+        let chunk = body[*sent_body..].to_vec();
+        *sent_body = body.len();
+        if !chunk.is_empty() {
+            tx.send(RawExecutionEvent::HttpResponseBody(chunk)).await;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CurlSinks<'a> {
+    progress: Option<&'a ProgressTx>,
+    raw: Option<&'a RawExecutionTx>,
+}
+
+#[derive(Default)]
+struct CurlStreamState {
+    progress_body: usize,
+    raw_body: usize,
+    raw_headers: Vec<u8>,
+}
+
+impl CurlStreamState {
+    async fn flush(&mut self, headers_path: &str, body_path: &str, sinks: CurlSinks<'_>) {
+        if let Some(tx) = sinks.progress {
+            emit_http_progress(headers_path, body_path, &mut self.progress_body, tx).await;
+        }
+        if let Some(tx) = sinks.raw {
+            emit_http_raw_events(
+                headers_path,
+                body_path,
+                &mut self.raw_body,
+                &mut self.raw_headers,
+                tx,
+            )
+            .await;
+        }
+    }
+}
+
+async fn wait_for_curl(
+    child: &mut tokio::process::Child,
+    remaining: Duration,
+    headers_path: &str,
+    body_path: &str,
+    sinks: CurlSinks<'_>,
+) -> std::result::Result<(Option<std::process::ExitStatus>, bool), CurlRunError> {
+    let mut stream = CurlStreamState::default();
+    let mut poll = tokio::time::interval(Duration::from_millis(25));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    poll.tick().await;
+    let completed = timeout(remaining, async {
+        loop {
+            tokio::select! {
+                status = child.wait() => break status,
+                _ = poll.tick(), if sinks.progress.is_some() || sinks.raw.is_some() => {
+                    stream.flush(headers_path, body_path, sinks).await;
+                }
+            }
+        }
+    })
+    .await;
+    let result = match completed {
+        Ok(Ok(status)) => (Some(status), false),
+        Ok(Err(error)) => return Err(CurlRunError::Spawn(format!("curl wait failed: {error}"))),
+        Err(_) => {
+            child.kill().await.ok();
+            (child.wait().await.ok(), true)
+        }
+    };
+    stream.flush(headers_path, body_path, sinks).await;
+    Ok(result)
+}
+
+async fn publish_curl_streams(raw_tx: Option<&RawExecutionTx>, stdout: &[u8], stderr: &[u8]) {
+    let Some(tx) = raw_tx else {
+        return;
+    };
+    if !stdout.is_empty() {
+        tx.send(RawExecutionEvent::Stdout(stdout.to_vec())).await;
+    }
+    if !stderr.is_empty() {
+        tx.send(RawExecutionEvent::Stderr(stderr.to_vec())).await;
+    }
+}
+
 async fn execute_curl(
     opts: &HttpOptions,
     url: &str,
@@ -602,7 +666,7 @@ async fn execute_curl(
     resolved_ip: &str,
     remaining: Duration,
     is_https: bool,
-    progress: Option<&ProgressTx>,
+    sinks: CurlSinks<'_>,
 ) -> std::result::Result<CurlCapture, CurlRunError> {
     use tokio::io::AsyncReadExt as _;
 
@@ -644,41 +708,17 @@ async fn execute_curl(
         bytes
     });
 
-    let mut sent_body = 0_usize;
-    let mut poll = tokio::time::interval(Duration::from_millis(25));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    poll.tick().await;
-    let completed = timeout(remaining, async {
-        loop {
-            tokio::select! {
-                status = child.wait() => break status,
-                _ = poll.tick(), if progress.is_some() => {
-                    if let Some(tx) = progress {
-                        emit_http_progress(&headers_path, &body_path, &mut sent_body, tx).await;
-                    }
-                }
-            }
-        }
-    })
-    .await;
-    let (status, timed_out) = match completed {
-        Ok(Ok(status)) => (Some(status), false),
-        Ok(Err(error)) => {
+    let wait = wait_for_curl(&mut child, remaining, &headers_path, &body_path, sinks).await;
+    let (status, timed_out) = match wait {
+        Ok(result) => result,
+        Err(error) => {
             remove_curl_files(&headers_path, &body_path).await;
-            return Err(CurlRunError::Spawn(format!("curl wait failed: {error}")));
-        }
-        Err(_) => {
-            child.kill().await.ok();
-            let status = child.wait().await.ok();
-            (status, true)
+            return Err(error);
         }
     };
-    if let Some(tx) = progress {
-        emit_http_progress(&headers_path, &body_path, &mut sent_body, tx).await;
-    }
-
     let stdout = stdout_task.await.unwrap_or_default();
     let stderr = stderr_task.await.unwrap_or_default();
+    publish_curl_streams(sinks.raw, &stdout, &stderr).await;
     let verbose = String::from_utf8_lossy(&stderr).to_string();
     if timed_out || status.is_some_and(|status| !status.success() && status.code() == Some(28)) {
         let message = curl_timeout_message(&verbose, is_https);
@@ -689,122 +729,45 @@ async fn execute_curl(
         stats: String::from_utf8_lossy(&stdout).trim().to_string(),
         verbose,
         raw_headers: fs::read_to_string(&headers_path).await.unwrap_or_default(),
-        raw_body: read_capped(&body_path, BODY_LIMIT).await,
+        raw_body: read_capped(&body_path, BODY_SIZE_LIMIT).await,
+        exit_code: status.and_then(|status| status.code()),
     };
     remove_curl_files(&headers_path, &body_path).await;
     Ok(capture)
 }
 
-fn curl_failure_message(verbose: &str, prefer_last: bool) -> String {
-    let candidate =
-        |line: &&str| line.contains("curl:") || line.contains("error") || line.starts_with("* ");
-    let mut lines = verbose.lines();
-    let line = if prefer_last {
-        lines.rfind(candidate)
-    } else {
-        lines.find(candidate)
-    };
-    line.map_or_else(
-        || "HTTP request failed".to_string(),
-        |value| value.trim_start_matches("* ").trim().to_string(),
-    )
-}
-
-fn parse_curl_stats(capture: &CurlCapture) -> std::result::Result<CurlStats, String> {
-    let stats: CurlStats = serde_json::from_str(&capture.stats)
-        .map_err(|_| curl_failure_message(&capture.verbose, false))?;
-    if stats.response_code == 0 {
-        return Err(curl_failure_message(&capture.verbose, true));
-    }
-    Ok(stats)
-}
-
-fn truncate_body(raw_body: &[u8]) -> (String, bool) {
-    if raw_body.len() > BODY_LIMIT {
-        (
-            String::from_utf8_lossy(&raw_body[..BODY_LIMIT]).to_string(),
-            true,
-        )
-    } else {
-        (String::from_utf8_lossy(raw_body).to_string(), false)
-    }
-}
-
-fn normalize_http_version(version: &str) -> Option<String> {
-    match version {
-        "2" | "2.0" => Some("2".to_string()),
-        "1.0" => Some("1.0".to_string()),
-        "1.1" => Some("1.1".to_string()),
-        value if !value.is_empty() => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn build_http_timings(stats: &CurlStats, dns_ms: Option<u64>, is_https: bool) -> HttpTimings {
-    let lookup = rounded_millis(stats.time_namelookup);
-    let tcp = rounded_millis(stats.time_connect - stats.time_namelookup);
-    let tls = is_https.then(|| rounded_millis(stats.time_appconnect - stats.time_connect));
-    let app_connect = if is_https {
-        stats.time_appconnect
-    } else {
-        stats.time_connect
-    };
-    let first_byte = rounded_millis(stats.time_starttransfer - app_connect);
-    let download = rounded_millis(stats.time_total - stats.time_starttransfer);
-    let total = dns_ms
-        .unwrap_or(0)
-        .saturating_add(rounded_millis(stats.time_total));
-    HttpTimings {
-        total: Some(total),
-        dns: dns_ms,
-        tcp: Some(tcp + lookup),
-        tls,
-        first_byte: Some(first_byte),
-        download: Some(download),
-    }
-}
-
 async fn build_tls_info(
     opts: &HttpOptions,
-    stats: &CurlStats,
+    stats: &HttpMetrics,
     final_resolved_ip: &str,
     port: u16,
     is_https: bool,
     verbose: &str,
     deadline: MeasurementDeadline,
-) -> Option<TlsInfo> {
+) -> (Option<TlsInfo>, Option<TlsEnrichment>) {
     if !is_https {
-        return None;
+        return (None, None);
     }
-    let mut tls = parse_tls_verbose(verbose, stats.ssl_verify_result)?;
+    let Some(mut tls) = parse_tls_verbose(verbose, stats.ssl_verify_result) else {
+        return (None, None);
+    };
     let server_name = opts.request.host.as_deref().unwrap_or(&opts.target);
-    enrich_tls(&mut tls, final_resolved_ip, port, server_name, deadline).await;
-    Some(tls)
+    let enrichment = collect_tls_enrichment(final_resolved_ip, port, server_name, deadline).await;
+    apply_tls_enrichment(&mut tls, enrichment.clone());
+    (Some(tls), Some(enrichment))
 }
 
 async fn build_success_http_result(
     opts: &HttpOptions,
     capture: &CurlCapture,
-    stats: &CurlStats,
+    stats: &HttpMetrics,
     final_resolved_ip: String,
     dns_ms: Option<u64>,
     port: u16,
     deadline: MeasurementDeadline,
 ) -> ParsedHttp {
     let is_https = !opts.protocol.eq_ignore_ascii_case("HTTP");
-    let status_text = parse_status_text(&capture.raw_headers);
-    let truncate_result = truncate_headers(parse_header_file(&capture.raw_headers));
-    let headers = dedup_headers(&truncate_result.headers);
-    let raw_headers = truncate_result
-        .headers
-        .iter()
-        .map(|(key, value)| format!("{key}: {value}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let (raw_body, body_truncated) = truncate_body(&capture.raw_body);
-    let truncated = truncate_result.truncated || body_truncated;
-    let http_version = normalize_http_version(&stats.http_version);
-    let tls = build_tls_info(
+    let (tls, _) = build_tls_info(
         opts,
         stats,
         &final_resolved_ip,
@@ -814,29 +777,156 @@ async fn build_success_http_result(
         deadline,
     )
     .await;
-    let timings = build_http_timings(stats, dns_ms, is_https);
-    let raw_body = (!raw_body.is_empty()).then_some(raw_body);
-    let raw_output = build_raw_output(
-        http_version.as_deref(),
-        Some(stats.response_code),
-        Some(&raw_headers),
-        raw_body.as_deref(),
-        &opts.request.method,
-    );
-    ParsedHttp {
-        status: HttpStatus::Finished,
-        failure_source: None,
-        status_code: Some(stats.response_code),
-        status_code_name: status_text,
-        resolved_address: Some(final_resolved_ip),
-        http_version,
-        headers,
-        raw_headers: (!raw_headers.is_empty()).then_some(raw_headers),
-        raw_body,
-        truncated,
+    shape_success_http_result(HttpSuccessInput {
+        method: &opts.request.method,
+        protocol: &opts.protocol,
+        raw_header_file: &capture.raw_headers,
+        raw_body_bytes: &capture.raw_body,
+        metrics: stats,
+        final_resolved_ip,
+        dns_ms,
         tls,
-        timings,
-        raw_output,
+    })
+}
+
+pub(crate) struct HttpRawExecution {
+    pub native: ParsedHttp,
+    pub timed_out: bool,
+    pub exit_code: Option<i32>,
+}
+
+async fn raw_failure(
+    tx: &RawExecutionTx,
+    failure_source: &str,
+    message: String,
+    timed_out: bool,
+    exit_code: Option<i32>,
+    publish: bool,
+) -> HttpRawExecution {
+    if publish {
+        tx.send(RawExecutionEvent::HttpNativeFailure {
+            failure_source: failure_source.to_string(),
+            message: message.clone(),
+        })
+        .await;
+    }
+    HttpRawExecution {
+        native: failed_result(failure_source, message),
+        timed_out,
+        exit_code,
+    }
+}
+
+async fn finalize_raw_success(
+    opts: &HttpOptions,
+    resolved_ip: String,
+    dns_ms: Option<u64>,
+    deadline: MeasurementDeadline,
+    tx: &RawExecutionTx,
+    capture: CurlCapture,
+) -> HttpRawExecution {
+    let is_https = !opts.protocol.eq_ignore_ascii_case("HTTP");
+    let port = opts.port.unwrap_or(if is_https { 443 } else { 80 });
+    let metrics = match parse_metrics(&capture.stats, &capture.verbose) {
+        Ok(metrics) => metrics,
+        Err(message) => {
+            return raw_failure(tx, "target", message, false, capture.exit_code, false).await;
+        }
+    };
+    let final_resolved_ip = if metrics.remote_ip.is_empty() {
+        resolved_ip
+    } else {
+        metrics.remote_ip.clone()
+    };
+    if final_resolved_ip.parse().is_ok_and(is_ip_private) {
+        return raw_failure(
+            tx,
+            "target",
+            "Private IP ranges are not allowed.".to_string(),
+            false,
+            capture.exit_code,
+            false,
+        )
+        .await;
+    }
+    let (tls, enrichment) = build_tls_info(
+        opts,
+        &metrics,
+        &final_resolved_ip,
+        port,
+        is_https,
+        &capture.verbose,
+        deadline,
+    )
+    .await;
+    if let Some(enrichment) = enrichment {
+        tx.send(RawExecutionEvent::HttpTlsEnrichment(enrichment))
+            .await;
+    }
+    let native = shape_success_http_result(HttpSuccessInput {
+        method: &opts.request.method,
+        protocol: &opts.protocol,
+        raw_header_file: &capture.raw_headers,
+        raw_body_bytes: &capture.raw_body,
+        metrics: &metrics,
+        final_resolved_ip,
+        dns_ms,
+        tls,
+    });
+    HttpRawExecution {
+        native,
+        timed_out: false,
+        exit_code: capture.exit_code,
+    }
+}
+
+pub(crate) async fn run_raw_stream(
+    opts: &HttpOptions,
+    resolved_ip: String,
+    dns_ms: Option<u64>,
+    deadline: MeasurementDeadline,
+    progress: Option<&ProgressTx>,
+    tx: &RawExecutionTx,
+) -> HttpRawExecution {
+    let protocol = opts.protocol.to_uppercase();
+    let is_https = protocol != "HTTP";
+    let port = opts
+        .port
+        .unwrap_or(if protocol == "HTTP" { 80 } else { 443 });
+    let remaining = deadline.remaining();
+    if remaining.is_zero() {
+        return raw_failure(
+            tx,
+            "target",
+            "Request timed out while establishing the TCP connection.".to_string(),
+            false,
+            Some(1),
+            true,
+        )
+        .await;
+    }
+    let url = build_url(opts, port);
+    let capture = execute_curl(
+        opts,
+        &url,
+        port,
+        &resolved_ip,
+        remaining,
+        is_https,
+        CurlSinks {
+            progress,
+            raw: Some(tx),
+        },
+    )
+    .await;
+    match capture {
+        Ok(capture) => finalize_raw_success(opts, resolved_ip, dns_ms, deadline, tx, capture).await,
+        Err(CurlRunError::TimedOut(message)) => {
+            raw_failure(tx, "target", message, true, None, false).await
+        }
+        Err(CurlRunError::Spawn(message)) => {
+            raw_failure(tx, "internal", message, false, Some(1), true).await
+        }
     }
 }
 
@@ -879,7 +969,10 @@ async fn run_http(opts: &HttpOptions, progress: Option<ProgressTx>) -> Result<Pa
         &resolved_ip,
         remaining,
         is_https,
-        progress.as_ref(),
+        CurlSinks {
+            progress: progress.as_ref(),
+            raw: None,
+        },
     )
     .await
     {
@@ -887,7 +980,7 @@ async fn run_http(opts: &HttpOptions, progress: Option<ProgressTx>) -> Result<Pa
         Err(CurlRunError::TimedOut(message)) => return Ok(failed_result("target", message)),
         Err(CurlRunError::Spawn(message)) => return Ok(failed_result("internal", message)),
     };
-    let stats = match parse_curl_stats(&capture) {
+    let stats = match parse_metrics(&capture.stats, &capture.verbose) {
         Ok(stats) => stats,
         Err(message) => return Ok(failed_result("target", message)),
     };
@@ -913,24 +1006,6 @@ async fn run_http(opts: &HttpOptions, progress: Option<ProgressTx>) -> Result<Pa
         deadline,
     )
     .await)
-}
-
-fn failed_result(failure_source: &str, message: String) -> ParsedHttp {
-    ParsedHttp {
-        status: HttpStatus::Failed,
-        failure_source: Some(failure_source.to_string()),
-        status_code: None,
-        status_code_name: None,
-        resolved_address: None,
-        http_version: None,
-        headers: HashMap::new(),
-        raw_headers: None,
-        raw_body: None,
-        truncated: false,
-        tls: None,
-        timings: HttpTimings::default(),
-        raw_output: Some(message),
-    }
 }
 
 // ── Command ───────────────────────────────────────────────────────────────────

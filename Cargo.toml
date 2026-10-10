@@ -12,7 +12,7 @@ categories = ["network-programming", "command-line-utilities"]
 [features]
 default = ["native"]
 native = [
-    "dep:anyhow",
+    "behavior-artifact",
     "dep:axum",
     "dep:config",
     "dep:futures",
@@ -27,6 +27,14 @@ native = [
     "dep:tracing-subscriber",
     "dep:url",
     "dep:uuid",
+    "dep:wasmtime",
+]
+behavior-artifact = [
+    "dep:anyhow",
+    "dep:ed25519-dalek",
+    "dep:hex",
+    "dep:semver",
+    "dep:sha2",
 ]
 wasm-core = []
 
@@ -48,9 +56,19 @@ name = "globalping-probe"
 path = "src/main.rs"
 required-features = ["native"]
 
+[[bin]]
+name = "globalping-behavior-pack"
+path = "src/bin/globalping-behavior-pack.rs"
+required-features = ["behavior-artifact"]
+
 [[test]]
 name = "integration"
 path = "tests/integration/mod.rs"
+required-features = ["native"]
+
+[[test]]
+name = "behavior_component"
+path = "tests/behavior_component.rs"
 required-features = ["native"]
 
 [[bin]]
@@ -68,7 +86,6 @@ serde_json  = "1"
 config      = { version = "0.14", optional = true }
 uuid        = { version = "1", features = ["v4"], optional = true }
 chrono      = { version = "0.4", features = ["serde"] }
-ipnet       = "2"
 regex       = "1"
 futures     = { version = "0.3", optional = true }
 futures-util  = { version = "0.3", optional = true }
@@ -79,6 +96,12 @@ rand = { version = "0.9", optional = true }
 if-addrs = { version = "0.15.0", optional = true }
 url = { version = "2.5.8", optional = true }
 psl = { version = "2", optional = true }
+ed25519-dalek = { version = "2", optional = true }
+hex = { version = "0.4", optional = true }
+semver = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+wasmtime = { version = "49", default-features = false, features = ["async", "component-model", "component-model-async", "cranelift", "runtime", "std"], optional = true }
+globalping-behavior-core = { path = "crates/globalping-behavior-core" }
 
 [dev-dependencies]
 bytes         = "1"
@@ -86,6 +109,7 @@ tokio-test     = "0.4"
 mockall        = "0.13"
 assert_matches = "1.5"
 tempfile       = "3"
+tokio-rustls  = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 
 [profile.dev]
 opt-level = 0
@@ -100,3 +124,8 @@ strip = true
 [profile.test]
 opt-level = 0
 debug = true
+
+[workspace]
+members = [".", "crates/globalping-behavior", "crates/globalping-behavior-core"]
+default-members = ["."]
+resolver = "2"

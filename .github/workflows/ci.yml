@@ -23,6 +23,7 @@ jobs:
     name: rust-skills2 strict nightly gate
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@main
     with:
+      cargo-args: --locked --workspace --exclude globalping-behavior --all-targets
       allow-test-panics: true
 
   stable:
@@ -47,9 +48,43 @@ jobs:
         run: cargo +1.99.0 check --locked --all-targets
       - name: Build WASIp2 sandbox component
         run: cargo +1.99.0 build --locked --release --no-default-features --features wasm-core --bin globalping-sandbox --target wasm32-wasip2
+      - name: Build WASIp2 behavior component
+        run: cargo +1.99.0 build --locked --release -p globalping-behavior --target wasm32-wasip2
+      - name: Package signed behavior update artifact
+        run: |
+          # Deterministic public CI-only seed. Production signing material never enters the probe runtime.
+          printf '47%.0s' {1..32} | cargo +1.99.0 run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
+            --component target/wasm32-wasip2/release/globalping_behavior.wasm \
+            --output-dir target/ci-behavior-artifact \
+            --sequence 1 \
+            --build-id ci-${GITHUB_SHA} \
+            --signing-key -
+          test -f target/ci-behavior-artifact/manifest.json
+          test -f target/ci-behavior-artifact/component.wasm
+          test "$(find target/ci-behavior-artifact -maxdepth 1 -type f | wc -l)" -eq 2
+      - name: Verify signed behavior runtime and behavior executor
+        env:
+          GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
+        run: cargo +1.99.0 test --locked --test behavior_component -- --include-ignored
+      - name: Differential-test all WASIp2 measurement behavior against native shaping
+        env:
+          GLOBALPING_BEHAVIOR_COMPONENT: target/wasm32-wasip2/release/globalping_behavior.wasm
+        run: cargo +1.99.0 test --locked --lib differential_tests::differential_ -- --ignored
       - name: Clippy production targets
         run: cargo +1.99.0 clippy --locked --lib --bins -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy shared behavior core
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior-core -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy WASIp2 behavior component
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy post-start behavior fault fixture
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-fault-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy post-start behavior divergence fixture
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-divergence-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
+      - name: Clippy post-start invalid-output fixture
+        run: cargo +1.99.0 clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-invalid-output-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
       - name: Unit tests
         run: cargo +1.99.0 test --locked --lib --bins
+      - name: Shared behavior core unit tests
+        run: cargo +1.99.0 test --locked -p globalping-behavior-core
       - name: Documentation
         run: cargo +1.99.0 doc --locked --no-deps
