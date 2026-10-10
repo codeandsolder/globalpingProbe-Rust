@@ -128,7 +128,7 @@ RUST_LOG=info \
 | `GP_ADOPTION_TOKEN` | _(none)_ | Adoption token sent in WebSocket handshake |
 | `GP_API_HOST` | `https://api.globalping.io` | Globalping API endpoint |
 | `GP_PING_TARGET` | `api.globalping.io` | Target for periodic QA ping tests |
-| `GP_BEHAVIOR_VERIFYING_KEY` | _(none)_ | 64-hex-character Ed25519 public key that explicitly enables trusted diagnostic WASM behavior bootstrap |
+| `GP_BEHAVIOR_VERIFYING_KEY` | _(none)_ | 64-hex-character Ed25519 public key that explicitly enables trusted WASM behavior bootstrap |
 | `GP_BEHAVIOR_ROOT` | `/.globalping-behavior` | Absolute persistent active/previous behavior-slot directory; only used when behavior bootstrap is enabled |
 | `GP_BEHAVIOR_UPDATE_URL` | _(none)_ | Optional HTTPS directory serving signed `manifest.json` and `component.wasm`; redirects, embedded credentials, query strings, and fragments are rejected |
 | `GP_BEHAVIOR_UPDATE_INTERVAL_SECS` | `300` | Signed behavior update polling interval; valid only when `GP_BEHAVIOR_UPDATE_URL` is set |

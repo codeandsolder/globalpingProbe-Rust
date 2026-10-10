@@ -218,26 +218,38 @@ pub struct BehaviorUpdater {
     interval: Duration,
 }
 
+fn update_http_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(Policy::none())
+        .https_only(true)
+        .connect_timeout(UPDATE_CONNECT_TIMEOUT)
+        .timeout(UPDATE_REQUEST_TIMEOUT)
+        .user_agent(concat!(
+            "globalping-probe/",
+            env!("CARGO_PKG_VERSION"),
+            " behavior-updater"
+        ))
+}
+
 impl BehaviorUpdater {
     fn new(base: &Url, interval: Duration) -> Result<Self, BehaviorTransportError> {
+        let client = update_http_client_builder()
+            .build()
+            .map_err(BehaviorTransportError::HttpClient)?;
+        Self::with_client(base, interval, client)
+    }
+
+    fn with_client(
+        base: &Url,
+        interval: Duration,
+        client: reqwest::Client,
+    ) -> Result<Self, BehaviorTransportError> {
         let manifest_url = base
             .join("manifest.json")
             .map_err(BehaviorTransportError::InvalidUpdateUrl)?;
         let component_url = base
             .join("component.wasm")
             .map_err(BehaviorTransportError::InvalidUpdateUrl)?;
-        let client = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .https_only(true)
-            .connect_timeout(UPDATE_CONNECT_TIMEOUT)
-            .timeout(UPDATE_REQUEST_TIMEOUT)
-            .user_agent(concat!(
-                "globalping-probe/",
-                env!("CARGO_PKG_VERSION"),
-                " behavior-updater"
-            ))
-            .build()
-            .map_err(BehaviorTransportError::HttpClient)?;
         Ok(Self {
             client,
             manifest_url,
@@ -390,13 +402,21 @@ fn normalize_update_base(value: &str) -> Result<Url, BehaviorTransportError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::net::SocketAddr;
+    use std::sync::RwLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::{Router, routing::get};
     use ed25519_dalek::{Signer as _, SigningKey};
     use sha2::{Digest as _, Sha256};
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
     use super::*;
+    use crate::supervisor::health::{BehaviorHealthEvent, BehaviorHealthPolicy};
+    use crate::supervisor::runtime::RuntimeError;
     use crate::supervisor::update::{SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR, UpdateError};
 
     fn key_hex() -> String {
@@ -416,6 +436,166 @@ mod tests {
         };
         manifest.signature = hex::encode(key.sign(&manifest.signing_payload()).to_bytes());
         manifest
+    }
+
+    #[derive(Clone)]
+    struct ServedBehavior {
+        manifest: Vec<u8>,
+        component: Vec<u8>,
+    }
+
+    impl ServedBehavior {
+        fn signed(sequence: u64, component: Vec<u8>, key: &SigningKey) -> Self {
+            let manifest = signed_manifest(sequence, &component, key);
+            let manifest = serde_json::to_vec(&manifest)
+                .unwrap_or_else(|error| panic!("manifest serialization failed: {error}"));
+            Self {
+                manifest,
+                component,
+            }
+        }
+    }
+
+    struct TestTlsListener {
+        tcp: tokio::net::TcpListener,
+        acceptor: TlsAcceptor,
+    }
+
+    impl axum::serve::Listener for TestTlsListener {
+        type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                match self.tcp.accept().await {
+                    Ok((stream, address)) => {
+                        if let Ok(stream) = self.acceptor.accept(stream).await {
+                            return (stream, address);
+                        }
+                    }
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        }
+
+        fn local_addr(&self) -> io::Result<Self::Addr> {
+            self.tcp.local_addr()
+        }
+    }
+
+    struct TestHttpsServer {
+        base: Url,
+        root_certificate: reqwest::Certificate,
+        artifact_state: Arc<RwLock<ServedBehavior>>,
+        component_hits: Arc<AtomicUsize>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestHttpsServer {
+        fn serve(&self, artifact: ServedBehavior) {
+            *self
+                .artifact_state
+                .write()
+                .unwrap_or_else(|_| panic!("served behavior lock poisoned")) = artifact;
+        }
+
+        fn component_hits(&self) -> usize {
+            self.component_hits.load(Ordering::Relaxed)
+        }
+
+        async fn shutdown(self) {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
+
+    async fn spawn_test_https_server(initial: ServedBehavior) -> TestHttpsServer {
+        let artifact_state = Arc::new(RwLock::new(initial));
+        let component_hits = Arc::new(AtomicUsize::new(0));
+        let manifest_route = {
+            let artifact_state = Arc::clone(&artifact_state);
+            move || {
+                let artifact_state = Arc::clone(&artifact_state);
+                async move {
+                    artifact_state
+                        .read()
+                        .unwrap_or_else(|_| panic!("served behavior lock poisoned"))
+                        .manifest
+                        .clone()
+                }
+            }
+        };
+        let component_route = {
+            let artifact_state = Arc::clone(&artifact_state);
+            let component_hits = Arc::clone(&component_hits);
+            move || {
+                let artifact_state = Arc::clone(&artifact_state);
+                let component_hits = Arc::clone(&component_hits);
+                async move {
+                    component_hits.fetch_add(1, Ordering::Relaxed);
+                    artifact_state
+                        .read()
+                        .unwrap_or_else(|_| panic!("served behavior lock poisoned"))
+                        .component
+                        .clone()
+                }
+            }
+        };
+        let app = Router::new()
+            .route("/manifest.json", get(manifest_route))
+            .route("/component.wasm", get(component_route));
+
+        // Fixed test-only localhost certificate and private key. These bytes are
+        // intentionally public fixtures, not production signing or TLS material.
+        let cert_der = tokio_rustls::rustls::pki_types::CertificateDer::from(
+            include_bytes!("../../tests/fixtures/behavior-update-localhost-cert.der").to_vec(),
+        );
+        let key_der = PrivatePkcs8KeyDer::from(
+            include_bytes!("../../tests/fixtures/behavior-update-localhost-key.der").to_vec(),
+        );
+        let tls = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
+            .unwrap_or_else(|error| panic!("test TLS configuration failed: {error}"));
+        let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap_or_else(|error| panic!("test HTTPS listener bind failed: {error}"));
+        let address = tcp
+            .local_addr()
+            .unwrap_or_else(|error| panic!("test HTTPS listener address failed: {error}"));
+        let listener = TestTlsListener {
+            tcp,
+            acceptor: TlsAcceptor::from(Arc::new(tls)),
+        };
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = Url::parse(&format!("https://{address}/"))
+            .unwrap_or_else(|error| panic!("test HTTPS URL failed: {error}"));
+        let root_certificate = reqwest::Certificate::from_der(include_bytes!(
+            "../../tests/fixtures/behavior-update-localhost-ca.der"
+        ))
+        .unwrap_or_else(|error| panic!("test root certificate failed: {error}"));
+        TestHttpsServer {
+            base,
+            root_certificate,
+            artifact_state,
+            component_hits,
+            task,
+        }
+    }
+
+    fn tcp_ping_measurement() -> serde_json::Value {
+        serde_json::json!({
+            "type": "ping",
+            "target": "1.1.1.1",
+            "protocol": "TCP",
+            "port": 443,
+            "packets": 1,
+            "ipVersion": 4,
+            "timeout": 10,
+            "inProgressUpdates": false
+        })
     }
 
     #[test]
@@ -633,6 +813,210 @@ mod tests {
         assert_eq!(component_hits.load(Ordering::Relaxed), 0);
         server.abort();
         let _ = server.await;
+    }
+
+    fn behavior_fixture(name: &'static str) -> Vec<u8> {
+        let path =
+            std::env::var_os(name).map_or_else(|| panic!("{name} is required"), PathBuf::from);
+        std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+    }
+
+    struct ProductionRolloutHarness {
+        signing_key: SigningKey,
+        normal: Vec<u8>,
+        invalid: Vec<u8>,
+        https: TestHttpsServer,
+        _storage: tempfile::TempDir,
+        config: ProductionBehaviorConfig,
+        updater: BehaviorUpdater,
+        policy: BehaviorHealthPolicy,
+    }
+
+    impl ProductionRolloutHarness {
+        async fn start() -> Self {
+            let normal = behavior_fixture("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT");
+            let invalid = behavior_fixture("GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT");
+            let signing_key = SigningKey::from_bytes(&[11; 32]);
+            let https =
+                spawn_test_https_server(ServedBehavior::signed(1, normal.clone(), &signing_key))
+                    .await;
+            let storage =
+                tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+            let config = ProductionBehaviorConfig::from_values(
+                Some(hex::encode(signing_key.verifying_key().to_bytes())),
+                Some(storage.path().to_string_lossy().into_owned()),
+                Some(https.base.to_string()),
+                Some("1".to_string()),
+            )
+            .unwrap_or_else(|error| panic!("production behavior config failed: {error}"))
+            .unwrap_or_else(|| panic!("production behavior config unexpectedly disabled"));
+            assert_eq!(config.update_base(), Some(&https.base));
+            assert!(config.updater().is_ok());
+            let client = update_http_client_builder()
+                .add_root_certificate(https.root_certificate.clone())
+                .build()
+                .unwrap_or_else(|error| panic!("test production HTTPS client failed: {error}"));
+            let updater = BehaviorUpdater::with_client(&https.base, Duration::from_secs(1), client)
+                .unwrap_or_else(|error| panic!("test updater failed: {error}"));
+            let policy = BehaviorHealthPolicy::new(
+                std::num::NonZeroU32::new(1)
+                    .unwrap_or_else(|| panic!("health threshold must be non-zero")),
+            );
+            Self {
+                signing_key,
+                normal,
+                invalid,
+                https,
+                _storage: storage,
+                config,
+                updater,
+                policy,
+            }
+        }
+
+        async fn load_controller(&self) -> Arc<BehaviorController> {
+            BehaviorController::load(
+                self.config
+                    .bootstrap_config()
+                    .with_health_policy(self.policy),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("controller load failed: {error}"))
+        }
+
+        fn serve(&self, sequence: u64, component: Vec<u8>) {
+            self.https.serve(ServedBehavior::signed(
+                sequence,
+                component,
+                &self.signing_key,
+            ));
+        }
+
+        async fn activate(&self, controller: &BehaviorController, sequence: u64) {
+            assert_eq!(
+                self.updater
+                    .check_once(controller)
+                    .await
+                    .unwrap_or_else(|error| panic!("update {sequence} failed: {error:?}")),
+                BehaviorUpdateOutcome::Activated {
+                    sequence,
+                    build_id: format!("transport-test-{sequence}"),
+                }
+            );
+        }
+
+        async fn assert_initial_activation(&self) -> Arc<BehaviorController> {
+            let controller = self.load_controller().await;
+            assert_eq!(controller.active_sequence().unwrap_or(None), None);
+            assert_eq!(controller.accepted_sequence().unwrap_or_default(), 0);
+            self.activate(&controller, 1).await;
+            assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+            assert_eq!(controller.accepted_sequence().unwrap_or_default(), 1);
+            assert_eq!(self.https.component_hits(), 1);
+            let result = controller
+                .executor()
+                .await
+                .unwrap_or_else(|| panic!("healthy executor missing"))
+                .run(tcp_ping_measurement())
+                .await
+                .unwrap_or_else(|error| panic!("healthy behavior execution failed: {error}"));
+            assert!(result.oracle_error.is_none());
+            assert!(result.component.is_ok());
+            controller
+        }
+
+        async fn assert_bad_update_rolls_back(&self, controller: &BehaviorController) {
+            self.serve(2, self.invalid.clone());
+            self.activate(controller, 2).await;
+            assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
+            assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+            assert!(controller.has_previous().unwrap_or(false));
+            assert_eq!(self.https.component_hits(), 2);
+
+            let result = controller
+                .executor()
+                .await
+                .unwrap_or_else(|| panic!("bad executor missing"))
+                .run(tcp_ping_measurement())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("bad behavior execution failed before native start: {error}")
+                });
+            assert!(result.oracle_error.is_none());
+            let component_error = result
+                .component
+                .err()
+                .unwrap_or_else(|| panic!("invalid-output fixture unexpectedly succeeded"));
+            assert!(matches!(
+                component_error,
+                RuntimeError::GuestInvalidOutput(_)
+            ));
+            assert!(component_error.is_component_health_fault());
+            assert_eq!(
+                controller
+                    .observe_health(2, BehaviorHealthEvent::RuntimeFault)
+                    .await
+                    .unwrap_or_else(|error| panic!("health rollback failed: {error}")),
+                crate::supervisor::bootstrap::BehaviorHealthAction::RolledBack {
+                    from_sequence: 2,
+                    to_sequence: 1,
+                }
+            );
+            assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+            assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+            assert!(!controller.has_previous().unwrap_or(true));
+        }
+
+        async fn assert_stale_is_not_redownloaded_and_recover(
+            &self,
+            controller: &BehaviorController,
+        ) {
+            let hits_before = self.https.component_hits();
+            assert_eq!(
+                self.updater
+                    .check_once(controller)
+                    .await
+                    .unwrap_or_else(|error| panic!("stale update check failed: {error}")),
+                BehaviorUpdateOutcome::Current { sequence: 2 }
+            );
+            assert_eq!(self.https.component_hits(), hits_before);
+
+            self.serve(3, self.normal.clone());
+            self.activate(controller, 3).await;
+            assert_eq!(controller.active_sequence().unwrap_or(None), Some(3));
+            assert_eq!(controller.accepted_sequence().unwrap_or_default(), 3);
+            assert!(controller.has_previous().unwrap_or(false));
+        }
+
+        async fn shutdown(self) {
+            self.https.shutdown().await;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access plus normal and invalid-output WASIp2 behavior fixtures"]
+    async fn production_rollout_survives_activation_restart_fault_rollback_and_restart() {
+        let harness = ProductionRolloutHarness::start().await;
+        let controller = harness.assert_initial_activation().await;
+        drop(controller);
+
+        let controller = harness.load_controller().await;
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 1);
+        harness.assert_bad_update_rolls_back(&controller).await;
+        drop(controller);
+
+        let controller = harness.load_controller().await;
+        assert_eq!(controller.active_sequence().unwrap_or(None), Some(1));
+        assert_eq!(controller.accepted_sequence().unwrap_or_default(), 2);
+        assert!(!controller.has_previous().unwrap_or(true));
+        harness
+            .assert_stale_is_not_redownloaded_and_recover(&controller)
+            .await;
+        drop(controller);
+        harness.shutdown().await;
     }
 
     #[test]
