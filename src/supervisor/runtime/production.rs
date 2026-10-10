@@ -128,6 +128,78 @@ impl ProductionHost {
             ))
         }
     }
+
+    fn expose_execution_event(
+        &mut self,
+        event: crate::command::RawExecutionEvent,
+        now: std::time::Instant,
+    ) -> Result<wit_host::ExecutionEvent, wit_host::HostError> {
+        match event {
+            crate::command::RawExecutionEvent::Stdout(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::Stdout(bytes))
+            }
+            crate::command::RawExecutionEvent::Stderr(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::Stderr(bytes))
+            }
+            crate::command::RawExecutionEvent::ObservedAddress(address) => {
+                self.lease
+                    .observe_address(address, now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::ObservedAddress(
+                    address.to_string(),
+                ))
+            }
+            crate::command::RawExecutionEvent::HttpResponseHeaders(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::HttpResponseHeaders(bytes))
+            }
+            crate::command::RawExecutionEvent::HttpResponseBody(bytes) => {
+                self.lease
+                    .account_raw_bytes(bytes.len(), now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::HttpResponseBody(bytes))
+            }
+            crate::command::RawExecutionEvent::HttpTlsEnrichment(enrichment) => Ok(
+                wit_host::ExecutionEvent::HttpTlsEnrichment(wit_host::HttpTlsEnrichment {
+                    authorized: enrichment.authorized,
+                    subject_alt: enrichment.subject_alt,
+                    key_type: enrichment.key_type,
+                    key_bits: enrichment.key_bits,
+                    serial_number: enrichment.serial_number,
+                    fingerprint256: enrichment.fingerprint256,
+                }),
+            ),
+            crate::command::RawExecutionEvent::HttpNativeFailure {
+                failure_source,
+                message,
+            } => Ok(wit_host::ExecutionEvent::HttpNativeFailure(
+                wit_host::HttpNativeFailure {
+                    failure_source,
+                    message,
+                },
+            )),
+            crate::command::RawExecutionEvent::Exited(code) => {
+                self.lease
+                    .observe_execution_complete(now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::Exited(code))
+            }
+            crate::command::RawExecutionEvent::TimedOut => {
+                self.lease
+                    .observe_execution_complete(now)
+                    .map_err(policy_error)?;
+                Ok(wit_host::ExecutionEvent::TimedOut)
+            }
+        }
+    }
 }
 
 const fn wit_measurement_kind(
@@ -222,6 +294,7 @@ fn policy_error(error: crate::supervisor::capability::PolicyError) -> wit_host::
         | PolicyError::InvalidTimeout => wit_host::HostErrorCode::InvalidRequest,
         PolicyError::AlreadyStarted
         | PolicyError::NotStarted
+        | PolicyError::NotFinished
         | PolicyError::UnknownAddress
         | PolicyError::PrivateAddress => wit_host::HostErrorCode::PolicyDenied,
     };
@@ -817,6 +890,14 @@ impl wit_host::Host for ProductionHost {
         self.mtr_enrichment.clone_from(&started.mtr_enrichment);
         self.events = Some(started.events);
         self.oracle = Some(started.oracle);
+        if matches!(
+            started.start,
+            wit_host::ExecutionStartResult::ResolutionFailed(_)
+        ) {
+            self.lease
+                .observe_execution_complete(std::time::Instant::now())
+                .map_err(policy_error)?;
+        }
         Ok(started.start)
     }
 
@@ -861,60 +942,7 @@ impl wit_host::Host for ProductionHost {
         };
         let now = std::time::Instant::now();
         self.lease.authorize_poll(now).map_err(policy_error)?;
-        let event = match event {
-            crate::command::RawExecutionEvent::Stdout(bytes) => {
-                self.lease
-                    .account_raw_bytes(bytes.len(), now)
-                    .map_err(policy_error)?;
-                wit_host::ExecutionEvent::Stdout(bytes)
-            }
-            crate::command::RawExecutionEvent::Stderr(bytes) => {
-                self.lease
-                    .account_raw_bytes(bytes.len(), now)
-                    .map_err(policy_error)?;
-                wit_host::ExecutionEvent::Stderr(bytes)
-            }
-            crate::command::RawExecutionEvent::ObservedAddress(address) => {
-                self.lease
-                    .observe_address(address, now)
-                    .map_err(policy_error)?;
-                wit_host::ExecutionEvent::ObservedAddress(address.to_string())
-            }
-            crate::command::RawExecutionEvent::HttpResponseHeaders(bytes) => {
-                self.lease
-                    .account_raw_bytes(bytes.len(), now)
-                    .map_err(policy_error)?;
-                wit_host::ExecutionEvent::HttpResponseHeaders(bytes)
-            }
-            crate::command::RawExecutionEvent::HttpResponseBody(bytes) => {
-                self.lease
-                    .account_raw_bytes(bytes.len(), now)
-                    .map_err(policy_error)?;
-                wit_host::ExecutionEvent::HttpResponseBody(bytes)
-            }
-            crate::command::RawExecutionEvent::HttpTlsEnrichment(enrichment) => {
-                wit_host::ExecutionEvent::HttpTlsEnrichment(wit_host::HttpTlsEnrichment {
-                    authorized: enrichment.authorized,
-                    subject_alt: enrichment.subject_alt,
-                    key_type: enrichment.key_type,
-                    key_bits: enrichment.key_bits,
-                    serial_number: enrichment.serial_number,
-                    fingerprint256: enrichment.fingerprint256,
-                })
-            }
-            crate::command::RawExecutionEvent::HttpNativeFailure {
-                failure_source,
-                message,
-            } => wit_host::ExecutionEvent::HttpNativeFailure(wit_host::HttpNativeFailure {
-                failure_source,
-                message,
-            }),
-            crate::command::RawExecutionEvent::Exited(code) => {
-                wit_host::ExecutionEvent::Exited(code)
-            }
-            crate::command::RawExecutionEvent::TimedOut => wit_host::ExecutionEvent::TimedOut,
-        };
-        Ok(Some(event))
+        self.expose_execution_event(event, now).map(Some)
     }
 
     async fn reverse_lookup(
@@ -1391,6 +1419,41 @@ mod tests {
         .err()
         .unwrap_or_else(|| panic!("mid-measurement progress mode change unexpectedly succeeded"));
         assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn final_result_is_rejected_until_guest_polls_terminal_event() {
+        let (progress_sink, _rx) = crate::command::ProgressSink::channel();
+        let (mut host, token) = progress_test_host(progress_sink);
+        let (tx, events) = crate::command::RawExecutionTx::channel();
+        let oracle = new_oracle_slot();
+        host.events = Some(events);
+        host.oracle = Some(std::sync::Arc::clone(&oracle));
+
+        assert_eq!(
+            host.lease
+                .authorize_final_result("{}", std::time::Instant::now()),
+            Err(crate::supervisor::capability::PolicyError::NotFinished)
+        );
+        send_terminal(&tx, &oracle, false, Some(0)).await;
+        assert_eq!(
+            host.lease
+                .authorize_final_result("{}", std::time::Instant::now()),
+            Err(crate::supervisor::capability::PolicyError::NotFinished),
+            "producer completion alone must not authorize a guest final result"
+        );
+        let terminal = wit_host::Host::poll(&mut host, token)
+            .await
+            .unwrap_or_else(|error| panic!("terminal poll failed: {error:?}"));
+        assert!(matches!(
+            terminal,
+            Some(wit_host::ExecutionEvent::Exited(0))
+        ));
+        assert_eq!(
+            host.lease
+                .authorize_final_result("{}", std::time::Instant::now()),
+            Ok(())
+        );
     }
 
     #[tokio::test]

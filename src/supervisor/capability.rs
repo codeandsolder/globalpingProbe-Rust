@@ -52,6 +52,7 @@ pub enum PolicyError {
     Expired,
     AlreadyStarted,
     NotStarted,
+    NotFinished,
     UnknownAddress,
     PrivateAddress,
     RawOutputQuota,
@@ -71,6 +72,7 @@ impl fmt::Display for PolicyError {
             Self::Expired => "capability expired",
             Self::AlreadyStarted => "native execution already started",
             Self::NotStarted => "native execution has not started",
+            Self::NotFinished => "native execution has not completed",
             Self::UnknownAddress => "address was not observed by this measurement",
             Self::PrivateAddress => "operation is not allowed for a private address",
             Self::RawOutputQuota => "raw execution output quota exceeded",
@@ -135,6 +137,7 @@ pub struct CapabilityLease {
     pub scope: MeasurementScope,
     expires_at: Instant,
     started: bool,
+    execution_complete: bool,
     raw_bytes: usize,
     poll_calls: u32,
     enrichment_lookups: u32,
@@ -151,6 +154,7 @@ impl CapabilityLease {
             scope,
             expires_at,
             started: false,
+            execution_complete: false,
             raw_bytes: 0,
             poll_calls: 0,
             enrichment_lookups: 0,
@@ -188,6 +192,22 @@ impl CapabilityLease {
         if self.poll_calls > MAX_POLL_CALLS {
             return Err(PolicyError::PollQuota);
         }
+        Ok(())
+    }
+
+    /// Record that the guest has observed execution completion.
+    ///
+    /// Resolution failure is completion without a native process; otherwise this
+    /// is called only when `poll` delivers `Exited` or `TimedOut` to the guest.
+    ///
+    /// # Errors
+    /// Returns an error when the lease expired or execution has not started.
+    pub fn observe_execution_complete(&mut self, now: Instant) -> Result<(), PolicyError> {
+        self.ensure_live(now)?;
+        if !self.started {
+            return Err(PolicyError::NotStarted);
+        }
+        self.execution_complete = true;
         Ok(())
     }
 
@@ -287,10 +307,16 @@ impl CapabilityLease {
     /// Authorize the final serialized result returned by the behavior component.
     ///
     /// # Errors
-    /// Returns an error when the lease expired or the result exceeds the hard
-    /// final-payload limit.
+    /// Returns an error when execution has not started/completed, the lease expired,
+    /// or the result exceeds the hard final-payload limit.
     pub fn authorize_final_result(&self, json: &str, now: Instant) -> Result<(), PolicyError> {
         self.ensure_live(now)?;
+        if !self.started {
+            return Err(PolicyError::NotStarted);
+        }
+        if !self.execution_complete {
+            return Err(PolicyError::NotFinished);
+        }
         let limit = if self.scope.kind == MeasurementKind::Http {
             MAX_HTTP_FINAL_JSON_BYTES
         } else {
@@ -451,6 +477,23 @@ mod tests {
     }
 
     #[test]
+    fn final_result_requires_observed_execution_completion() {
+        let now = Instant::now();
+        let mut lease = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, ping_scope(10), now);
+        assert_eq!(
+            lease.authorize_final_result("{}", now),
+            Err(PolicyError::NotStarted)
+        );
+        assert_eq!(lease.authorize_start(now), Ok(()));
+        assert_eq!(
+            lease.authorize_final_result("{}", now),
+            Err(PolicyError::NotFinished)
+        );
+        assert_eq!(lease.observe_execution_complete(now), Ok(()));
+        assert_eq!(lease.authorize_final_result("{}", now), Ok(()));
+    }
+
+    #[test]
     fn output_quotas_are_supervisor_enforced() {
         let now = Instant::now();
         let mut lease = CapabilityLease::new(CapabilityToken { hi: 1, lo: 2 }, ping_scope(10), now);
@@ -470,6 +513,9 @@ mod tests {
             lease.authorize_progress(&"x".repeat(MAX_PROGRESS_JSON_BYTES + 1), now),
             Err(PolicyError::ProgressQuota)
         );
+        lease
+            .observe_execution_complete(now)
+            .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(
             lease.authorize_final_result(&"x".repeat(MAX_FINAL_JSON_BYTES + 1), now),
             Err(PolicyError::FinalResultQuota)
@@ -483,6 +529,11 @@ mod tests {
         assert_eq!(http.authorize_start(now), Ok(()));
         let payload = "x".repeat(MAX_PROGRESS_JSON_BYTES + 1);
         assert_eq!(http.authorize_progress(&payload, now), Ok(()));
+        assert_eq!(
+            http.authorize_final_result(&payload, now),
+            Err(PolicyError::NotFinished)
+        );
+        assert_eq!(http.observe_execution_complete(now), Ok(()));
         assert_eq!(http.authorize_final_result(&payload, now), Ok(()));
         assert_eq!(
             http.authorize_progress(&"x".repeat(MAX_HTTP_PROGRESS_JSON_BYTES + 1), now),
