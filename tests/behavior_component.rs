@@ -124,6 +124,28 @@ async fn behavior_controller_loads_persisted_active_and_previous() {
         .unwrap_or_else(|| panic!("active executor must be available"));
     assert_eq!(executor.sequence(), 11);
     assert_eq!(executor.build_id(), "persistent-active");
+    let snapshot = controller
+        .operator_snapshot()
+        .await
+        .unwrap_or_else(|error| panic!("operator snapshot failed: {error}"));
+    assert_eq!(snapshot.active.as_ref().map(|slot| slot.sequence), Some(11));
+    assert_eq!(
+        snapshot.active.as_ref().map(|slot| slot.build_id.as_str()),
+        Some("persistent-active")
+    );
+    assert_eq!(
+        snapshot.previous.as_ref().map(|slot| slot.sequence),
+        Some(10)
+    );
+    assert_eq!(
+        snapshot
+            .previous
+            .as_ref()
+            .map(|slot| slot.build_id.as_str()),
+        Some("previous")
+    );
+    assert_eq!(snapshot.accepted_sequence, 11);
+    assert_eq!(snapshot.health.active_sequence, Some(11));
 
     let rolled_back = controller
         .rollback()
@@ -134,6 +156,14 @@ async fn behavior_controller_loads_persisted_active_and_previous() {
     assert_eq!(controller.active_sequence().unwrap_or(None), Some(10));
     assert_eq!(controller.accepted_sequence().unwrap_or_default(), 11);
     assert!(!controller.has_previous().unwrap_or(true));
+    let snapshot = controller
+        .operator_snapshot()
+        .await
+        .unwrap_or_else(|error| panic!("post-rollback operator snapshot failed: {error}"));
+    assert_eq!(snapshot.active.as_ref().map(|slot| slot.sequence), Some(10));
+    assert!(snapshot.previous.is_none());
+    assert_eq!(snapshot.accepted_sequence, 11);
+    assert_eq!(snapshot.health.active_sequence, Some(10));
 }
 
 #[tokio::test]
@@ -306,6 +336,14 @@ async fn behavior_controller_distinguishes_empty_store_and_invalid_root() {
     assert!(controller.executor().await.is_none());
     assert_eq!(controller.active_sequence().unwrap_or(None), None);
     assert_eq!(controller.accepted_sequence().unwrap_or_default(), 0);
+    let snapshot = controller
+        .operator_snapshot()
+        .await
+        .unwrap_or_else(|error| panic!("empty operator snapshot failed: {error}"));
+    assert!(snapshot.active.is_none());
+    assert!(snapshot.previous.is_none());
+    assert_eq!(snapshot.accepted_sequence, 0);
+    assert_eq!(snapshot.health.active_sequence, None);
 
     let relative = BehaviorBootstrapConfig::new("relative-behavior-store", key);
     assert!(matches!(

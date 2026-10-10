@@ -304,10 +304,43 @@ impl BehaviorUpdater {
             interval.tick().await;
             match self.check_once(&controller).await {
                 Ok(BehaviorUpdateOutcome::Current { sequence }) => {
-                    debug!(target: "behavior-update", accepted_sequence = sequence, "Behavior component is current.");
+                    match controller.operator_snapshot().await {
+                        Ok(state) => debug!(
+                            target: "behavior-update",
+                            accepted_sequence = sequence,
+                            active = ?state.active,
+                            previous = ?state.previous,
+                            health = ?state.health,
+                            "Behavior component is current."
+                        ),
+                        Err(error) => warn!(
+                            target: "behavior-update",
+                            accepted_sequence = sequence,
+                            %error,
+                            "Behavior component is current, but controller state could not be inspected."
+                        ),
+                    }
                 }
                 Ok(BehaviorUpdateOutcome::Activated { sequence, build_id }) => {
-                    info!(target: "behavior-update", behavior_sequence = sequence, behavior_build_id = %build_id, "Activated signed behavior component update.");
+                    match controller.operator_snapshot().await {
+                        Ok(state) => info!(
+                            target: "behavior-update",
+                            behavior_sequence = sequence,
+                            behavior_build_id = %build_id,
+                            active = ?state.active,
+                            previous = ?state.previous,
+                            accepted_sequence = state.accepted_sequence,
+                            health = ?state.health,
+                            "Activated signed behavior component update."
+                        ),
+                        Err(error) => warn!(
+                            target: "behavior-update",
+                            behavior_sequence = sequence,
+                            behavior_build_id = %build_id,
+                            %error,
+                            "Activated signed behavior component update, but controller state could not be inspected."
+                        ),
+                    }
                 }
                 Err(error) => {
                     warn!(target: "behavior-update", %error, "Signed behavior update check failed; keeping the current behavior slot.");

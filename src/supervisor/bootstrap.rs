@@ -133,6 +133,29 @@ pub enum BehaviorDiagnosticAction {
     IgnoredStaleSequence,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorSlotSnapshot {
+    pub sequence: u64,
+    pub build_id: String,
+}
+
+impl BehaviorSlotSnapshot {
+    fn from_executor(executor: &BehaviorExecutor) -> Self {
+        Self {
+            sequence: executor.sequence(),
+            build_id: executor.build_id().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BehaviorOperatorSnapshot {
+    pub active: Option<BehaviorSlotSnapshot>,
+    pub previous: Option<BehaviorSlotSnapshot>,
+    pub accepted_sequence: u64,
+    pub health: BehaviorHealthSnapshot,
+}
+
 struct ExecutorSlots {
     active: Option<Arc<BehaviorExecutor>>,
     previous: Option<Arc<BehaviorExecutor>>,
@@ -221,6 +244,36 @@ impl BehaviorController {
     #[must_use]
     pub async fn health_snapshot(&self) -> BehaviorHealthSnapshot {
         self.health.lock().await.snapshot()
+    }
+
+    /// Return a coherent operator-facing view of the currently admitted behavior,
+    /// rollback slot, accepted network high-water mark, and health counters.
+    ///
+    /// # Errors
+    /// Returns an error only if the persistent-slot lock was poisoned.
+    pub async fn operator_snapshot(&self) -> Result<BehaviorOperatorSnapshot, BootstrapError> {
+        let _update = self.update_lock.lock().await;
+        let (active, previous) = {
+            let executors = self.executors.read().await;
+            (
+                executors
+                    .active
+                    .as_deref()
+                    .map(BehaviorSlotSnapshot::from_executor),
+                executors
+                    .previous
+                    .as_deref()
+                    .map(BehaviorSlotSnapshot::from_executor),
+            )
+        };
+        let accepted_sequence = self.accepted_sequence()?;
+        let health = self.health.lock().await.snapshot();
+        Ok(BehaviorOperatorSnapshot {
+            active,
+            previous,
+            accepted_sequence,
+            health,
+        })
     }
 
     /// Record one behavior execution health outcome and roll back when the configured

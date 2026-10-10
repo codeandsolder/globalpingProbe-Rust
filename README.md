@@ -39,28 +39,28 @@ globalPing-Rust/
 │   ├── lib.rs                Library root — re-exports all modules for tests
 │   ├── config.rs             AppConfig skeleton (future config-file support)
 │   ├── command/
-│   │   ├── mod.rs            MeasurementCommand trait + ProgressTx type alias
-│   │   ├── ping/             PingCommand — spawns system ping, line-by-line output
-│   │   │   ├── mod.rs        run_icmp(), run_with_progress(), build_args()
-│   │   │   └── parse.rs      ParsedPing, PingStatus, timing + stats extraction
-│   │   ├── traceroute/       TracerouteCommand — spawns traceroute, per-hop streaming
-│   │   │   ├── mod.rs        run_traceroute(), HOP_LINE regex, build_args()
-│   │   │   └── parse.rs      ParsedTraceroute, hop/timing extraction
-│   │   ├── dns/              DnsCommand — spawns dig, classic + trace modes
-│   │   │   ├── mod.rs        query_classic(), query_trace(), build_args()
-│   │   │   └── parse.rs      ParsedDns, answer/metadata extraction
-│   │   ├── mtr.rs            MtrCommand — spawns mtr --json, parses hub list
-│   │   └── http.rs           HttpCommand — spawns curl, parses headers/body/TLS
+│   │   ├── mod.rs            Native execution traits + typed progress/raw-event channels
+│   │   ├── ping/             Privileged ping/TCP execution; parse.rs re-exports shared core
+│   │   ├── traceroute/       Privileged traceroute execution + shared PTR broker; parse.rs re-exports core
+│   │   ├── dns/              Privileged dig execution/resolver policy; parse.rs re-exports shared core
+│   │   ├── mtr.rs            Privileged mtr --raw execution + shared PTR/ASN enrichment
+│   │   └── http.rs           Privileged curl/OpenSSL execution; parse.rs re-exports shared core
 │   ├── probe/
 │   │   ├── mod.rs            Module registry
-│   │   ├── client.rs         Socket.io client, connect/reconnect loop, dispatch
-│   │   ├── dns_servers.rs    get_dns_servers() — reads /etc/resolv.conf
-│   │   ├── limiter.rs        MeasurementLimiter — semaphore cap of 3, wait_idle()
-│   │   ├── progress.rs       ProgressEmitter — drains channel → socket.io events
-│   │   ├── reconnect.rs      ConnectOutcome, classify_error(), ExponentialBackoff
-│   │   ├── stats.rs          MeasurementStats — lock-free atomic counters, take()
-│   │   ├── sysinfo.rs        total_memory_bytes(), disk_info_mb()
+│   │   ├── client.rs         Socket.io client, reconnect loop, dispatch + behavior authority/fallback
+│   │   ├── jobs.rs           Active-job tracking used by shutdown/status accounting
+│   │   ├── progress.rs       ProgressEmitter — drains mode-tagged progress → socket.io events
+│   │   ├── reconnect.rs      ConnectOutcome and upstream-compatible reconnect policy
+│   │   ├── stats.rs          Per-CPU /proc/stat utilization sampling
+│   │   ├── sysinfo.rs        Memory/disk/hardware metadata
 │   │   └── uuid.rs           ProbeUuid::load_or_create(), resolve_uuid_path()
+│   ├── supervisor/
+│   │   ├── bootstrap.rs      Trusted controller, active/previous executors, health rollback
+│   │   ├── capability.rs     Immutable per-measurement capability leases and quotas
+│   │   ├── runtime.rs        Wasmtime component runtime + diagnostic/fault oracle
+│   │   ├── storage.rs        Crash-safe signed active/previous/high-water slots
+│   │   ├── transport.rs      Opt-in HTTPS signed update bootstrap/poller
+│   │   └── update.rs         Manifest signature/digest/ABI/sequence verification
 │   ├── status/
 │   │   ├── mod.rs
 │   │   ├── status_manager.rs StatusManager — aggregates ping/ICMP/proxy/disconnect state
@@ -75,6 +75,9 @@ globalPing-Rust/
 │       ├── private_ip.rs     is_ip_private() — blocks all RFC-reserved ranges
 │       ├── progress_buffer.rs ProgressBuffer — Append / Diff / Overwrite modes
 │       └── tcp_ping.rs       TCP ping via connect() for latency measurement
+├── crates/
+│   ├── globalping-behavior/       no_std authoritative WASIp2 behavior component
+│   └── globalping-behavior-core/  shared no_std parsers/result shaping/address policy
 ├── tests/
 │   └── integration/
 │       ├── mod.rs

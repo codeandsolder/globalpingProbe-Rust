@@ -35,10 +35,14 @@ async fn main() -> anyhow::Result<()> {
     let behavior_config = ProductionBehaviorConfig::from_env()?;
     let (behavior_controller, updater_task) = if let Some(behavior_config) = behavior_config {
         let controller = BehaviorController::load(behavior_config.bootstrap_config()).await?;
+        let behavior_state = controller.operator_snapshot().await?;
         info!(
             target: "behavior-update",
             root = %behavior_config.root().display(),
-            active_sequence = ?controller.active_sequence()?,
+            active = ?behavior_state.active,
+            previous = ?behavior_state.previous,
+            accepted_sequence = behavior_state.accepted_sequence,
+            health = ?behavior_state.health,
             update_source = ?behavior_config.update_base().map(url::Url::as_str),
             "Trusted behavior controller enabled."
         );
