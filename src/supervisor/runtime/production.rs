@@ -880,9 +880,50 @@ async fn prepare_traceroute(
     })
 }
 
+async fn finish_mtr_oracle(
+    oracle: &SharedOracleSlot,
+    enrichment: &crate::command::mtr::MtrEnrichmentBroker,
+    native: crate::command::mtr::NativeMtrOutput,
+    target: &crate::util::resolve_target::ResolvedTarget,
+    remaining: std::time::Duration,
+) {
+    delay_oracle_completion_for_test().await;
+    let component_outcome = wait_component_outcome(oracle).await;
+    #[cfg(test)]
+    let oracle_phase_started = std::time::Instant::now();
+    #[cfg(test)]
+    let enrichment_started = std::time::Instant::now();
+    if component_outcome == ComponentOutcome::Fault {
+        enrichment.enrich_raw(&native.stdout, remaining).await;
+    }
+    #[cfg(test)]
+    let enrichment_elapsed = enrichment_started.elapsed();
+    #[cfg(test)]
+    let shape_started = std::time::Instant::now();
+    let shaped = serde_json::to_value(crate::command::mtr::shape_mtr_output(
+        &native.stdout,
+        &native.stderr,
+        native.timed_out,
+        target,
+        &enrichment.snapshot(),
+    ));
+    #[cfg(test)]
+    record_oracle_work(
+        oracle,
+        oracle_phase_started.elapsed(),
+        enrichment_elapsed,
+        shape_started.elapsed(),
+        enrichment.oracle_network_lookups(),
+    );
+    match shaped {
+        Ok(value) => store_oracle(oracle, Ok(value)),
+        Err(error) => store_oracle(oracle, Err(error.to_string())),
+    }
+}
+
 async fn prepare_mtr(
     scope: &crate::supervisor::capability::MeasurementScope,
-    native_progress: Option<crate::command::ProgressTx>,
+    _native_progress: Option<crate::command::ProgressTx>,
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::mtr;
     use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
@@ -911,52 +952,21 @@ async fn prepare_mtr(
     let oracle = new_oracle_slot();
     let task_oracle = std::sync::Arc::clone(&oracle);
     let task_target = target.clone();
-    let mut enrichment = mtr::MtrEnrichment::new(&target);
-    let shared_enrichment = enrichment.broker();
-    let task_progress = native_progress.clone();
+    let shared_enrichment = mtr::MtrEnrichmentBroker::new(&target);
+    let task_enrichment = shared_enrichment.clone();
     tokio::spawn(async move {
-        match mtr::run_native_mtr_stream(
-            &args,
-            deadline.process_timeout(),
-            task_progress.as_ref(),
-            &mut enrichment,
-            &deadline,
-            &tx,
-        )
-        .await
-        {
+        match mtr::run_native_mtr_behavior_stream(&args, deadline.process_timeout(), &tx).await {
             Ok(native) => {
                 let timed_out = native.timed_out;
                 send_terminal(&tx, &task_oracle, timed_out, native.exit_code).await;
-                #[cfg(test)]
-                let oracle_phase_started = std::time::Instant::now();
-                delay_oracle_completion_for_test().await;
-                #[cfg(test)]
-                let enrichment_started = std::time::Instant::now();
-                enrichment.wait().await;
-                #[cfg(test)]
-                let enrichment_elapsed = enrichment_started.elapsed();
-                #[cfg(test)]
-                let shape_started = std::time::Instant::now();
-                let shaped = serde_json::to_value(mtr::shape_mtr_output(
-                    &native.stdout,
-                    &native.stderr,
-                    timed_out,
-                    &task_target,
-                    &enrichment.broker().snapshot(),
-                ));
-                #[cfg(test)]
-                record_oracle_work(
+                finish_mtr_oracle(
                     &task_oracle,
-                    oracle_phase_started.elapsed(),
-                    enrichment_elapsed,
-                    shape_started.elapsed(),
-                    0,
-                );
-                match shaped {
-                    Ok(value) => store_oracle(&task_oracle, Ok(value)),
-                    Err(error) => store_oracle(&task_oracle, Err(error.to_string())),
-                }
+                    &task_enrichment,
+                    native,
+                    &task_target,
+                    deadline.remaining(),
+                )
+                .await;
             }
             Err(error) => {
                 store_oracle(&task_oracle, Err(error.to_string()));
@@ -1647,6 +1657,70 @@ mod tests {
         .err()
         .unwrap_or_else(|| panic!("mid-measurement progress mode change unexpectedly succeeded"));
         assert_eq!(error.code, wit_host::HostErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn successful_mtr_oracle_never_initiates_enrichment() {
+        let oracle = new_oracle_slot();
+        mark_component_outcome(&oracle, ComponentOutcome::Success);
+        let target = crate::util::resolve_target::ResolvedTarget {
+            address: "1.1.1.1"
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture address: {error}")),
+            hostname: "one.one.one.one".to_string(),
+        };
+        let enrichment = crate::command::mtr::MtrEnrichmentBroker::new(&target);
+        let native = crate::command::mtr::NativeMtrOutput {
+            stdout: "h 0 9.9.9.9\nx 0 0\np 0 1000 0\n".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            exit_code: Some(0),
+        };
+
+        finish_mtr_oracle(
+            &oracle,
+            &enrichment,
+            native,
+            &target,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(enrichment.oracle_network_lookups(), 0);
+        let resolved = resolve_oracle_result(wait_oracle(&oracle).await);
+        assert!(resolved.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn faulted_mtr_oracle_backfills_missing_enrichment() {
+        let oracle = new_oracle_slot();
+        mark_component_outcome(&oracle, ComponentOutcome::Fault);
+        let target = crate::util::resolve_target::ResolvedTarget {
+            address: "1.1.1.1"
+                .parse()
+                .unwrap_or_else(|error| panic!("fixture address: {error}")),
+            hostname: "one.one.one.one".to_string(),
+        };
+        let enrichment = crate::command::mtr::MtrEnrichmentBroker::new(&target);
+        let native = crate::command::mtr::NativeMtrOutput {
+            stdout: "h 0 9.9.9.9\nx 0 0\np 0 1000 0\n".to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            exit_code: Some(0),
+        };
+
+        finish_mtr_oracle(
+            &oracle,
+            &enrichment,
+            native,
+            &target,
+            std::time::Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(enrichment.oracle_network_lookups(), 1);
+        let resolved = resolve_oracle_result(wait_oracle(&oracle).await);
+        assert!(resolved.error.is_none());
     }
 
     #[tokio::test]

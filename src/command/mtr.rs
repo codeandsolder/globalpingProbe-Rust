@@ -208,6 +208,8 @@ impl EnrichmentCache {
 pub(crate) struct MtrEnrichmentBroker {
     cache: EnrichmentCache,
     lookups: Arc<RwLock<HashMap<IpAddr, Arc<OnceCell<MtrEnrichmentEntry>>>>>,
+    #[cfg(test)]
+    oracle_network_lookups: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MtrEnrichmentBroker {
@@ -219,6 +221,8 @@ impl MtrEnrichmentBroker {
         Self {
             cache,
             lookups: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            oracle_network_lookups: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -262,6 +266,50 @@ impl MtrEnrichmentBroker {
         .clone()
     }
 
+    #[cfg(test)]
+    async fn lookup_oracle(&self, address: IpAddr, budget: Duration) -> MtrEnrichmentEntry {
+        if is_ip_private(address) {
+            return MtrEnrichmentEntry::default();
+        }
+        let cell = self.lookup_cell(address);
+        let cache = self.cache.clone();
+        let oracle_network_lookups = Arc::clone(&self.oracle_network_lookups);
+        cell.get_or_init(|| async move {
+            oracle_network_lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let hostname = match cache.hostname(address) {
+                Some(hostname) => Some(hostname),
+                None => reverse_lookup(address, budget.min(Duration::from_secs(3))).await,
+            };
+            let asn = lookup_asn(address, budget).await;
+            let entry = MtrEnrichmentEntry { hostname, asn };
+            cache.update(address, &entry);
+            entry
+        })
+        .await
+        .clone()
+    }
+
+    pub(crate) async fn enrich_raw(&self, raw: &str, budget: Duration) {
+        let addresses = raw
+            .lines()
+            .filter_map(hop_address_from_raw_line)
+            .filter(|address| !is_ip_private(*address))
+            .collect::<HashSet<_>>();
+        futures::future::join_all(addresses.into_iter().map(|address| async move {
+            #[cfg(test)]
+            self.lookup_oracle(address, budget).await;
+            #[cfg(not(test))]
+            self.lookup(address, budget).await;
+        }))
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn oracle_network_lookups(&self) -> u64 {
+        self.oracle_network_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn snapshot(&self) -> MtrEnrichmentMap {
         self.cache.snapshot()
     }
@@ -280,10 +328,6 @@ impl MtrEnrichment {
             seen: HashSet::new(),
             tasks: JoinSet::new(),
         }
-    }
-
-    pub(crate) fn broker(&self) -> MtrEnrichmentBroker {
-        self.broker.clone()
     }
 
     fn add(
@@ -352,23 +396,12 @@ fn hop_address_from_raw_line(line: &str) -> Option<IpAddr> {
     normalize_ip_text(parts.next()?).parse().ok()
 }
 
-pub(crate) async fn run_native_mtr_stream(
+pub(crate) async fn run_native_mtr_behavior_stream(
     args: &[String],
     process_timeout: Duration,
-    progress: Option<&ProgressTx>,
-    enrichment: &mut MtrEnrichment,
-    deadline: &MeasurementDeadline,
     raw_events: &RawExecutionTx,
 ) -> Result<NativeMtrOutput> {
-    run_native_mtr_inner(
-        args,
-        process_timeout,
-        progress,
-        Some(enrichment),
-        Some(deadline),
-        Some(raw_events),
-    )
-    .await
+    run_native_mtr_inner(args, process_timeout, None, None, None, Some(raw_events)).await
 }
 
 async fn run_native_mtr(
