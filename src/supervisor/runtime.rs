@@ -1443,11 +1443,14 @@ no answer yet for icmp_seq=1\n\
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore = "requires live network tools/access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_behavior_real_host_adapter_matches_native_oracles() {
-        let cases = [
+    fn live_real_host_cases() -> [(
+        &'static str,
+        Value,
+        crate::util::progress_buffer::BufferMode,
+    ); 6] {
+        [
             (
+                "ping-icmp",
                 json!({
                     "type": "ping",
                     "target": "1.1.1.1",
@@ -1460,6 +1463,7 @@ no answer yet for icmp_seq=1\n\
                 crate::util::progress_buffer::BufferMode::Append,
             ),
             (
+                "ping-tcp",
                 json!({
                     "type": "ping",
                     "target": "1.1.1.1",
@@ -1473,6 +1477,7 @@ no answer yet for icmp_seq=1\n\
                 crate::util::progress_buffer::BufferMode::Diff,
             ),
             (
+                "dns",
                 json!({
                     "type": "dns",
                     "target": "example.com",
@@ -1488,6 +1493,7 @@ no answer yet for icmp_seq=1\n\
                 crate::util::progress_buffer::BufferMode::Diff,
             ),
             (
+                "traceroute",
                 json!({
                     "type": "traceroute",
                     "target": "1.1.1.1",
@@ -1500,6 +1506,7 @@ no answer yet for icmp_seq=1\n\
                 crate::util::progress_buffer::BufferMode::Diff,
             ),
             (
+                "mtr",
                 json!({
                     "type": "mtr",
                     "target": "1.1.1.1",
@@ -1513,6 +1520,7 @@ no answer yet for icmp_seq=1\n\
                 crate::util::progress_buffer::BufferMode::Overwrite,
             ),
             (
+                "http",
                 json!({
                     "type": "http",
                     "target": "example.com",
@@ -1529,40 +1537,128 @@ no answer yet for icmp_seq=1\n\
                 }),
                 crate::util::progress_buffer::BufferMode::Append,
             ),
-        ];
+        ]
+    }
 
-        for (measurement, expected_mode) in cases {
-            let kind = measurement["type"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_behavior_real_host_adapter_matches_native_oracles() {
+        for (case, measurement, expected_mode) in live_real_host_cases() {
             let execution = run_real_host_behavior(measurement).await;
             let component = execution
                 .component
                 .as_ref()
-                .unwrap_or_else(|error| panic!("{kind} component failed: {error}"));
+                .unwrap_or_else(|error| panic!("{case} component failed: {error}"));
             let oracle = execution.resolve_oracle().await;
             assert!(
                 oracle.error.is_none(),
-                "{kind} oracle failed: {:?}",
+                "{case} oracle failed: {:?}",
                 oracle.error
             );
-            assert_eq!(component, &oracle.value, "{kind} behavior/oracle mismatch");
+            assert_eq!(component, &oracle.value, "{case} behavior/oracle mismatch");
             assert!(
                 !execution.progress.is_empty(),
-                "{kind} should emit progress through the real host adapter"
+                "{case} should emit progress through the real host adapter"
             );
             assert!(
                 execution
                     .progress
                     .iter()
                     .all(|(_, actual)| *actual == expected_mode),
-                "{kind} emitted the wrong progress mode"
+                "{case} emitted the wrong progress mode"
             );
-            if kind == "http" {
+            if case == "http" {
                 assert!(
                     execution.progress_during_native_execution,
                     "HTTP progress was emitted only after curl/TLS oracle completion"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat")
+            .unwrap_or_else(|error| panic!("failed to read /proc/self/stat: {error}"));
+        let (_, fields) = stat
+            .rsplit_once(") ")
+            .unwrap_or_else(|| panic!("unexpected /proc/self/stat format"));
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let user = fields
+            .get(11)
+            .unwrap_or_else(|| panic!("/proc/self/stat is missing utime"))
+            .parse::<u64>()
+            .unwrap_or_else(|error| panic!("invalid /proc/self/stat utime: {error}"));
+        let system = fields
+            .get(12)
+            .unwrap_or_else(|| panic!("/proc/self/stat is missing stime"))
+            .parse::<u64>()
+            .unwrap_or_else(|error| panic!("invalid /proc/self/stat stime: {error}"));
+        user.saturating_add(system)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "live oracle cost profiler; requires network tools/access and an explicitly selected normal wasm32-wasip2 behavior component"]
+    async fn live_behavior_oracle_cost_profile() {
+        let runtime = BehaviorRuntime::new()
+            .unwrap_or_else(|error| panic!("runtime construction failed: {error}"));
+        let path = std::env::var_os(COMPONENT_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                panic!("{COMPONENT_ENV} must point to the exact normal release component")
+            });
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let component = Component::from_binary(runtime.engine(), &bytes)
+            .unwrap_or_else(|error| panic!("component compilation failed: {error}"));
+        let samples = std::env::var("GLOBALPING_BEHAVIOR_PROFILE_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 10);
+        let cases = live_real_host_cases();
+
+        for sample in 1..=samples {
+            for (case, measurement, _) in &cases {
+                let authority_started = std::time::Instant::now();
+                let execution = runtime
+                    .execute_component(&component, measurement.clone(), None)
+                    .await
+                    .unwrap_or_else(|error| panic!("{case} behavior failed: {error}"));
+                let authority_ms = authority_started.elapsed().as_secs_f64() * 1_000.0;
+                let component_result = execution
+                    .component
+                    .as_ref()
+                    .unwrap_or_else(|error| panic!("{case} component failed: {error}"));
+                let oracle_ready_at_authority = execution.oracle_handle().try_resolve().is_some();
+                let cpu_before_oracle = process_cpu_ticks();
+                let oracle_started = std::time::Instant::now();
+                let oracle = execution.resolve_oracle().await;
+                let oracle_residual_ms = oracle_started.elapsed().as_secs_f64() * 1_000.0;
+                let oracle_cpu_ticks = process_cpu_ticks().saturating_sub(cpu_before_oracle);
+                assert!(
+                    oracle.error.is_none(),
+                    "{case} oracle failed: {:?}",
+                    oracle.error
+                );
+                assert_eq!(
+                    component_result, &oracle.value,
+                    "{case} behavior/oracle mismatch"
+                );
+                println!(
+                    "ORACLE_COST {}",
+                    json!({
+                        "sample": sample,
+                        "case": case,
+                        "authorityMs": authority_ms,
+                        "oracleReadyAtAuthority": oracle_ready_at_authority,
+                        "oracleResidualMs": oracle_residual_ms,
+                        "oracleCpuTicks": oracle_cpu_ticks,
+                        "progressEvents": execution.progress.len(),
+                        "streamedProgress": execution.progress_during_native_execution,
+                    })
                 );
             }
         }
