@@ -242,10 +242,20 @@ fn measurement_type_discriminator_covers_all_known_types() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn live_total_memory_nonzero() {
-    let bytes = globalping_probe::probe::sysinfo::total_memory_bytes();
-    assert!(bytes > 0, "Expected nonzero total memory");
-    println!("Total RAM: {} MB", bytes / (1024 * 1024));
+fn live_effective_total_memory_is_sane() {
+    let host = globalping_probe::probe::sysinfo::host_total_memory_bytes();
+    let effective = globalping_probe::probe::sysinfo::effective_total_memory_bytes();
+    assert!(host > 0, "Expected nonzero host memory");
+    assert!(effective > 0, "Expected nonzero effective memory");
+    assert!(
+        effective <= host,
+        "Effective memory must not exceed host RAM"
+    );
+    println!(
+        "RAM: {} MB effective / {} MB host",
+        effective / (1024 * 1024),
+        host / (1024 * 1024)
+    );
 }
 
 #[cfg(target_os = "linux")]

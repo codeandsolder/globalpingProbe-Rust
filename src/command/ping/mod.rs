@@ -9,12 +9,13 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use super::ProgressTx;
+use super::{ProgressTx, RawExecutionTx};
 use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
 use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, resolve_command_target};
 use crate::util::tcp_ping::{TcpPingProbe, compute_tcp_stats, tcp_ping_single};
 use crate::util::validate::is_safe_host;
-use parse::{ParsedPing, PingStats, PingStatus, PingTiming, parse};
+use parse::{ParsedPing, failed_ping};
+pub(crate) use parse::{normalize_ping_output, shape_ping_output};
 
 // ── Options (deserialised from the socket.io job payload) ───────────────────
 
@@ -50,7 +51,7 @@ const fn default_ip_version() -> u8 {
 
 // ── Validation ───────────────────────────────────────────────────────────────
 
-fn validate(opts: &PingOptions) -> Result<()> {
+pub(crate) fn validate(opts: &PingOptions) -> Result<()> {
     if !is_safe_host(&opts.target) {
         bail!("Invalid target.");
     }
@@ -109,16 +110,8 @@ impl PingCommand {
     }
 }
 
-fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
-    ParsedPing {
-        status: PingStatus::Failed,
-        failure_source: Some(error.failure_source_or("internal").to_string()),
-        raw_output: error.public_message(),
-        resolved_address: None,
-        resolved_hostname: None,
-        timings: vec![],
-        stats: PingStats::default(),
-    }
+pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
+    failed_ping(error.failure_source_or("internal"), error.public_message())
 }
 
 async fn run_ping(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<ParsedPing> {
@@ -146,39 +139,10 @@ async fn run_ping(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
     }
 }
 
-fn normalize_ping_output(output: &str, address: &str, hostname: &str) -> String {
-    if address == hostname {
-        return output.to_string();
-    }
-    output
-        .lines()
-        .map(|line| {
-            if line.starts_with(&format!("PING {address} ({address})")) {
-                line.replacen(
-                    &format!("PING {address} ({address})"),
-                    &format!("PING {hostname} ({address})"),
-                    1,
-                )
-            } else if line.contains(&format!(" bytes from {address}:")) {
-                line.replacen(
-                    &format!(" bytes from {address}:"),
-                    &format!(" bytes from {hostname} ({address}):"),
-                    1,
-                )
-            } else if line.starts_with(&format!("From {address} ")) {
-                line.replacen(
-                    &format!("From {address} "),
-                    &format!("From {hostname} ({address}) "),
-                    1,
-                )
-            } else if line == format!("--- {address} ping statistics ---") {
-                format!("--- {hostname} ping statistics ---")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+pub(crate) struct NativePingRaw {
+    pub(crate) raw: String,
+    pub(crate) timed_out: bool,
+    pub(crate) exit_code: Option<i32>,
 }
 
 async fn run_icmp(
@@ -187,6 +151,32 @@ async fn run_icmp(
     progress: Option<ProgressTx>,
     process_timeout: Duration,
 ) -> Result<ParsedPing> {
+    let native = run_icmp_raw_inner(opts, target, progress, process_timeout, None).await?;
+    Ok(shape_ping_output(
+        &native.raw,
+        &target.address.to_string(),
+        &target.hostname,
+        native.timed_out,
+    ))
+}
+
+pub(crate) async fn run_icmp_raw_stream(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
+    process_timeout: Duration,
+    raw_events: &RawExecutionTx,
+) -> Result<NativePingRaw> {
+    run_icmp_raw_inner(opts, target, progress, process_timeout, Some(raw_events)).await
+}
+
+async fn run_icmp_raw_inner(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
+    process_timeout: Duration,
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<NativePingRaw> {
     let args = build_args(opts);
     let mut child = Command::new("ping")
         .args(&args)
@@ -206,45 +196,40 @@ async fn run_icmp(
         while let Some(line) = lines.next_line().await? {
             raw_output.push_str(&line);
             raw_output.push('\n');
+            if let Some(tx) = raw_events {
+                tx.stdout_line(&line).await;
+            }
             if let Some(tx) = &progress {
                 let mut normalized = normalize_ping_output(&line, &address, &target.hostname);
                 normalized.push('\n');
                 tx.send(json!({ "rawOutput": normalized })).ok();
             }
         }
-        child.wait().await.map(|_| ())
+        child.wait().await
     })
     .await;
 
-    let timed_out = completed.is_err();
-    if timed_out {
+    let (timed_out, exit_code) = if let Ok(result) = completed {
+        let status = result?;
+        (
+            false,
+            Some(
+                status
+                    .code()
+                    .unwrap_or_else(|| i32::from(!status.success())),
+            ),
+        )
+    } else {
         child.kill().await.ok();
         child.wait().await.ok();
-    } else {
-        completed??;
-    }
+        (true, None)
+    };
 
-    let normalized = normalize_ping_output(&raw_output, &address, &target.hostname);
-    let mut parsed = parse(&normalized);
-    parsed.resolved_address = Some(address);
-    parsed.resolved_hostname = Some(target.hostname.clone());
-    if timed_out {
-        parsed.status = PingStatus::Failed;
-        parsed.failure_source = Some(
-            if parsed.timings.is_empty()
-                && (normalized.contains("no answer yet for ")
-                    || normalized.contains("100% packet loss"))
-            {
-                "target"
-            } else {
-                "internal"
-            }
-            .to_string(),
-        );
-    } else if parsed.status == PingStatus::Failed {
-        parsed.failure_source = Some("internal".to_string());
-    }
-    Ok(parsed)
+    Ok(NativePingRaw {
+        raw: raw_output,
+        timed_out,
+        exit_code,
+    })
 }
 
 fn format_compact(value: f64, decimals: usize) -> String {
@@ -286,36 +271,68 @@ async fn run_tcp(
     progress: Option<ProgressTx>,
     remaining: Duration,
 ) -> Result<ParsedPing> {
+    let native = run_tcp_raw_inner(opts, target, progress, remaining, None).await?;
+    Ok(shape_ping_output(
+        &native.raw,
+        &target.address.to_string(),
+        &target.hostname,
+        native.timed_out,
+    ))
+}
+
+pub(crate) async fn run_tcp_raw_stream(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
+    remaining: Duration,
+    raw_events: &RawExecutionTx,
+) -> Result<NativePingRaw> {
+    run_tcp_raw_inner(opts, target, progress, remaining, Some(raw_events)).await
+}
+
+async fn run_tcp_raw_inner(
+    opts: &PingOptions,
+    target: &ResolvedTarget,
+    progress: Option<ProgressTx>,
+    remaining: Duration,
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<NativePingRaw> {
     let start = Instant::now();
     let address = target.address.to_string();
     let tasks = spawn_tcp_probes(opts, &address, remaining);
 
-    let mut probes: Vec<TcpPingProbe> = Vec::with_capacity(usize::from(opts.packets));
-    let mut raw_lines = vec![format!(
-        "PING {} ({}) on port {}.",
-        target.hostname, address, opts.port
-    )];
-    let mut timings = Vec::new();
+    let header = format!(
+        "PING {} ({address}) on port {}.",
+        target.hostname, opts.port
+    );
+    let mut raw_lines = vec![header.clone()];
+    if let Some(tx) = raw_events {
+        tx.stdout_line(&header).await;
+    }
 
+    let mut probes: Vec<TcpPingProbe> = Vec::with_capacity(usize::from(opts.packets));
     for (index, task) in tasks.into_iter().enumerate() {
         let probe = task.await.unwrap_or(TcpPingProbe { rtt_ms: None });
         let number = index + 1;
-        match probe.rtt_ms {
-            Some(rtt) => {
-                timings.push(PingTiming { rtt, ttl: None });
-                raw_lines.push(format!(
-                    "Reply from {} ({}) on port {}: tcp_conn={} time={} ms",
+        let line = probe.rtt_ms.map_or_else(
+            || {
+                format!(
+                    "No reply from {} ({address}) on port {}: tcp_conn={number}",
+                    target.hostname, opts.port,
+                )
+            },
+            |rtt| {
+                format!(
+                    "Reply from {} ({address}) on port {}: tcp_conn={number} time={} ms",
                     target.hostname,
-                    address,
                     opts.port,
-                    number,
                     format_compact(rtt, 2),
-                ));
-            }
-            None => raw_lines.push(format!(
-                "No reply from {} ({}) on port {}: tcp_conn={number}",
-                target.hostname, address, opts.port,
-            )),
+                )
+            },
+        );
+        raw_lines.push(line.clone());
+        if let Some(tx) = raw_events {
+            tx.stdout_line(&line).await;
         }
         probes.push(probe);
 
@@ -326,42 +343,36 @@ async fn run_tcp(
 
     let stats = compute_tcp_stats(&probes, opts.packets);
     let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    raw_lines.push(String::new());
-    raw_lines.push(format!(
-        "--- {} ({}) ping statistics ---",
-        target.hostname, address
-    ));
-    raw_lines.push(format!(
-        "{} packets transmitted, {} received, {}% packet loss, time {} ms",
-        stats.total,
-        stats.rcv,
-        format_compact(stats.loss, 2),
-        elapsed_ms,
-    ));
+    let summary = [
+        String::new(),
+        format!("--- {} ({address}) ping statistics ---", target.hostname),
+        format!(
+            "{} packets transmitted, {} received, {}% packet loss, time {elapsed_ms} ms",
+            stats.total,
+            stats.rcv,
+            format_compact(stats.loss, 2),
+        ),
+    ];
+    for line in summary {
+        raw_lines.push(line.clone());
+        if let Some(tx) = raw_events {
+            tx.stdout_line(&line).await;
+        }
+    }
     if let (Some(min), Some(avg), Some(max), Some(mdev)) =
         (stats.min, stats.avg, stats.max, stats.mdev)
     {
-        raw_lines.push(format!(
-            "rtt min/avg/max/mdev = {min:.3}/{avg:.3}/{max:.3}/{mdev:.3} ms"
-        ));
+        let line = format!("rtt min/avg/max/mdev = {min:.3}/{avg:.3}/{max:.3}/{mdev:.3} ms");
+        raw_lines.push(line.clone());
+        if let Some(tx) = raw_events {
+            tx.stdout_line(&line).await;
+        }
     }
 
-    Ok(ParsedPing {
-        status: PingStatus::Finished,
-        failure_source: None,
-        raw_output: raw_lines.join("\n"),
-        resolved_address: Some(address),
-        resolved_hostname: Some(target.hostname.clone()),
-        timings,
-        stats: PingStats {
-            min: stats.min,
-            max: stats.max,
-            avg: stats.avg,
-            total: Some(stats.total),
-            loss: Some(stats.loss),
-            rcv: Some(stats.rcv),
-            drop: Some(stats.drop),
-        },
+    Ok(NativePingRaw {
+        raw: raw_lines.join("\n"),
+        timed_out: false,
+        exit_code: Some(0),
     })
 }
 

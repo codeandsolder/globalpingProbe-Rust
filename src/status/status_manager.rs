@@ -57,18 +57,21 @@ impl StatusManager {
     }
 
     /// Derive the current probe status. Mirrors `StatusManager.getStatus()` in TypeScript.
-    /// Priority (highest → lowest): sigterm → initializing → ping-test-failed →
-    /// icmp-tcp-test-failed → too-many-disconnects → ready.
+    /// Priority (highest → lowest): sigterm → ping initialization/failure →
+    /// ICMP/TCP initialization/failure → too-many-disconnects → ready.
     #[must_use]
     pub fn get_status(&self) -> ProbeStatus {
         if self.sigterm {
             return ProbeStatus::Sigterm;
         }
-        if self.ping_test_failed.is_none() || self.icmp_tcp_test_failed.is_none() {
+        if self.ping_test_failed.is_none() {
             return ProbeStatus::Initializing;
         }
         if self.ping_test_failed == Some(true) {
             return ProbeStatus::PingTestFailed;
+        }
+        if self.icmp_tcp_test_failed.is_none() {
+            return ProbeStatus::Initializing;
         }
         if self.icmp_tcp_test_failed == Some(true) {
             return ProbeStatus::IcmpTcpTestFailed;
@@ -212,6 +215,14 @@ mod tests {
         let mut m = mgr();
         m.ping_test_failed = Some(true);
         m.icmp_tcp_test_failed = Some(true);
+        assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
+    }
+
+    #[test]
+    fn ping_test_failure_precedes_pending_icmp_tcp_test() {
+        let mut m = mgr();
+        m.ping_test_failed = Some(true);
+        m.icmp_tcp_test_failed = None;
         assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
     }
 

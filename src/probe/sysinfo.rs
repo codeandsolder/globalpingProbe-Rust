@@ -1,9 +1,88 @@
 use regex::Regex;
+use std::path::Path;
 
-/// Total system RAM in bytes, read from /proc/meminfo on Linux.
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// Total physical system RAM in bytes, read from `/proc/meminfo` on Linux.
 #[must_use]
-pub fn total_memory_bytes() -> u64 {
+pub fn host_total_memory_bytes() -> u64 {
     parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default())
+}
+
+/// Memory effectively available to this process. Upstream v0.53.0 runs on
+/// Node 22.22.3 / libuv 1.51.0, where `process.constrainedMemory()` is derived
+/// from cgroup v1/v2 memory limits only.
+#[must_use]
+pub fn effective_total_memory_bytes() -> u64 {
+    let host_total = host_total_memory_bytes();
+    constrained_memory_bytes().map_or(host_total, |limit| host_total.min(limit))
+}
+
+fn constrained_memory_bytes() -> Option<u64> {
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_constrained_memory(&cgroup, read_memory_limit)
+}
+
+fn cgroup_constrained_memory<F>(cgroup: &str, mut read_limit: F) -> Option<u64>
+where
+    F: FnMut(&Path) -> u64,
+{
+    let (high, max) = if let Some(path) = cgroup.strip_prefix("0::/") {
+        let path = path.lines().next().unwrap_or_default();
+        let base = Path::new(CGROUP_ROOT).join(path);
+        (
+            read_limit(&base.join("memory.high")),
+            read_limit(&base.join("memory.max")),
+        )
+    } else {
+        cgroup1_memory_limits(cgroup, &mut read_limit)
+    };
+
+    (high != 0 && max != 0).then_some(high.min(max))
+}
+
+fn cgroup1_memory_limits<F>(cgroup: &str, read_limit: &mut F) -> (u64, u64)
+where
+    F: FnMut(&Path) -> u64,
+{
+    let scoped = cgroup.lines().find_map(|line| {
+        let mut fields = line.splitn(3, ':');
+        let _hierarchy = fields.next()?;
+        let controllers = fields.next()?;
+        let path = fields.next()?;
+        (controllers == "memory").then_some(path.trim_start_matches('/'))
+    });
+
+    if let Some(path) = scoped {
+        let base = Path::new(CGROUP_ROOT).join("memory").join(path);
+        let high = read_limit(&base.join("memory.soft_limit_in_bytes"));
+        let max = read_limit(&base.join("memory.limit_in_bytes"));
+        if high != 0 && max != 0 {
+            return (high, max);
+        }
+    }
+
+    let base = Path::new(CGROUP_ROOT).join("memory");
+    (
+        read_limit(&base.join("memory.soft_limit_in_bytes")),
+        read_limit(&base.join("memory.limit_in_bytes")),
+    )
+}
+
+fn read_memory_limit(path: &Path) -> u64 {
+    let Ok(value) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    parse_memory_limit(&value)
+}
+
+fn parse_memory_limit(value: &str) -> u64 {
+    let value = value.trim();
+    if value == "max" {
+        u64::MAX
+    } else {
+        value.parse::<u64>().unwrap_or(0)
+    }
 }
 
 #[must_use]
@@ -62,7 +141,7 @@ pub fn looks_like_v1_hardware_device() -> bool {
         logical_cpus,
         &cpuinfo,
         hostname.trim(),
-        total_memory_bytes(),
+        host_total_memory_bytes(),
     )
 }
 
@@ -133,10 +212,104 @@ MemAvailable:   12000000 kB\n";
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn live_total_memory_is_nonzero() {
-        let bytes = total_memory_bytes();
+    fn live_host_total_memory_is_nonzero() {
+        let bytes = host_total_memory_bytes();
         assert!(bytes > 0, "expected non-zero total memory on Linux");
         println!("Total memory: {} MB", bytes / (1024 * 1024));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_effective_total_memory_is_nonzero_and_not_above_host() {
+        let host = host_total_memory_bytes();
+        let effective = effective_total_memory_bytes();
+        assert!(effective > 0, "expected non-zero effective memory on Linux");
+        assert!(
+            effective <= host,
+            "effective memory must not exceed host RAM"
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_uses_minimum_of_high_and_max() {
+        let cgroup = "0::/user.slice/example.scope\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/user.slice/example.scope/memory.high" => 536_870_912,
+                "/sys/fs/cgroup/user.slice/example.scope/memory.max" => 1_073_741_824,
+                _ => 0,
+            });
+        assert_eq!(result, Some(536_870_912));
+    }
+
+    #[test]
+    fn cgroup_v2_treats_max_as_unbounded() {
+        assert_eq!(parse_memory_limit("max\n"), u64::MAX);
+        let result = cgroup_constrained_memory("0::/demo\n", |path| {
+            match path.file_name().and_then(|name| name.to_str()) {
+                Some("memory.high") => u64::MAX,
+                Some("memory.max") => 536_870_912,
+                _ => 0,
+            }
+        });
+        assert_eq!(result, Some(536_870_912));
+    }
+
+    #[test]
+    fn cgroup_v2_requires_both_limit_files() {
+        let result = cgroup_constrained_memory("0::/demo\n", |path| {
+            if path.file_name().and_then(|name| name.to_str()) == Some("memory.max") {
+                536_870_912
+            } else {
+                0
+            }
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn cgroup_v1_uses_memory_controller_soft_and_hard_limits() {
+        let cgroup = "5:memory:/docker/abc\n4:cpu:/docker/abc\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/memory/docker/abc/memory.soft_limit_in_bytes" => 805_306_368,
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => 1_073_741_824,
+                _ => 0,
+            });
+        assert_eq!(result, Some(805_306_368));
+    }
+
+    #[test]
+    fn cgroup_v1_falls_back_to_global_controller_limits() {
+        let cgroup = "5:memory:/docker/abc\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/memory/docker/abc/memory.soft_limit_in_bytes" => 0,
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => 1_073_741_824,
+                "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes" => 402_653_184,
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => 536_870_912,
+                _ => 0,
+            });
+        assert_eq!(result, Some(402_653_184));
+    }
+
+    #[test]
+    fn cgroup_v1_does_not_treat_combined_controller_name_as_memory() {
+        let cgroup = "5:memory,cpu:/docker/abc\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes" => 402_653_184,
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => 536_870_912,
+                _ => 0,
+            });
+        assert_eq!(result, Some(402_653_184));
+    }
+
+    #[test]
+    fn invalid_memory_limit_reads_as_zero() {
+        assert_eq!(parse_memory_limit("banana\n"), 0);
+        assert_eq!(parse_memory_limit("0\n"), 0);
+        assert_eq!(parse_memory_limit("536870912\n"), 536_870_912);
     }
 
     #[test]

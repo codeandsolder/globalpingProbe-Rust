@@ -5,6 +5,7 @@ use globalping_probe::command::{
     ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand, ping::PingCommand,
     traceroute::TracerouteCommand,
 };
+use globalping_probe::util::progress_buffer::BufferMode;
 use serde_json::json;
 
 // ── Ping in-progress ──────────────────────────────────────────────────────────
@@ -12,7 +13,7 @@ use serde_json::json;
 /// Verify the progress channel path exists and is type-correct (compile check).
 #[test]
 fn progress_methods_are_constructible() {
-    let (tx, _rx) = ProgressTx::channel();
+    let (tx, _rx) = ProgressTx::channel(BufferMode::Append);
     let ping_future = PingCommand.run_with_progress(json!({}), tx.clone());
     let dns_future = DnsCommand.run_with_progress(json!({}), tx.clone());
     let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx.clone());
@@ -30,7 +31,7 @@ fn progress_methods_are_constructible() {
 /// Verify producers can detect a dropped progress receiver without panicking.
 #[test]
 fn closed_progress_channel_send_returns_error() {
-    let (tx, rx) = ProgressTx::channel();
+    let (tx, rx) = ProgressTx::channel(BufferMode::Append);
     drop(rx);
     assert!(tx.send(json!({"status": "in-progress"})).is_err());
 }
@@ -39,7 +40,7 @@ fn closed_progress_channel_send_returns_error() {
 
 #[tokio::test]
 async fn progress_channel_delivers_values_in_order() {
-    let (tx, mut rx) = ProgressTx::channel();
+    let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
     for i in 0u32..5 {
         tx.send(json!({ "seq": i })).unwrap();
     }
@@ -55,14 +56,14 @@ async fn progress_channel_delivers_values_in_order() {
 
 #[tokio::test]
 async fn progress_channel_terminates_when_sender_dropped() {
-    let (tx, mut rx) = ProgressTx::channel();
+    let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
     drop(tx);
     assert!(rx.recv().await.is_none());
 }
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_ping_shape() {
-    let (tx, mut rx) = ProgressTx::channel();
+    let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
     let partial = json!({
         "rawOutput": "PING 1.1.1.1 (1.1.1.1)\n64 bytes from 1.1.1.1: seq=1 ttl=58 time=10.1 ms\n",
     });
@@ -78,7 +79,7 @@ async fn progress_channel_accepts_partial_ping_shape() {
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_traceroute_shape() {
-    let (tx, mut rx) = ProgressTx::channel();
+    let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
     let partial = json!({
         "rawOutput": "traceroute to 1.1.1.1 (1.1.1.1), 20 hops max\n 1  _gateway (192.168.1.1)  1.2 ms\n",
     });
@@ -134,7 +135,7 @@ mod live {
     /// arrives on the channel before the measurement finishes.
     #[tokio::test]
     async fn live_ping_emits_progress_per_packet() {
-        let (tx, mut rx) = ProgressTx::channel();
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
         let options = json!({
             "type": "ping",
             "target": "1.1.1.1",
@@ -173,7 +174,7 @@ mod live {
     /// Traceroute with inProgressUpdates=true — verify hop-by-hop progress.
     #[tokio::test]
     async fn live_traceroute_emits_progress_per_hop() {
-        let (tx, mut rx) = ProgressTx::channel();
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Diff);
         let options = json!({
             "type": "traceroute",
             "target": "1.1.1.1",
@@ -206,7 +207,7 @@ mod live {
 
     #[tokio::test]
     async fn live_dns_emits_progress() {
-        let (tx, mut rx) = ProgressTx::channel();
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Diff);
         let options = json!({
             "type": "dns",
             "target": "example.com",
@@ -237,7 +238,7 @@ mod live {
 
     #[tokio::test]
     async fn live_mtr_emits_progress() {
-        let (tx, mut rx) = ProgressTx::channel();
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Overwrite);
         let options = json!({
             "type": "mtr",
             "target": "1.1.1.1",
@@ -262,7 +263,7 @@ mod live {
 
     #[tokio::test]
     async fn live_http_get_emits_progress() {
-        let (tx, mut rx) = ProgressTx::channel();
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
         let options = json!({
             "type": "http",
             "target": "example.com",
@@ -297,7 +298,7 @@ mod live {
     /// Without inProgressUpdates, the channel should receive no events.
     #[tokio::test]
     async fn live_ping_no_progress_when_flag_false() {
-        let (tx, mut rx) = ProgressTx::channel();
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
         // Flag is false — default run path, tx is never used
         let options = json!({
             "type": "ping",

@@ -16,8 +16,8 @@ pub struct ProgressEmitter {
     client: Client,
     test_id: String,
     measurement_id: String,
-    buffer: ProgressBuffer,
-    pending_lazy: Option<LazyProgress>,
+    buffer: Option<ProgressBuffer>,
+    pending_lazy: Option<(LazyProgress, BufferMode)>,
 }
 
 impl ProgressEmitter {
@@ -25,46 +25,78 @@ impl ProgressEmitter {
         client: Client,
         test_id: impl Into<String>,
         measurement_id: impl Into<String>,
-        mode: BufferMode,
     ) -> Self {
         Self {
             client,
             test_id: test_id.into(),
             measurement_id: measurement_id.into(),
-            buffer: ProgressBuffer::new(mode),
+            buffer: None,
             pending_lazy: None,
         }
     }
 
-    fn merge(&mut self, partial: Value) {
+    fn ensure_mode(&mut self, mode: BufferMode) -> bool {
+        match self.buffer.as_ref() {
+            Some(buffer) if buffer.mode() != mode => {
+                warn!(
+                    "Ignoring progress mode change for {}: {:?} -> {:?}",
+                    self.measurement_id,
+                    buffer.mode(),
+                    mode
+                );
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.buffer = Some(ProgressBuffer::new(mode));
+                true
+            }
+        }
+    }
+
+    fn merge(&mut self, partial: Value, mode: BufferMode) {
+        if !self.ensure_mode(mode) {
+            return;
+        }
         let Value::Object(fields) = partial else {
+            return;
+        };
+        let Some(buffer) = self.buffer.as_mut() else {
             return;
         };
         for (field, value) in fields {
             if let Some(value) = value.as_str() {
-                self.buffer.push(&field, value);
+                buffer.push(&field, value);
             }
         }
     }
 
     fn merge_update(&mut self, update: ProgressUpdate) {
         match update {
-            ProgressUpdate::Value(value) => self.merge(value),
-            ProgressUpdate::Lazy(render) => self.pending_lazy = Some(render),
+            ProgressUpdate::Value { value, mode } => self.merge(value, mode),
+            ProgressUpdate::Lazy { render, mode } => {
+                if self.ensure_mode(mode) {
+                    self.pending_lazy = Some((render, mode));
+                }
+            }
         }
     }
 
     async fn emit_buffer(&mut self) {
-        if let Some(render) = self.pending_lazy.take() {
-            self.merge(render());
+        if let Some((render, mode)) = self.pending_lazy.take() {
+            self.merge(render(), mode);
         }
-        if self.buffer.is_empty() {
+        let Some(buffer) = self.buffer.as_mut() else {
+            return;
+        };
+        if buffer.is_empty() {
             return;
         }
-        let fields = self.buffer.take_progress();
+        let fields = buffer.take_progress();
         if fields.values().all(String::is_empty) {
             return;
         }
+        let overwrite = buffer.overwrite();
         let mut partial = Value::Object(
             fields
                 .into_iter()
@@ -79,7 +111,7 @@ impl ProgressEmitter {
                 json!({
                     "testId": self.test_id,
                     "measurementId": self.measurement_id,
-                    "overwrite": self.buffer.overwrite(),
+                    "overwrite": overwrite,
                     "result": partial,
                 }),
             )
