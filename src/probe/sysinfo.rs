@@ -1,5 +1,7 @@
 use regex::Regex;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Total physical system RAM in bytes, read from `/proc/meminfo` on Linux.
 #[must_use]
@@ -7,8 +9,9 @@ pub fn host_total_memory_bytes() -> u64 {
     parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
 
-/// Memory effectively available to this process. This matches upstream's
-/// `Math.min(process.constrainedMemory() || Infinity, os.totalmem())` semantics.
+/// Memory effectively available to this process. Upstream v0.53.0 runs on
+/// Node 22.22.3 / libuv 1.51.0, where `process.constrainedMemory()` is derived
+/// from cgroup v1/v2 memory limits only.
 #[must_use]
 pub fn effective_total_memory_bytes() -> u64 {
     let host_total = host_total_memory_bytes();
@@ -16,149 +19,70 @@ pub fn effective_total_memory_bytes() -> u64 {
 }
 
 fn constrained_memory_bytes() -> Option<u64> {
-    let cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-    let limits = std::fs::read_to_string("/proc/self/limits").unwrap_or_default();
-
-    [
-        cgroup_memory_limit_bytes(&cgroup, &mountinfo),
-        parse_rlimit_memory_bytes(&limits),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|limit| *limit > 0)
-    .min()
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    cgroup_constrained_memory(&cgroup, read_memory_limit)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CgroupMemoryLocation {
-    mount_point: PathBuf,
-    current: PathBuf,
-    limit_file: &'static str,
+fn cgroup_constrained_memory<F>(cgroup: &str, mut read_limit: F) -> Option<u64>
+where
+    F: FnMut(&Path) -> u64,
+{
+    let (high, max) = if let Some(path) = cgroup.strip_prefix("0::/") {
+        let path = path.lines().next().unwrap_or_default();
+        let base = Path::new(CGROUP_ROOT).join(path);
+        (
+            read_limit(&base.join("memory.high")),
+            read_limit(&base.join("memory.max")),
+        )
+    } else {
+        cgroup1_memory_limits(cgroup, &mut read_limit)
+    };
+
+    (high != 0 && max != 0).then_some(high.min(max))
 }
 
-fn parse_cgroup_memory_location(cgroup: &str, mountinfo: &str) -> Option<CgroupMemoryLocation> {
-    let unified_path = cgroup.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ':');
-        let hierarchy = fields.next()?;
-        let controllers = fields.next()?;
-        let path = fields.next()?;
-        (hierarchy == "0" && controllers.is_empty()).then_some(path)
-    });
-
-    if let Some(path) = unified_path {
-        let (mount_root, mount_point) = find_cgroup_mount(mountinfo, "cgroup2", None)?;
-        return map_cgroup_path(&mount_root, &mount_point, path).map(|current| {
-            CgroupMemoryLocation {
-                mount_point,
-                current,
-                limit_file: "memory.max",
-            }
-        });
-    }
-
-    let legacy_path = cgroup.lines().find_map(|line| {
+fn cgroup1_memory_limits<F>(cgroup: &str, read_limit: &mut F) -> (u64, u64)
+where
+    F: FnMut(&Path) -> u64,
+{
+    let scoped = cgroup.lines().find_map(|line| {
         let mut fields = line.splitn(3, ':');
         let _hierarchy = fields.next()?;
         let controllers = fields.next()?;
         let path = fields.next()?;
-        controllers
-            .split(',')
-            .any(|controller| controller == "memory")
-            .then_some(path)
-    })?;
-    let (mount_root, mount_point) = find_cgroup_mount(mountinfo, "cgroup", Some("memory"))?;
-    map_cgroup_path(&mount_root, &mount_point, legacy_path).map(|current| CgroupMemoryLocation {
-        mount_point,
-        current,
-        limit_file: "memory.limit_in_bytes",
-    })
-}
+        (controllers == "memory").then_some(path.trim_start_matches('/'))
+    });
 
-fn find_cgroup_mount(
-    mountinfo: &str,
-    fs_type: &str,
-    required_option: Option<&str>,
-) -> Option<(PathBuf, PathBuf)> {
-    mountinfo.lines().find_map(|line| {
-        let (left, right) = line.split_once(" - ")?;
-        let left_fields = left.split_whitespace().collect::<Vec<_>>();
-        if left_fields.len() < 5 {
-            return None;
+    if let Some(path) = scoped {
+        let base = Path::new(CGROUP_ROOT).join("memory").join(path);
+        let high = read_limit(&base.join("memory.soft_limit_in_bytes"));
+        let max = read_limit(&base.join("memory.limit_in_bytes"));
+        if high != 0 && max != 0 {
+            return (high, max);
         }
-        let mut right_fields = right.split_whitespace();
-        let found_fs_type = right_fields.next()?;
-        let _source = right_fields.next()?;
-        let super_options = right_fields.next().unwrap_or_default();
-        if found_fs_type != fs_type
-            || required_option
-                .is_some_and(|required| !super_options.split(',').any(|option| option == required))
-        {
-            return None;
-        }
-        Some((PathBuf::from(left_fields[3]), PathBuf::from(left_fields[4])))
-    })
-}
+    }
 
-fn map_cgroup_path(mount_root: &Path, mount_point: &Path, cgroup_path: &str) -> Option<PathBuf> {
-    let cgroup_path = Path::new(cgroup_path);
-    let relative = cgroup_path
-        .strip_prefix(mount_root)
-        .or_else(|_| cgroup_path.strip_prefix("/"))
-        .ok()?;
-    Some(mount_point.join(relative))
-}
-
-fn cgroup_memory_limit_bytes(cgroup: &str, mountinfo: &str) -> Option<u64> {
-    let location = parse_cgroup_memory_location(cgroup, mountinfo)?;
-    hierarchical_memory_limit(
-        &location.current,
-        &location.mount_point,
-        location.limit_file,
+    let base = Path::new(CGROUP_ROOT).join("memory");
+    (
+        read_limit(&base.join("memory.soft_limit_in_bytes")),
+        read_limit(&base.join("memory.limit_in_bytes")),
     )
 }
 
-fn hierarchical_memory_limit(current: &Path, mount_point: &Path, limit_file: &str) -> Option<u64> {
-    let mut path = current.to_path_buf();
-    let mut minimum = None;
-    loop {
-        if let Ok(value) = std::fs::read_to_string(path.join(limit_file))
-            && let Some(limit) = parse_memory_limit(&value)
-        {
-            minimum = Some(minimum.map_or(limit, |existing: u64| existing.min(limit)));
-        }
-        if path == mount_point || !path.pop() {
-            break;
-        }
-        if !path.starts_with(mount_point) {
-            break;
-        }
-    }
-    minimum
+fn read_memory_limit(path: &Path) -> u64 {
+    let Ok(value) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    parse_memory_limit(&value)
 }
 
-fn parse_memory_limit(value: &str) -> Option<u64> {
+fn parse_memory_limit(value: &str) -> u64 {
     let value = value.trim();
-    if value == "max" || value == "-1" {
-        None
+    if value == "max" {
+        u64::MAX
     } else {
-        value.parse::<u64>().ok().filter(|value| *value > 0)
+        value.parse::<u64>().unwrap_or(0)
     }
-}
-
-fn parse_rlimit_memory_bytes(content: &str) -> Option<u64> {
-    ["Max data size", "Max address space"]
-        .into_iter()
-        .filter_map(|label| {
-            let line = content.lines().find(|line| line.starts_with(label))?;
-            let value = line[label.len()..].split_whitespace().next()?;
-            if value == "unlimited" {
-                None
-            } else {
-                value.parse::<u64>().ok().filter(|value| *value > 0)
-            }
-        })
-        .min()
 }
 
 #[must_use]
@@ -307,82 +231,85 @@ MemAvailable:   12000000 kB\n";
     }
 
     #[test]
-    fn parses_v2_cgroup_location() {
-        let location = parse_cgroup_memory_location(
-            "0::/user.slice/example.scope\n",
-            "35 27 0:31 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
-        )
-        .expect("v2 cgroup location");
-        assert_eq!(location.mount_point, Path::new("/sys/fs/cgroup"));
-        assert_eq!(
-            location.current,
-            Path::new("/sys/fs/cgroup/user.slice/example.scope")
-        );
-        assert_eq!(location.limit_file, "memory.max");
+    fn cgroup_v2_uses_minimum_of_high_and_max() {
+        let cgroup = "0::/user.slice/example.scope\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/user.slice/example.scope/memory.high" => 536_870_912,
+                "/sys/fs/cgroup/user.slice/example.scope/memory.max" => 1_073_741_824,
+                _ => 0,
+            });
+        assert_eq!(result, Some(536_870_912));
     }
 
     #[test]
-    fn parses_namespaced_v2_cgroup_location() {
-        let location = parse_cgroup_memory_location(
-            "0::/\n",
-            "35 27 0:31 /docker/abc /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
-        )
-        .expect("namespaced v2 cgroup location");
-        assert_eq!(location.current, Path::new("/sys/fs/cgroup"));
+    fn cgroup_v2_treats_max_as_unbounded() {
+        assert_eq!(parse_memory_limit("max\n"), u64::MAX);
+        let result = cgroup_constrained_memory("0::/demo\n", |path| {
+            match path.file_name().and_then(|name| name.to_str()) {
+                Some("memory.high") => u64::MAX,
+                Some("memory.max") => 536_870_912,
+                _ => 0,
+            }
+        });
+        assert_eq!(result, Some(536_870_912));
     }
 
     #[test]
-    fn parses_v1_memory_cgroup_location() {
-        let location = parse_cgroup_memory_location(
-            "5:memory,cpu:/docker/abc\n",
-            "29 23 0:26 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
-        )
-        .expect("v1 memory cgroup location");
-        assert_eq!(
-            location.current,
-            Path::new("/sys/fs/cgroup/memory/docker/abc")
-        );
-        assert_eq!(location.limit_file, "memory.limit_in_bytes");
+    fn cgroup_v2_requires_both_limit_files() {
+        let result = cgroup_constrained_memory("0::/demo\n", |path| {
+            if path.file_name().and_then(|name| name.to_str()) == Some("memory.max") {
+                536_870_912
+            } else {
+                0
+            }
+        });
+        assert_eq!(result, None);
     }
 
     #[test]
-    fn parses_memory_limit_values() {
-        assert_eq!(parse_memory_limit("536870912\n"), Some(536_870_912));
-        assert_eq!(parse_memory_limit("max\n"), None);
-        assert_eq!(parse_memory_limit("-1\n"), None);
-        assert_eq!(parse_memory_limit("0\n"), None);
+    fn cgroup_v1_uses_memory_controller_soft_and_hard_limits() {
+        let cgroup = "5:memory:/docker/abc\n4:cpu:/docker/abc\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/memory/docker/abc/memory.soft_limit_in_bytes" => 805_306_368,
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => 1_073_741_824,
+                _ => 0,
+            });
+        assert_eq!(result, Some(805_306_368));
     }
 
     #[test]
-    fn parses_rlimit_memory_minimum() {
-        let limits = "\
-Limit                     Soft Limit           Hard Limit           Units\n\
-Max data size             1073741824           unlimited            bytes\n\
-Max address space         2147483648           unlimited            bytes\n";
-        assert_eq!(parse_rlimit_memory_bytes(limits), Some(1_073_741_824));
+    fn cgroup_v1_falls_back_to_global_controller_limits() {
+        let cgroup = "5:memory:/docker/abc\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/memory/docker/abc/memory.soft_limit_in_bytes" => 0,
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes" => 1_073_741_824,
+                "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes" => 402_653_184,
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => 536_870_912,
+                _ => 0,
+            });
+        assert_eq!(result, Some(402_653_184));
     }
 
     #[test]
-    fn ignores_unlimited_rlimits() {
-        let limits = "\
-Limit                     Soft Limit           Hard Limit           Units\n\
-Max data size             unlimited            unlimited            bytes\n\
-Max address space         unlimited            unlimited            bytes\n";
-        assert_eq!(parse_rlimit_memory_bytes(limits), None);
+    fn cgroup_v1_does_not_treat_combined_controller_name_as_memory() {
+        let cgroup = "5:memory,cpu:/docker/abc\n";
+        let result =
+            cgroup_constrained_memory(cgroup, |path| match path.to_string_lossy().as_ref() {
+                "/sys/fs/cgroup/memory/memory.soft_limit_in_bytes" => 402_653_184,
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes" => 536_870_912,
+                _ => 0,
+            });
+        assert_eq!(result, Some(402_653_184));
     }
 
     #[test]
-    fn hierarchy_uses_tightest_memory_limit() {
-        let root = tempfile::tempdir().expect("temp cgroup root");
-        let group = root.path().join("a/b");
-        std::fs::create_dir_all(&group).expect("create cgroup hierarchy");
-        std::fs::write(root.path().join("memory.max"), "max\n").expect("root limit");
-        std::fs::write(root.path().join("a/memory.max"), "1073741824\n").expect("parent limit");
-        std::fs::write(group.join("memory.max"), "2147483648\n").expect("child limit");
-        assert_eq!(
-            hierarchical_memory_limit(&group, root.path(), "memory.max"),
-            Some(1_073_741_824)
-        );
+    fn invalid_memory_limit_reads_as_zero() {
+        assert_eq!(parse_memory_limit("banana\n"), 0);
+        assert_eq!(parse_memory_limit("0\n"), 0);
+        assert_eq!(parse_memory_limit("536870912\n"), 536_870_912);
     }
 
     #[test]
