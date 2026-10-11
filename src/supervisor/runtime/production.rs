@@ -1296,7 +1296,6 @@ impl BehaviorRuntime {
         );
         store.limiter(|state| &mut state.limits);
         store.set_fuel(JOB_FUEL).map_err(RuntimeError::Store)?;
-        store.set_epoch_deadline(1);
         let bindings = ProbeBehavior::instantiate_async(&mut store, component, &linker)
             .await
             .map_err(RuntimeError::Instantiate)?;

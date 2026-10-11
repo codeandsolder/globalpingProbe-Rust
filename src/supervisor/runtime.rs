@@ -2,7 +2,8 @@
 //!
 //! The stable native supervisor only compiles artifacts that already passed
 //! signature, digest, ABI, and anti-rollback verification. Per-job stores are
-//! separately bounded by memory, fuel, and epoch deadlines. The linker exposes
+//! separately bounded by memory/table/instance limits and fuel. Host calls are
+//! additionally bounded by capability lifetime, quotas, and operation deadlines. The linker exposes
 //! only the versioned Globalping host interface; ambient WASI is never linked.
 
 use std::future::{Future, ready};
@@ -92,10 +93,7 @@ impl BehaviorRuntime {
     /// Returns an error if Wasmtime rejects a security-relevant engine setting.
     pub fn new() -> Result<Self, RuntimeError> {
         let mut config = Config::new();
-        config
-            .wasm_component_model(true)
-            .consume_fuel(true)
-            .epoch_interruption(true);
+        config.wasm_component_model(true).consume_fuel(true);
         let engine = Engine::new(&config).map_err(RuntimeError::Engine)?;
         Ok(Self { engine })
     }
@@ -133,7 +131,6 @@ impl BehaviorRuntime {
         let mut store = Store::new(&self.engine, SelfTestState::new());
         store.limiter(|state| &mut state.limits);
         store.set_fuel(JOB_FUEL).map_err(RuntimeError::Store)?;
-        store.set_epoch_deadline(1);
 
         let bindings = ProbeBehavior::instantiate_async(&mut store, &compiled.component, &linker)
             .await
@@ -154,10 +151,6 @@ impl BehaviorRuntime {
             .instances(MAX_GUEST_INSTANCES)
             .tables(MAX_GUEST_TABLES)
             .build()
-    }
-
-    pub fn increment_epoch(&self) {
-        self.engine.increment_epoch();
     }
 }
 
@@ -641,7 +634,6 @@ mod differential_tests {
         store
             .set_fuel(JOB_FUEL)
             .unwrap_or_else(|error| panic!("failed to set fixture fuel: {error}"));
-        store.set_epoch_deadline(1);
 
         let bindings = ProbeBehavior::instantiate_async(&mut store, &component, &linker)
             .await
