@@ -7,7 +7,7 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,11 +16,15 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 
 use super::update::{
-    BehaviorManifest, MAX_MANIFEST_BYTES, UpdateError, VerifiedBehavior, verify_artifact,
+    BehaviorManifest, MAX_COMPONENT_BYTES, MAX_MANIFEST_BYTES, UpdateError, VerifiedBehavior,
+    verify_artifact,
 };
 
 const STATE_FILE: &str = "state.json";
 const BUNDLE_MAGIC: &[u8; 4] = b"GPB1";
+const MAX_STATE_BYTES: usize = 4 * 1024;
+const MAX_BUNDLE_BYTES: usize =
+    BUNDLE_MAGIC.len() + size_of::<u32>() + MAX_MANIFEST_BYTES + MAX_COMPONENT_BYTES;
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -32,6 +36,8 @@ pub enum StorageError {
     MissingState,
     InvalidState,
     InvalidBundle,
+    StateTooLarge,
+    BundleTooLarge,
     ManifestTooLarge,
 }
 
@@ -45,6 +51,8 @@ impl fmt::Display for StorageError {
             Self::MissingState => f.write_str("behavior storage state is missing"),
             Self::InvalidState => f.write_str("behavior storage state is inconsistent"),
             Self::InvalidBundle => f.write_str("behavior artifact bundle is malformed"),
+            Self::StateTooLarge => f.write_str("behavior storage state exceeds size limit"),
+            Self::BundleTooLarge => f.write_str("behavior artifact bundle exceeds size limit"),
             Self::ManifestTooLarge => f.write_str("behavior manifest exceeds storage limit"),
         }
     }
@@ -134,13 +142,15 @@ impl PersistentBehaviorSlots {
     ) -> Result<Self, StorageError> {
         let root = root.into();
         let state_path = root.join(STATE_FILE);
-        let state_bytes = match fs::read(&state_path) {
-            Ok(bytes) => bytes,
+        let state_file = match File::open(&state_path) {
+            Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(StorageError::MissingState);
             }
             Err(error) => return Err(error.into()),
         };
+        let state_bytes =
+            read_file_limited(state_file, MAX_STATE_BYTES, || StorageError::StateTooLarge)?;
         let state: PersistedState = serde_json::from_slice(&state_bytes)?;
 
         let active = load_bundle(
@@ -250,6 +260,9 @@ fn bundle_path(root: &Path, sequence: u64) -> PathBuf {
 }
 
 fn write_bundle(root: &Path, behavior: &VerifiedBehavior) -> Result<(), StorageError> {
+    if behavior.component.len() > MAX_COMPONENT_BYTES {
+        return Err(StorageError::Update(UpdateError::ComponentTooLarge));
+    }
     let manifest = serde_json::to_vec(&behavior.manifest)?;
     let manifest_len = u32::try_from(manifest.len()).map_err(|_| StorageError::ManifestTooLarge)?;
     if manifest.len() > MAX_MANIFEST_BYTES {
@@ -272,7 +285,10 @@ fn load_bundle(
     verifying_key: &VerifyingKey,
     supervisor_version: &Version,
 ) -> Result<VerifiedBehavior, StorageError> {
-    let bundle = fs::read(bundle_path(root, sequence))?;
+    let bundle_file = File::open(bundle_path(root, sequence))?;
+    let bundle = read_file_limited(bundle_file, MAX_BUNDLE_BYTES, || {
+        StorageError::BundleTooLarge
+    })?;
     if bundle.len() < BUNDLE_MAGIC.len() + size_of::<u32>()
         || &bundle[..BUNDLE_MAGIC.len()] != BUNDLE_MAGIC
     {
@@ -299,6 +315,26 @@ fn load_bundle(
     }
     let component = bundle[manifest_end..].to_vec();
     verify_artifact(manifest, component, verifying_key, supervisor_version).map_err(Into::into)
+}
+
+fn read_file_limited(
+    file: File,
+    limit: usize,
+    too_large: fn() -> StorageError,
+) -> Result<Vec<u8>, StorageError> {
+    let metadata_len = file.metadata()?.len();
+    if metadata_len > limit as u64 {
+        return Err(too_large());
+    }
+
+    let capacity = usize::try_from(metadata_len).unwrap_or(limit).min(limit);
+    let mut bytes = Vec::with_capacity(capacity);
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(too_large());
+    }
+    Ok(bytes)
 }
 
 fn write_state(root: &Path, state: PersistedState) -> Result<(), StorageError> {
@@ -472,6 +508,54 @@ mod tests {
         );
         assert!(matches!(result, Err(StorageError::InvalidBundle)));
         assert_eq!(store.accepted_sequence(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_unverified_component_is_not_persisted() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let mut oversized = verified(1, b"small", &key);
+        oversized.component = vec![0; MAX_COMPONENT_BYTES + 1].into();
+
+        let result = PersistentBehaviorSlots::initialize(dir.path(), oversized);
+        assert!(matches!(
+            result,
+            Err(StorageError::Update(UpdateError::ComponentTooLarge))
+        ));
+        assert!(!dir.path().join(STATE_FILE).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_json_allocation() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        PersistentBehaviorSlots::initialize(dir.path(), verified(1, b"first", &key))?;
+        File::create(dir.path().join(STATE_FILE))?.set_len(u64::try_from(MAX_STATE_BYTES + 1)?)?;
+
+        let result = PersistentBehaviorSlots::load(
+            dir.path(),
+            &key.verifying_key(),
+            &Version::new(0, 48, 0),
+        );
+        assert!(matches!(result, Err(StorageError::StateTooLarge)));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_bundle_is_rejected_before_component_allocation() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let key = SigningKey::from_bytes(&[7; 32]);
+        PersistentBehaviorSlots::initialize(dir.path(), verified(1, b"first", &key))?;
+        File::create(bundle_path(dir.path(), 1))?.set_len(u64::try_from(MAX_BUNDLE_BYTES + 1)?)?;
+
+        let result = PersistentBehaviorSlots::load(
+            dir.path(),
+            &key.verifying_key(),
+            &Version::new(0, 48, 0),
+        );
+        assert!(matches!(result, Err(StorageError::BundleTooLarge)));
         Ok(())
     }
 
