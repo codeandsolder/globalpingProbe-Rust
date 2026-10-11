@@ -86,6 +86,14 @@ fn status_ping_test_failed() {
 }
 
 #[test]
+fn status_ping_failure_precedes_pending_icmp_tcp_test() {
+    let mut m = StatusManager::new();
+    m.ping_test_failed = Some(true);
+    m.icmp_tcp_test_failed = None;
+    assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
+}
+
+#[test]
 fn status_icmp_tcp_failed() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(false);

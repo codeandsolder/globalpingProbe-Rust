@@ -1,6 +1,6 @@
 [package]
 name = "globalping-probe"
-version = "0.48.0"
+version = "0.53.0"
 edition = "2024"
 description = "Rust rewrite of the globalping network measurement probe"
 authors = ["Fyaz Manknojiya"]

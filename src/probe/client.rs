@@ -24,10 +24,11 @@ use crate::probe::{
     adoption::{AdoptionServer, local_ips},
     dns_servers::get_dns_servers,
     jobs::ActiveJobs,
+    lifecycle::LifecycleTasks,
     reconnect::{ConnectOutcome, classify_error, reconnect_delay},
     settings::ProbeSettingsStore,
     stats::get_cpu_usage,
-    sysinfo::{disk_info_mb, total_memory_bytes},
+    sysinfo::{disk_info_mb, effective_total_memory_bytes},
 };
 use crate::status::{
     icmp_tcp_test::{DEFAULT_TARGETS as ICMP_TCP_TARGETS, IcmpTcpTest},
@@ -91,7 +92,7 @@ impl Default for ClientConfig {
 /// Build the WebSocket handshake URL with probe metadata as query params.
 #[must_use]
 pub fn connection_url(cfg: &ClientConfig) -> String {
-    let mem = total_memory_bytes();
+    let mem = effective_total_memory_bytes();
     let (total_disk, avail_disk) = disk_info_mb();
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query
@@ -1464,15 +1465,20 @@ pub async fn run_with_behavior_controller(
         info!(target: "general", "Hardware probe version {device} running firmware version {firmware}.");
     }
 
-    // One signal handler for the entire lifetime of the process.
+    // One shutdown channel for the process lifetime. OS signals, upstream-style
+    // release polling, and scheduled max-uptime restart all use the ordinary
+    // SIGTERM-equivalent graceful drain. API `probe:sigkill` remains a distinct
+    // connection outcome with the upstream 40-second restart drain.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let signal_shutdown_tx = shutdown_tx.clone();
     tokio::spawn(async move {
         if let Err(error) = wait_for_signal().await {
             error!(%error, "Failed to install process signal handler.");
             return;
         }
-        let _ = shutdown_tx.send(true);
+        let _ = signal_shutdown_tx.send(true);
     });
+    let lifecycle_tasks = LifecycleTasks::spawn(shutdown_tx);
 
     loop {
         if *shutdown_rx.borrow() {
@@ -1521,6 +1527,7 @@ pub async fn run_with_behavior_controller(
         }
     }
 
+    lifecycle_tasks.abort();
     adoption.stop().await;
     debug!(target: "general", "Closing process.");
     Ok(())

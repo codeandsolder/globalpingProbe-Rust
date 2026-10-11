@@ -3,6 +3,12 @@
     feature = "pre-completion-final-fixture",
     allow(
         dead_code,
+        reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
+    )
+)]
+#![cfg_attr(
+    feature = "pre-completion-final-fixture",
+    allow(
         unused_imports,
         reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
     )
