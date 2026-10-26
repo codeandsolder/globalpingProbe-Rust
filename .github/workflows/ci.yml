@@ -21,7 +21,7 @@ env:
 jobs:
   rust-skills2-strict:
     name: rust-skills2 strict nightly gate
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@ca8e5368b41e5699095dd0458a3849ecb8db7712
     with:
       allow-test-panics: true
 
