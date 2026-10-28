@@ -20,13 +20,13 @@ pub struct CommandsConfig {
     pub ping: PingConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Copy)]
 pub struct PingConfig {
     pub interval: f32,
     pub packets: u8,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Copy)]
 pub struct StatusConfig {
     pub ping_interval_secs: u64,
     pub icmp_tcp_interval_secs: u64,
@@ -34,7 +34,7 @@ pub struct StatusConfig {
     pub max_disconnects: usize,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Copy)]
 pub struct StatsConfig {
     pub interval_secs: u64,
 }
