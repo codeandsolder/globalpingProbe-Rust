@@ -7,7 +7,7 @@ use crate::util::private_ip::is_ip_private;
 
 // ── Shared types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsStatus {
     Finished,
@@ -24,7 +24,7 @@ pub struct DnsAnswer {
     pub value: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DnsTimings {
     pub total: u32,
 }

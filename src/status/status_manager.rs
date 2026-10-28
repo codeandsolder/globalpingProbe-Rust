@@ -4,7 +4,7 @@ use super::ping_test::PingTest;
 
 const DEFAULT_ICMP_TCP_TARGETS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeStatus {
     Initializing,
     Ready,
