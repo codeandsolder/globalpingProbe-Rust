@@ -62,7 +62,7 @@ impl StatusManager {
     /// Priority (highest → lowest): sigterm → initializing → ping-test-failed →
     /// icmp-tcp-test-failed → too-many-disconnects → ready.
     #[must_use]
-    pub fn get_status(&self) -> ProbeStatus {
+    pub fn status(&self) -> ProbeStatus {
         if self.sigterm {
             return ProbeStatus::Sigterm;
         }
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn initial_status_is_initializing() {
         let m = mgr();
-        assert_eq!(m.get_status(), ProbeStatus::Initializing);
+        assert_eq!(m.status(), ProbeStatus::Initializing);
     }
 
     #[test]
@@ -163,7 +163,7 @@ mod tests {
         // Even with everything else ok, sigterm wins
         m.ping_test_failed = Some(false);
         m.icmp_tcp_test_failed = Some(false);
-        assert_eq!(m.get_status(), ProbeStatus::Sigterm);
+        assert_eq!(m.status(), ProbeStatus::Sigterm);
     }
 
     #[test]
@@ -171,7 +171,7 @@ mod tests {
         let mut m = mgr();
         m.ping_test_failed = Some(false);
         m.icmp_tcp_test_failed = Some(false);
-        assert_eq!(m.get_status(), ProbeStatus::Ready);
+        assert_eq!(m.status(), ProbeStatus::Ready);
     }
 
     #[test]
@@ -179,7 +179,7 @@ mod tests {
         let mut m = mgr();
         m.ping_test_failed = Some(true);
         m.icmp_tcp_test_failed = Some(false);
-        assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
+        assert_eq!(m.status(), ProbeStatus::PingTestFailed);
     }
 
     #[test]
@@ -187,7 +187,7 @@ mod tests {
         let mut m = mgr();
         m.ping_test_failed = Some(false);
         m.icmp_tcp_test_failed = Some(true);
-        assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+        assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
     }
 
     #[test]
@@ -196,7 +196,7 @@ mod tests {
         m.ping_test_failed = Some(false);
         m.icmp_tcp_test_failed = Some(false);
         m.too_many_disconnects = true;
-        assert_eq!(m.get_status(), ProbeStatus::TooManyDisconnects);
+        assert_eq!(m.status(), ProbeStatus::TooManyDisconnects);
     }
 
     #[test]
@@ -204,7 +204,7 @@ mod tests {
         let mut m = mgr();
         m.ping_test_failed = Some(true);
         m.icmp_tcp_test_failed = Some(true);
-        assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
+        assert_eq!(m.status(), ProbeStatus::PingTestFailed);
     }
 
     #[test]
@@ -213,7 +213,7 @@ mod tests {
         m.ping_test_failed = Some(false);
         m.icmp_tcp_test_failed = Some(true);
         m.too_many_disconnects = true;
-        assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+        assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
     }
 
     #[test]
@@ -221,7 +221,7 @@ mod tests {
         let mut m = mgr();
         m.ping_test_failed = Some(false);
         // icmp_tcp_test_failed is still None
-        assert_eq!(m.get_status(), ProbeStatus::Initializing);
+        assert_eq!(m.status(), ProbeStatus::Initializing);
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
         assert!(!m.report_disconnect());
         let too_many = m.report_disconnect();
         assert!(too_many);
-        assert_eq!(m.get_status(), ProbeStatus::TooManyDisconnects);
+        assert_eq!(m.status(), ProbeStatus::TooManyDisconnects);
     }
 
     #[test]
@@ -244,11 +244,11 @@ mod tests {
         // inject a border-line diff (>= 60ms but < 100ms) — needs is_proxy to trigger
         m.icmp_tcp_test.diffs_v4 = vec![Some(65.0)];
         m.icmp_tcp_test.diffs_v6 = vec![];
-        assert_eq!(m.get_status(), ProbeStatus::Ready);
+        assert_eq!(m.status(), ProbeStatus::Ready);
 
         m.on_proxy_status(true);
         assert_eq!(m.icmp_tcp_test_failed, Some(true));
-        assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+        assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
     }
 
     #[test]

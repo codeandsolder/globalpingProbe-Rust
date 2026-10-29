@@ -207,7 +207,7 @@ pub async fn dispatch(
         return;
     };
 
-    let current_status = status_manager.lock().await.get_status().to_string();
+    let current_status = status_manager.lock().await.status().to_string();
     if current_status != "ready" {
         warn!("Measurement was sent to probe with {current_status} status.");
         return;
@@ -361,7 +361,7 @@ pub async fn run_status_loop(
             mgr.icmp_tcp_test_failed = Some(vpn);
             // Re-evaluate disconnect status: TTL-expired entries may have cleared.
             mgr.recheck_disconnect_status();
-            let st = mgr.get_status().to_string();
+            let st = mgr.status().to_string();
             drop(mgr);
             client.emit("probe:status:update", json!(st)).await.ok();
         }
@@ -404,7 +404,7 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
         state.signal.signal(ConnectOutcome::Transient).await;
         return;
     }
-    let status = state.status_manager.lock().await.get_status().to_string();
+    let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
     client
         .emit("probe:dns:update", json!(get_dns_servers()))
@@ -420,7 +420,7 @@ async fn handle_close(state: ConnectionHandlers, payload: Payload, client: Clien
         let status = {
             let mut manager = state.status_manager.lock().await;
             manager.report_disconnect();
-            manager.get_status().to_string()
+            manager.status().to_string()
         };
         client.emit("probe:status:update", json!(status)).await.ok();
     }
@@ -528,7 +528,7 @@ async fn handle_proxy(state: ConnectionHandlers, payload: Payload, client: Clien
     let status = {
         let mut manager = state.status_manager.lock().await;
         manager.on_proxy_status(is_proxy);
-        manager.get_status().to_string()
+        manager.status().to_string()
     };
     client.emit("probe:status:update", json!(status)).await.ok();
 }
