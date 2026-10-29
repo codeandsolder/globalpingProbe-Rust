@@ -2,6 +2,7 @@
 name = "globalping-probe"
 version = "0.48.0"
 edition = "2024"
+rust-version = "1.99"
 description = "Rust rewrite of the globalping network measurement probe"
 authors = ["Fyaz Manknojiya"]
 license = "Apache-2.0"
