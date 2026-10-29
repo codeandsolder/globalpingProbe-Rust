@@ -58,14 +58,14 @@ fn exactly_60_does_not_count_as_over_60() {
 #[test]
 fn status_initializing_before_any_test_runs() {
     let m = StatusManager::new();
-    assert_eq!(m.get_status(), ProbeStatus::Initializing);
+    assert_eq!(m.status(), ProbeStatus::Initializing);
 }
 
 #[test]
 fn status_initializing_after_only_ping_test() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(false);
-    assert_eq!(m.get_status(), ProbeStatus::Initializing);
+    assert_eq!(m.status(), ProbeStatus::Initializing);
 }
 
 #[test]
@@ -73,8 +73,8 @@ fn status_ready_when_all_pass() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(false);
     m.icmp_tcp_test_failed = Some(false);
-    assert_eq!(m.get_status(), ProbeStatus::Ready);
-    assert_eq!(m.get_status().to_string(), "ready");
+    assert_eq!(m.status(), ProbeStatus::Ready);
+    assert_eq!(m.status().to_string(), "ready");
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn status_ping_test_failed() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(true);
     m.icmp_tcp_test_failed = Some(false);
-    assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
+    assert_eq!(m.status(), ProbeStatus::PingTestFailed);
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn status_icmp_tcp_failed() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(false);
     m.icmp_tcp_test_failed = Some(true);
-    assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+    assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn ping_test_failed_has_higher_priority_than_icmp_tcp() {
     let mut m = StatusManager::new();
     m.ping_test_failed = Some(true);
     m.icmp_tcp_test_failed = Some(true);
-    assert_eq!(m.get_status(), ProbeStatus::PingTestFailed);
+    assert_eq!(m.status(), ProbeStatus::PingTestFailed);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn icmp_tcp_failed_has_higher_priority_than_disconnects() {
     m.ping_test_failed = Some(false);
     m.icmp_tcp_test_failed = Some(true);
     m.too_many_disconnects = true;
-    assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+    assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn sigterm_overrides_all_other_statuses() {
     m.icmp_tcp_test_failed = Some(true);
     m.too_many_disconnects = true;
     m.set_sigterm();
-    assert_eq!(m.get_status(), ProbeStatus::Sigterm);
+    assert_eq!(m.status(), ProbeStatus::Sigterm);
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn three_disconnects_trigger_status() {
     assert!(!m.report_disconnect());
     assert!(!m.report_disconnect());
     assert!(m.report_disconnect()); // 3rd triggers
-    assert_eq!(m.get_status(), ProbeStatus::TooManyDisconnects);
+    assert_eq!(m.status(), ProbeStatus::TooManyDisconnects);
 }
 
 #[test]
@@ -138,10 +138,10 @@ fn on_proxy_true_with_medium_diff_triggers_icmp_tcp_failed() {
     m.icmp_tcp_test_failed = Some(false);
     m.icmp_tcp_test.diffs_v4 = vec![Some(65.0)]; // one diff >= 60 but < 100
     m.icmp_tcp_test.diffs_v6 = vec![];
-    assert_eq!(m.get_status(), ProbeStatus::Ready);
+    assert_eq!(m.status(), ProbeStatus::Ready);
 
     m.on_proxy_status(true);
-    assert_eq!(m.get_status(), ProbeStatus::IcmpTcpTestFailed);
+    assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn on_proxy_false_clears_vpn_when_only_medium_diff() {
     m.on_proxy_status(false);
     // With is_proxy=false, one diff>=60 is not enough → cleared
     assert_eq!(m.icmp_tcp_test_failed, Some(false));
-    assert_eq!(m.get_status(), ProbeStatus::Ready);
+    assert_eq!(m.status(), ProbeStatus::Ready);
 }
 
 #[test]
@@ -243,7 +243,7 @@ mod live {
     async fn live_status_manager_becomes_ready() {
         let mut m = StatusManager::with_api_host("1.1.1.1");
         assert_eq!(
-            m.get_status(),
+            m.status(),
             ProbeStatus::Initializing,
             "should start Initializing"
         );
@@ -255,27 +255,24 @@ mod live {
 
         // Status is STILL Initializing until BOTH tests have run (mirrors Node.js behaviour)
         assert_eq!(
-            m.get_status(),
+            m.status(),
             ProbeStatus::Initializing,
             "still Initializing until ICMP/TCP test also completes"
         );
 
         let vpn = m.run_icmp_tcp_test().await;
-        println!(
-            "ICMP/TCP test: vpn_detected={vpn} status={}",
-            m.get_status()
-        );
+        println!("ICMP/TCP test: vpn_detected={vpn} status={}", m.status());
 
         // Now both tests are done — status must have left Initializing
         assert_ne!(
-            m.get_status(),
+            m.status(),
             ProbeStatus::Initializing,
             "status should leave Initializing after both tests complete"
         );
 
         // If VPN not detected and ping passed, we should be Ready
         if !vpn {
-            assert_eq!(m.get_status(), ProbeStatus::Ready);
+            assert_eq!(m.status(), ProbeStatus::Ready);
         }
     }
 
