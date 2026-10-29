@@ -153,6 +153,7 @@ async fn run_traceroute(
                     "resolvedHostname":  partial.resolved_hostname,
                     "hops":              partial.hops,
                 }))
+                .await
                 .ok();
             }
         }

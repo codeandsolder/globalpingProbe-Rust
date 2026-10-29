@@ -249,7 +249,7 @@ pub async fn dispatch(
 
     let measurement_fut = async {
         if in_progress {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = tokio::sync::mpsc::channel(16);
             let emitter = ProgressEmitter::new(client.clone(), tid.clone(), mid.clone());
             tokio::spawn(emitter.forward(rx));
             cmd.run_with_progress(req.measurement.clone(), tx).await
@@ -400,7 +400,7 @@ impl ConnectionHandlers {
 }
 
 async fn handle_open(state: ConnectionHandlers, client: Client) {
-    if state.already_connected.swap(true, Ordering::SeqCst) {
+    if state.already_connected.swap(true, Ordering::Relaxed) {
         state.signal.signal(ConnectOutcome::Transient).await;
         return;
     }
@@ -692,7 +692,7 @@ async fn connect_once(
         graceful_shutdown(&state, &socket).await;
     }
     socket.disconnect().await.ok();
-    let was_connected = connected_reader.load(Ordering::SeqCst);
+    let was_connected = connected_reader.load(Ordering::Relaxed);
     (outcome, was_connected)
 }
 
