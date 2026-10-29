@@ -12,10 +12,11 @@ enum AltIpError {
 /// Enumerate all public IP addresses from local network interfaces.
 /// Uses `ip -o addr show scope global` to filter out loopback and link-local.
 #[must_use]
-pub fn get_local_public_ips() -> Vec<IpAddr> {
-    let Ok(out) = std::process::Command::new("ip")
+pub async fn get_local_public_ips() -> Vec<IpAddr> {
+    let Ok(out) = tokio::process::Command::new("ip")
         .args(["-o", "addr", "show", "scope", "global"])
         .output()
+        .await
     else {
         return vec![];
     };
@@ -86,7 +87,7 @@ async fn fetch_alt_ip_token(
 /// main IP the API already knows), and emit `probe:alt-ips` so the API registers
 /// them all for this probe session.
 pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
-    let local_ips = get_local_public_ips();
+    let local_ips = get_local_public_ips().await;
 
     let alt_ips: Vec<IpAddr> = local_ips
         .into_iter()
