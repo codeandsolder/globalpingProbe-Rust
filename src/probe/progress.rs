@@ -29,7 +29,7 @@ impl ProgressEmitter {
     /// Consume the emitter and drain `rx` until the sender is dropped,
     /// forwarding each partial result to the API.  Designed to be spawned
     /// as a background task alongside the measurement.
-    pub async fn forward(self, mut rx: mpsc::UnboundedReceiver<Value>) {
+    pub async fn forward(self, mut rx: mpsc::Receiver<Value>) {
         while let Some(mut partial) = rx.recv().await {
             limit_raw_output(&mut partial);
             if let Err(e) = self
@@ -59,12 +59,18 @@ mod tests {
     /// Helper: exercise the channel mechanics without a real socket.
     #[tokio::test]
     async fn channel_forwards_all_values_in_order() {
-        let (tx, rx) = mpsc::unbounded_channel::<Value>();
+        let (tx, rx) = mpsc::channel::<Value>(16);
 
         // Send three partial results
-        tx.send(json!({"status": "in-progress", "hop": 1})).unwrap();
-        tx.send(json!({"status": "in-progress", "hop": 2})).unwrap();
-        tx.send(json!({"status": "in-progress", "hop": 3})).unwrap();
+        tx.send(json!({"status": "in-progress", "hop": 1}))
+            .await
+            .unwrap();
+        tx.send(json!({"status": "in-progress", "hop": 2}))
+            .await
+            .unwrap();
+        tx.send(json!({"status": "in-progress", "hop": 3}))
+            .await
+            .unwrap();
         drop(tx); // close sender so recv loop terminates
 
         let mut received = vec![];
@@ -77,8 +83,8 @@ mod tests {
 
     #[tokio::test]
     async fn channel_terminates_when_sender_dropped() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-        tx.send(json!({"x": 1})).unwrap();
+        let (tx, mut rx) = mpsc::channel::<Value>(16);
+        tx.send(json!({"x": 1})).await.unwrap();
         drop(tx);
         assert!(rx.recv().await.is_some());
         assert!(
@@ -87,12 +93,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sender_clone_shares_channel() {
-        let (tx, _rx) = mpsc::unbounded_channel::<Value>();
+    #[tokio::test]
+    async fn sender_clone_shares_channel() {
+        let (tx, _rx) = mpsc::channel::<Value>(16);
         let tx2 = tx.clone();
-        tx.send(json!(1)).unwrap();
-        tx2.send(json!(2)).unwrap();
+        tx.send(json!(1)).await.unwrap();
+        tx2.send(json!(2)).await.unwrap();
         // Both senders go to the same receiver — no assertion needed on rx here,
         // just confirming neither send panics
     }

@@ -165,6 +165,7 @@ async fn run_icmp(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
                     "timings":           partial.timings,
                     "stats":             partial.stats,
                 }))
+                .await
                 .ok();
             }
         }
