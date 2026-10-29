@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 /// Verify the progress channel path exists and is type-correct (compile check).
 #[test]
 fn progress_methods_are_constructible() {
-    let (tx, _rx) = mpsc::unbounded_channel();
+    let (tx, _rx) = mpsc::channel(16);
     let ping_future = PingCommand.run_with_progress(json!({}), tx.clone());
     let traceroute_future = TracerouteCommand.run_with_progress(json!({}), tx);
     drop((ping_future, traceroute_future));
@@ -19,18 +19,18 @@ fn progress_methods_are_constructible() {
 /// Verify producers can detect a dropped progress receiver without panicking.
 #[test]
 fn closed_progress_channel_send_returns_error() {
-    let (tx, rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (tx, rx) = mpsc::channel::<serde_json::Value>(16);
     drop(rx);
-    assert!(tx.send(json!({"status": "in-progress"})).is_err());
+    assert!(tx.try_send(json!({"status": "in-progress"})).is_err());
 }
 
 // ── Channel mechanics ─────────────────────────────────────────────────────────
 
 #[tokio::test]
 async fn progress_channel_delivers_values_in_order() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(16);
     for i in 0u32..5 {
-        tx.send(json!({ "seq": i })).unwrap();
+        tx.try_send(json!({ "seq": i })).unwrap();
     }
     drop(tx);
     let mut seq = 0u32;
@@ -43,14 +43,14 @@ async fn progress_channel_delivers_values_in_order() {
 
 #[tokio::test]
 async fn progress_channel_terminates_when_sender_dropped() {
-    let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (tx, mut rx) = mpsc::channel::<serde_json::Value>(16);
     drop(tx);
     assert!(rx.recv().await.is_none());
 }
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_ping_shape() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(16);
     let partial = json!({
         "status": "in-progress",
         "rawOutput": "PING 1.1.1.1 (1.1.1.1)\n64 bytes from 1.1.1.1: seq=1 ttl=58 time=10.1 ms\n",
@@ -59,7 +59,7 @@ async fn progress_channel_accepts_partial_ping_shape() {
         "timings": [{"rtt": 10.1, "ttl": 58}],
         "stats": {"min": 10.1, "max": 10.1, "avg": 10.1},
     });
-    tx.send(partial.clone()).unwrap();
+    tx.try_send(partial.clone()).unwrap();
     drop(tx);
     let received = rx.recv().await.unwrap();
     assert_eq!(received["status"], "in-progress");
@@ -68,7 +68,7 @@ async fn progress_channel_accepts_partial_ping_shape() {
 
 #[tokio::test]
 async fn progress_channel_accepts_partial_traceroute_shape() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(16);
     let partial = json!({
         "status": "in-progress",
         "rawOutput": "traceroute to 1.1.1.1 (1.1.1.1), 20 hops max\n 1  _gateway (192.168.1.1)  1.2 ms\n",
@@ -76,7 +76,7 @@ async fn progress_channel_accepts_partial_traceroute_shape() {
         "resolvedHostname": null,
         "hops": [{ "resolvedAddress": "192.168.1.1", "resolvedHostname": "_gateway", "timings": [{"rtt": 1.2}] }],
     });
-    tx.send(partial).unwrap();
+    tx.try_send(partial).unwrap();
     drop(tx);
     let received = rx.recv().await.unwrap();
     assert_eq!(received["status"], "in-progress");
@@ -125,7 +125,7 @@ mod live {
     /// arrives on the channel before the measurement finishes.
     #[tokio::test]
     async fn live_ping_emits_progress_per_packet() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let options = json!({
             "type": "ping",
             "target": "1.1.1.1",
@@ -166,7 +166,7 @@ mod live {
     /// Traceroute with inProgressUpdates=true — verify hop-by-hop progress.
     #[tokio::test]
     async fn live_traceroute_emits_progress_per_hop() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let options = json!({
             "type": "traceroute",
             "target": "1.1.1.1",
@@ -200,7 +200,7 @@ mod live {
     /// Without inProgressUpdates, the channel should receive no events.
     #[tokio::test]
     async fn live_ping_no_progress_when_flag_false() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let (tx, mut rx) = mpsc::channel::<serde_json::Value>(16);
         // Flag is false — default run path, tx is never used
         let options = json!({
             "type": "ping",
