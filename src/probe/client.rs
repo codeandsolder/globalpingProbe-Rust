@@ -366,7 +366,7 @@ fn log_behavior_error(
     event
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "diagnostic task needs immutable measurement identity plus execution metadata"
 )]
@@ -445,7 +445,7 @@ async fn record_behavior_diagnostic(
     BEHAVIOR_DIAGNOSTIC_COMPLETIONS.fetch_add(1, Ordering::SeqCst);
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "diagnostic task owns immutable measurement identity plus execution metadata"
 )]
@@ -526,7 +526,7 @@ async fn finish_behavior_fault(
     resolved.value
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "success handling needs immutable measurement identity plus execution metadata"
 )]

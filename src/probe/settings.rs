@@ -78,7 +78,7 @@ impl ProbeSettingsStore {
     ///
     /// Unknown keys are intentionally preserved for forward compatibility.
     /// Persistence failures do not roll back the in-memory update, matching upstream.
-    #[allow(
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the write mutex intentionally serializes persistence and acknowledgements"
     )]

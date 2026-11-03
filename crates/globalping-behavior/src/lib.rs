@@ -1,14 +1,14 @@
 #![no_std]
 #![cfg_attr(
     feature = "pre-completion-final-fixture",
-    allow(
+    expect(
         dead_code,
         reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
     )
 )]
 #![cfg_attr(
     feature = "pre-completion-final-fixture",
-    allow(
+    expect(
         unused_imports,
         reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
     )
@@ -35,11 +35,11 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 // `wit-bindgen` generates the canonical ABI shims, which necessarily contain
 // unsafe exports/blocks. Keep that exemption confined to generated glue; the
 // rest of this crate remains under the workspace `unsafe_code = "deny"` lint.
-#[allow(
+#[expect(
     unsafe_code,
     reason = "wit-bindgen generates canonical ABI glue that requires unsafe exports and blocks"
 )]
-#[allow(
+#[expect(
     clippy::same_length_and_capacity,
     reason = "wit-bindgen reconstructs exact-length canonical ABI buffers"
 )]

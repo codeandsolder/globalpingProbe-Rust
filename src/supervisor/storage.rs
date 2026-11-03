@@ -80,7 +80,7 @@ impl From<UpdateError> for StorageError {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-#[allow(
+#[expect(
     clippy::struct_field_names,
     reason = "the explicit sequence suffix is part of the persisted state schema and distinguishes all three monotonic sequence roles"
 )]
