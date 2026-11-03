@@ -188,7 +188,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("failed to fill progress queue: {error}"));
         }
 
-        let mut blocked = Box::pin(tx.send(json!({ "sequence": PROGRESS_EVENT_CAPACITY })));
+        let mut blocked = std::pin::pin!(tx.send(json!({ "sequence": PROGRESS_EVENT_CAPACITY })));
         assert!(matches!(poll!(blocked.as_mut()), Poll::Pending));
 
         let first = rx
