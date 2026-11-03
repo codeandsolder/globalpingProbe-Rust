@@ -2,7 +2,7 @@ use crate::util::progress_buffer::BufferMode;
 
 use super::{
     BehaviorRuntime, CompiledBehavior, Component, Future, HasSelf, JOB_FUEL, Linker, ProbeBehavior,
-    RuntimeError, Store, StoreLimits, exports, ready, wit_host,
+    RuntimeError, Store, StoreLimits, exports, wit_host,
 };
 
 #[derive(Debug)]
@@ -1232,7 +1232,7 @@ impl wit_host::Host for ProductionHost {
         result_json: String,
         mode: wit_host::ProgressMode,
     ) -> impl Future<Output = Result<(), wit_host::HostError>> + Send {
-        let result = (|| {
+        async move {
             self.check_token(&token)?;
             self.lease
                 .authorize_progress(&result_json, std::time::Instant::now())
@@ -1252,12 +1252,11 @@ impl wit_host::Host for ProductionHost {
                 self.progress_during_native_execution = true;
             }
             if let Some(tx) = &self.behavior_progress_sink {
-                tx.send(value.clone(), mode).ok();
+                tx.send(value.clone(), mode).await.ok();
             }
             self.progress.push((value, mode));
             Ok(())
-        })();
-        ready(result)
+        }
     }
 }
 

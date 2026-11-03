@@ -340,7 +340,7 @@ async fn run_native_traceroute_inner(
             if let Some(tx) = progress {
                 let raw = raw_lines.join("\n");
                 let normalized = normalize_numeric_output(&raw, target, &HashMap::new());
-                tx.send(json!({ "rawOutput": normalized })).ok();
+                tx.send(json!({ "rawOutput": normalized })).await.ok();
             }
         }
         child.wait().await

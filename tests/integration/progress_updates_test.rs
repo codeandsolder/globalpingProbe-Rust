@@ -29,11 +29,11 @@ fn progress_methods_are_constructible() {
 }
 
 /// Verify producers can detect a dropped progress receiver without panicking.
-#[test]
-fn closed_progress_channel_send_returns_error() {
+#[tokio::test]
+async fn closed_progress_channel_send_returns_error() {
     let (tx, rx) = ProgressTx::channel(BufferMode::Append);
     drop(rx);
-    assert!(tx.send(json!({"status": "in-progress"})).is_err());
+    assert!(tx.send(json!({"status": "in-progress"})).await.is_err());
 }
 
 // ── Channel mechanics ─────────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ fn closed_progress_channel_send_returns_error() {
 async fn progress_channel_delivers_values_in_order() {
     let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
     for i in 0u32..5 {
-        tx.send(json!({ "seq": i })).unwrap();
+        tx.send(json!({ "seq": i })).await.unwrap();
     }
     drop(tx);
     let mut seq = 0u32;
@@ -67,7 +67,7 @@ async fn progress_channel_accepts_partial_ping_shape() {
     let partial = json!({
         "rawOutput": "PING 1.1.1.1 (1.1.1.1)\n64 bytes from 1.1.1.1: seq=1 ttl=58 time=10.1 ms\n",
     });
-    tx.send(partial.clone()).unwrap();
+    tx.send(partial.clone()).await.unwrap();
     drop(tx);
     let received = rx.recv().await.unwrap().resolve();
     assert!(
@@ -83,7 +83,7 @@ async fn progress_channel_accepts_partial_traceroute_shape() {
     let partial = json!({
         "rawOutput": "traceroute to 1.1.1.1 (1.1.1.1), 20 hops max\n 1  _gateway (192.168.1.1)  1.2 ms\n",
     });
-    tx.send(partial).unwrap();
+    tx.send(partial).await.unwrap();
     drop(tx);
     let received = rx.recv().await.unwrap().resolve();
     assert!(

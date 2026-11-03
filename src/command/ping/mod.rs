@@ -202,7 +202,7 @@ async fn run_icmp_raw_inner(
             if let Some(tx) = &progress {
                 let mut normalized = normalize_ping_output(&line, &address, &target.hostname);
                 normalized.push('\n');
-                tx.send(json!({ "rawOutput": normalized })).ok();
+                tx.send(json!({ "rawOutput": normalized })).await.ok();
             }
         }
         child.wait().await
@@ -337,7 +337,9 @@ async fn run_tcp_raw_inner(
         probes.push(probe);
 
         if let Some(tx) = &progress {
-            tx.send(json!({ "rawOutput": raw_lines.join("\n") })).ok();
+            tx.send(json!({ "rawOutput": raw_lines.join("\n") }))
+                .await
+                .ok();
         }
     }
 

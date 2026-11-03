@@ -15,6 +15,7 @@ use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use super::update::VerifiedBehavior;
 
 pub const MAX_GUEST_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_GUEST_MEMORIES: usize = 1;
 pub const MAX_GUEST_TABLE_ELEMENTS: usize = 10_000;
 pub const MAX_GUEST_INSTANCES: usize = 16;
 pub const MAX_GUEST_TABLES: usize = 16;
@@ -147,6 +148,7 @@ impl BehaviorRuntime {
     pub fn store_limits() -> StoreLimits {
         StoreLimitsBuilder::new()
             .memory_size(MAX_GUEST_MEMORY_BYTES)
+            .memories(MAX_GUEST_MEMORIES)
             .table_elements(MAX_GUEST_TABLE_ELEMENTS)
             .instances(MAX_GUEST_INSTANCES)
             .tables(MAX_GUEST_TABLES)

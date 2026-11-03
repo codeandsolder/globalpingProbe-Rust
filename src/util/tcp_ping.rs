@@ -3,12 +3,12 @@ use std::time::Instant;
 use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep, timeout};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TcpPingProbe {
     pub rtt_ms: Option<f64>, // None = timeout or error
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TcpPingStats {
     pub min: Option<f64>,
     pub avg: Option<f64>,

@@ -772,12 +772,11 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn bad_manifest_signature_is_rejected_before_component_download() {
-        let trusted = SigningKey::from_bytes(&[11; 32]);
-        let attacker = SigningKey::from_bytes(&[12; 32]);
-        let component = b"not-even-downloaded".to_vec();
-        let manifest = signed_manifest(1, &component, &attacker);
+    async fn manifest_preflight_result(
+        trusted: &SigningKey,
+        manifest: BehaviorManifest,
+        component: Vec<u8>,
+    ) -> (Result<BehaviorUpdateOutcome, BehaviorTransportError>, usize) {
         let manifest_body = serde_json::to_vec(&manifest)
             .unwrap_or_else(|error| panic!("manifest serialization failed: {error}"));
         let component_hits = Arc::new(AtomicUsize::new(0));
@@ -837,15 +836,45 @@ mod tests {
         .unwrap_or_else(|error| panic!("controller load failed: {error}"));
 
         let result = updater.check_once(&controller).await;
+        let hits = component_hits.load(Ordering::Relaxed);
+        server.abort();
+        let _ = server.await;
+        (result, hits)
+    }
+
+    #[tokio::test]
+    async fn bad_manifest_signature_is_rejected_before_component_download() {
+        let trusted = SigningKey::from_bytes(&[11; 32]);
+        let attacker = SigningKey::from_bytes(&[12; 32]);
+        let component = b"not-even-downloaded".to_vec();
+        let manifest = signed_manifest(1, &component, &attacker);
+        let (result, component_hits) =
+            manifest_preflight_result(&trusted, manifest, component).await;
         assert!(matches!(
             result,
             Err(BehaviorTransportError::Bootstrap(BootstrapError::Update(
                 UpdateError::SignatureMismatch
             )))
         ));
-        assert_eq!(component_hits.load(Ordering::Relaxed), 0);
-        server.abort();
-        let _ = server.await;
+        assert_eq!(component_hits, 0);
+    }
+
+    #[tokio::test]
+    async fn malformed_signed_build_id_is_rejected_before_component_download() {
+        let trusted = SigningKey::from_bytes(&[11; 32]);
+        let component = b"not-even-downloaded".to_vec();
+        let mut manifest = signed_manifest(1, &component, &trusted);
+        manifest.build_id = "malformed\nbuild-id".to_string();
+        manifest.signature = hex::encode(trusted.sign(&manifest.signing_payload()).to_bytes());
+        let (result, component_hits) =
+            manifest_preflight_result(&trusted, manifest, component).await;
+        assert!(matches!(
+            result,
+            Err(BehaviorTransportError::Bootstrap(BootstrapError::Update(
+                UpdateError::InvalidBuildId
+            )))
+        ));
+        assert_eq!(component_hits, 0);
     }
 
     fn behavior_fixture(name: &'static str) -> Vec<u8> {

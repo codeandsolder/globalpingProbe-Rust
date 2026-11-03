@@ -10,6 +10,7 @@ pub const SUPPORTED_ABI_MAJOR: u16 = 6;
 pub const SUPPORTED_ABI_MINOR: u16 = 0;
 pub const MAX_COMPONENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+pub const MAX_BUILD_ID_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -56,6 +57,7 @@ pub enum UpdateError {
     InvalidDigest,
     DigestMismatch,
     InvalidSignature,
+    InvalidBuildId,
     SignatureMismatch,
     RollbackSequence,
     UnsupportedAbi,
@@ -72,6 +74,7 @@ impl fmt::Display for UpdateError {
             Self::InvalidDigest => "manifest SHA-256 is malformed",
             Self::DigestMismatch => "behavior component SHA-256 does not match its manifest",
             Self::InvalidSignature => "manifest Ed25519 signature is malformed",
+            Self::InvalidBuildId => "manifest build ID is malformed",
             Self::SignatureMismatch => "manifest Ed25519 signature verification failed",
             Self::RollbackSequence => "update sequence is not newer than the accepted sequence",
             Self::UnsupportedAbi => "behavior ABI is not supported by this supervisor",
@@ -90,10 +93,21 @@ pub struct VerifiedBehavior {
     pub component: Arc<[u8]>,
 }
 
+/// Return whether a manifest build ID is safe for the canonical signed payload and operator logs.
+#[must_use]
+pub fn is_valid_build_id(build_id: &str) -> bool {
+    !build_id.is_empty()
+        && build_id.len() <= MAX_BUILD_ID_BYTES
+        && build_id.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 fn validate_manifest_metadata(
     manifest: &BehaviorManifest,
     supervisor_version: &Version,
 ) -> Result<[u8; 32], UpdateError> {
+    if !is_valid_build_id(&manifest.build_id) {
+        return Err(UpdateError::InvalidBuildId);
+    }
     if manifest.size > MAX_COMPONENT_BYTES as u64 {
         return Err(UpdateError::ComponentTooLarge);
     }
@@ -291,6 +305,25 @@ mod tests {
             verify_manifest(&manifest, &trusted.verifying_key(), &Version::new(0, 48, 0),),
             Err(UpdateError::SignatureMismatch)
         );
+    }
+
+    #[test]
+    fn rejects_malformed_build_ids_before_signature_acceptance() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let bytes = b"component-v2";
+        for build_id in [
+            String::new(),
+            "contains\nnewline".to_string(),
+            "x".repeat(MAX_BUILD_ID_BYTES + 1),
+        ] {
+            let mut manifest = signed_candidate(2, bytes, &key);
+            manifest.build_id = build_id;
+            manifest.signature = hex::encode(key.sign(&manifest.signing_payload()).to_bytes());
+            assert_eq!(
+                verify_manifest(&manifest, &key.verifying_key(), &Version::new(0, 48, 0)),
+                Err(UpdateError::InvalidBuildId)
+            );
+        }
     }
 
     #[test]

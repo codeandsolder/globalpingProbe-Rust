@@ -261,7 +261,7 @@ async fn run_dig_inner(
                 }
                 DnsProgress::Emit(output) => {
                     if let Some(tx) = progress {
-                        tx.send(json!({ "rawOutput": output })).ok();
+                        tx.send(json!({ "rawOutput": output })).await.ok();
                     }
                 }
                 DnsProgress::Ignore => {}

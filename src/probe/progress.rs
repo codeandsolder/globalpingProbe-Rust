@@ -127,7 +127,7 @@ impl ProgressEmitter {
     /// Drain partial progress until the producer closes. The first update is sent
     /// immediately; later updates are coalesced for 500 ms. Pending progress is
     /// discarded when the producer closes because the final result supersedes it.
-    pub async fn forward(mut self, mut rx: mpsc::UnboundedReceiver<ProgressUpdate>) {
+    pub async fn forward(mut self, mut rx: mpsc::Receiver<ProgressUpdate>) {
         let mut first = true;
         let mut deadline: Option<Instant> = None;
         loop {

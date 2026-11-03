@@ -345,7 +345,7 @@ impl MtrEnrichment {
         self.tasks.spawn(async move {
             broker.lookup(address, budget).await;
             if let Some(tx) = progress {
-                queue_mtr_progress(&tx, raw, broker.cache.clone());
+                queue_mtr_progress(&tx, raw, broker.cache.clone()).await;
             }
         });
     }
@@ -376,7 +376,7 @@ pub(crate) fn shape_mtr_output(
     )
 }
 
-fn queue_mtr_progress(tx: &ProgressTx, raw: Arc<RwLock<String>>, cache: EnrichmentCache) {
+async fn queue_mtr_progress(tx: &ProgressTx, raw: Arc<RwLock<String>>, cache: EnrichmentCache) {
     tx.send_lazy(move || {
         let raw = raw
             .read()
@@ -384,6 +384,7 @@ fn queue_mtr_progress(tx: &ProgressTx, raw: Arc<RwLock<String>>, cache: Enrichme
             .clone();
         render_mtr_progress(&raw, &cache)
     })
+    .await
     .ok();
 }
 
@@ -492,7 +493,8 @@ async fn run_native_mtr_inner(
                 );
             }
             if let (Some(tx), Some(enrichment)) = (progress, enrichment.as_deref()) {
-                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.broker.cache.clone());
+                queue_mtr_progress(tx, Arc::clone(&raw_stdout), enrichment.broker.cache.clone())
+                    .await;
             }
         }
         child.wait().await

@@ -7,14 +7,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail, ensure};
 use ed25519_dalek::{Signer as _, SigningKey};
 use globalping_probe::supervisor::update::{
-    BehaviorManifest, MAX_COMPONENT_BYTES, MAX_MANIFEST_BYTES, SUPPORTED_ABI_MAJOR,
-    SUPPORTED_ABI_MINOR, verify_artifact,
+    BehaviorManifest, MAX_BUILD_ID_BYTES, MAX_COMPONENT_BYTES, MAX_MANIFEST_BYTES,
+    SUPPORTED_ABI_MAJOR, SUPPORTED_ABI_MINOR, is_valid_build_id, verify_artifact,
 };
 use semver::Version;
 use sha2::{Digest as _, Sha256};
 
 const MAX_SIGNING_KEY_INPUT_BYTES: usize = 1024;
-const MAX_BUILD_ID_BYTES: usize = 128;
 const MANIFEST_NAME: &str = "manifest.json";
 const COMPONENT_NAME: &str = "component.wasm";
 
@@ -161,7 +160,7 @@ fn validate_build_id(build_id: &str) -> Result<()> {
         "--build-id must be at most {MAX_BUILD_ID_BYTES} bytes"
     );
     ensure!(
-        build_id.bytes().all(|byte| byte.is_ascii_graphic()),
+        is_valid_build_id(build_id),
         "--build-id must contain only printable non-whitespace ASCII"
     );
     Ok(())

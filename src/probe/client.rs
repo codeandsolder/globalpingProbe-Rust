@@ -745,7 +745,7 @@ pub async fn dispatch(
     let mid = req.measurement_id.clone();
     let tid = req.test_id.clone();
 
-    let current_status = status_manager.lock().await.get_status().to_string();
+    let current_status = status_manager.lock().await.status().to_string();
     if current_status != "ready" {
         warn!("Measurement was sent to probe with {current_status} status.");
         return;
@@ -901,7 +901,7 @@ async fn run_ping_status_cycle(
     let current_status = {
         let mut mgr = status.lock().await;
         mgr.ping_test_failed = Some(!ipv4 && !ipv6);
-        mgr.get_status().to_string()
+        mgr.status().to_string()
     };
     client
         .emit("probe:isIPv4Supported:update", json!(ipv4))
@@ -951,7 +951,7 @@ async fn run_icmp_tcp_status_cycle(status: &Arc<Mutex<StatusManager>>, client: &
         mgr.icmp_tcp_test = test;
         mgr.icmp_tcp_test_failed = failed;
         mgr.recheck_disconnect_status();
-        mgr.get_status().to_string()
+        mgr.status().to_string()
     };
     client
         .emit("probe:status:update", json!(current_status))
@@ -1017,11 +1017,11 @@ impl ConnectionHandlers {
 }
 
 async fn handle_open(state: ConnectionHandlers, client: Client) {
-    if state.already_connected.swap(true, Ordering::SeqCst) {
+    if state.already_connected.swap(true, Ordering::Relaxed) {
         state.signal.signal(ConnectOutcome::Transient).await;
         return;
     }
-    let status = state.status_manager.lock().await.get_status().to_string();
+    let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
     client
         .emit("probe:dns:update", json!(get_dns_servers()))
@@ -1037,7 +1037,7 @@ async fn handle_close(state: ConnectionHandlers, payload: Payload, client: Clien
         let status = {
             let mut manager = state.status_manager.lock().await;
             manager.report_disconnect();
-            manager.get_status().to_string()
+            manager.status().to_string()
         };
         client.emit("probe:status:update", json!(status)).await.ok();
     }
@@ -1209,7 +1209,7 @@ async fn handle_proxy(state: ConnectionHandlers, payload: Payload, client: Clien
         manager.icmp_tcp_test = confirmation;
     }
 
-    let status = state.status_manager.lock().await.get_status().to_string();
+    let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
 }
 

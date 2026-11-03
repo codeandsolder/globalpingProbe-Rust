@@ -9,9 +9,10 @@ use std::net::IpAddr;
 use serde_json::Value;
 
 use crate::util::progress_buffer::BufferMode;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, error::SendError};
+use tokio::sync::mpsc::{Receiver, Sender, error::SendError};
 
 pub(crate) const RAW_EXECUTION_EVENT_CAPACITY: usize = 32;
+pub(crate) const PROGRESS_EVENT_CAPACITY: usize = 16;
 
 #[derive(Debug)]
 pub(crate) enum RawExecutionEvent {
@@ -95,12 +96,12 @@ impl ProgressUpdate {
 /// Neutral progress sink. The behavior host supplies a mode per event; native
 /// commands are given a fixed-mode `ProgressTx` only when the native path runs.
 #[derive(Clone)]
-pub(crate) struct ProgressSink(UnboundedSender<ProgressUpdate>);
+pub(crate) struct ProgressSink(Sender<ProgressUpdate>);
 
 impl ProgressSink {
     #[must_use]
-    pub(crate) fn channel() -> (Self, UnboundedReceiver<ProgressUpdate>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    pub(crate) fn channel() -> (Self, Receiver<ProgressUpdate>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(PROGRESS_EVENT_CAPACITY);
         (Self(tx), rx)
     }
 
@@ -116,25 +117,25 @@ impl ProgressSink {
     ///
     /// # Errors
     /// Returns an error if the progress receiver has already been dropped.
-    pub(crate) fn send(
+    pub(crate) async fn send(
         &self,
         value: Value,
         mode: BufferMode,
     ) -> Result<(), SendError<ProgressUpdate>> {
-        self.0.send(ProgressUpdate::Value { value, mode })
+        self.0.send(ProgressUpdate::Value { value, mode }).await
     }
 }
 
 /// Fixed-mode progress sender used by native command implementations.
 #[derive(Clone)]
 pub struct ProgressTx {
-    tx: UnboundedSender<ProgressUpdate>,
+    tx: Sender<ProgressUpdate>,
     mode: BufferMode,
 }
 
 impl ProgressTx {
     #[must_use]
-    pub fn channel(mode: BufferMode) -> (Self, UnboundedReceiver<ProgressUpdate>) {
+    pub fn channel(mode: BufferMode) -> (Self, Receiver<ProgressUpdate>) {
         let (sink, rx) = ProgressSink::channel();
         (sink.fixed(mode), rx)
     }
@@ -143,24 +144,28 @@ impl ProgressTx {
     ///
     /// # Errors
     /// Returns an error if the progress receiver has already been dropped.
-    pub fn send(&self, value: Value) -> Result<(), SendError<ProgressUpdate>> {
-        self.tx.send(ProgressUpdate::Value {
-            value,
-            mode: self.mode,
-        })
+    pub async fn send(&self, value: Value) -> Result<(), SendError<ProgressUpdate>> {
+        self.tx
+            .send(ProgressUpdate::Value {
+                value,
+                mode: self.mode,
+            })
+            .await
     }
 
     /// Queue a progress update that is rendered only when the coalescer emits.
     ///
     /// # Errors
     /// Returns an error if the progress receiver has already been dropped.
-    pub fn send_lazy<F>(&self, render: F) -> Result<(), SendError<ProgressUpdate>>
+    pub async fn send_lazy<F>(&self, render: F) -> Result<(), SendError<ProgressUpdate>>
     where
         F: FnOnce() -> Value + Send + 'static,
     {
-        self.tx.send(ProgressUpdate::Lazy {
-            render: Box::new(render),
-            mode: self.mode,
-        })
+        self.tx
+            .send(ProgressUpdate::Lazy {
+                render: Box::new(render),
+                mode: self.mode,
+            })
+            .await
     }
 }

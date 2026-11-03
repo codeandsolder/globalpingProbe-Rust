@@ -546,12 +546,14 @@ async fn emit_http_progress(
             "rawBody": chunk,
             "rawOutput": format!("{prefix}{chunk}"),
         }))
+        .await
         .ok();
     } else {
         tx.send(json!({
             "rawBody": chunk,
             "rawOutput": chunk,
         }))
+        .await
         .ok();
     }
 }

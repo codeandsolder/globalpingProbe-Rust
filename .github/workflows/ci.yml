@@ -21,7 +21,7 @@ env:
 jobs:
   rust-skills2-strict:
     name: rust-skills2 strict nightly gate
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@cc82bd6c31d8f9e5e6e2a3cc9d2f00663bd57e15 # main
     with:
       cargo-args: --locked --workspace --exclude globalping-behavior --all-targets
       allow-test-panics: true
@@ -36,6 +36,8 @@ jobs:
         run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
       - name: Install WASIp2 target
         run: rustup target add wasm32-wasip2 --toolchain 1.99.0
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Toolchain versions
         run: |
           rustc +1.99.0 --version
