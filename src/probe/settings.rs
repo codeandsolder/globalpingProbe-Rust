@@ -78,10 +78,6 @@ impl ProbeSettingsStore {
     ///
     /// Unknown keys are intentionally preserved for forward compatibility.
     /// Persistence failures do not roll back the in-memory update, matching upstream.
-    #[expect(
-        clippy::significant_drop_tightening,
-        reason = "the write mutex intentionally serializes persistence and acknowledgements"
-    )]
     pub async fn update(&self, update: &Value) -> bool {
         let Value::Object(update) = update else {
             error!(target: "probe-settings", "Invalid probe settings received: expected an object.");

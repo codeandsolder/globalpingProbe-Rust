@@ -1,7 +1,7 @@
 use crate::util::progress_buffer::BufferMode;
 
 use super::{
-    BehaviorRuntime, CompiledBehavior, Component, Future, HasSelf, JOB_FUEL, Linker, ProbeBehavior,
+    BehaviorRuntime, CompiledBehavior, Component, HasSelf, JOB_FUEL, Linker, ProbeBehavior,
     RuntimeError, Store, StoreLimits, exports, wit_host,
 };
 
@@ -1226,37 +1226,35 @@ impl wit_host::Host for ProductionHost {
         Ok(asn)
     }
 
-    fn emit_progress(
+    async fn emit_progress(
         &mut self,
         token: wit_host::CapabilityToken,
         result_json: String,
         mode: wit_host::ProgressMode,
-    ) -> impl Future<Output = Result<(), wit_host::HostError>> + Send {
-        async move {
-            self.check_token(&token)?;
-            self.lease
-                .authorize_progress(&result_json, std::time::Instant::now())
-                .map_err(policy_error)?;
-            let value: serde_json::Value = serde_json::from_str(&result_json).map_err(|error| {
-                host_error(wit_host::HostErrorCode::InvalidRequest, error.to_string())
-            })?;
-            let mode = buffer_mode(mode);
-            if self.progress_mode.is_some_and(|current| current != mode) {
-                return Err(host_error(
-                    wit_host::HostErrorCode::InvalidRequest,
-                    "behavior progress mode changed during one measurement",
-                ));
-            }
-            self.progress_mode = Some(mode);
-            if self.oracle.as_ref().is_some_and(native_execution_pending) {
-                self.progress_during_native_execution = true;
-            }
-            if let Some(tx) = &self.behavior_progress_sink {
-                tx.send(value.clone(), mode).await.ok();
-            }
-            self.progress.push((value, mode));
-            Ok(())
+    ) -> Result<(), wit_host::HostError> {
+        self.check_token(&token)?;
+        self.lease
+            .authorize_progress(&result_json, std::time::Instant::now())
+            .map_err(policy_error)?;
+        let value: serde_json::Value = serde_json::from_str(&result_json).map_err(|error| {
+            host_error(wit_host::HostErrorCode::InvalidRequest, error.to_string())
+        })?;
+        let mode = buffer_mode(mode);
+        if self.progress_mode.is_some_and(|current| current != mode) {
+            return Err(host_error(
+                wit_host::HostErrorCode::InvalidRequest,
+                "behavior progress mode changed during one measurement",
+            ));
         }
+        self.progress_mode = Some(mode);
+        if self.oracle.as_ref().is_some_and(native_execution_pending) {
+            self.progress_during_native_execution = true;
+        }
+        if let Some(tx) = &self.behavior_progress_sink {
+            tx.send(value.clone(), mode).await.ok();
+        }
+        self.progress.push((value, mode));
+        Ok(())
     }
 }
 
