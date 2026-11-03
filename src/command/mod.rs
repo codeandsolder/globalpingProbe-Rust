@@ -169,3 +169,35 @@ impl ProgressTx {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::task::Poll;
+
+    use futures::poll;
+    use serde_json::json;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn progress_queue_applies_backpressure_at_capacity() {
+        let (tx, mut rx) = ProgressTx::channel(BufferMode::Append);
+        for sequence in 0..PROGRESS_EVENT_CAPACITY {
+            tx.send(json!({ "sequence": sequence }))
+                .await
+                .unwrap_or_else(|error| panic!("failed to fill progress queue: {error}"));
+        }
+
+        let mut blocked = Box::pin(tx.send(json!({ "sequence": PROGRESS_EVENT_CAPACITY })));
+        assert!(matches!(poll!(blocked.as_mut()), Poll::Pending));
+
+        let first = rx
+            .recv()
+            .await
+            .unwrap_or_else(|| panic!("progress queue closed while full"))
+            .resolve();
+        assert_eq!(first["sequence"], 0);
+
+        assert!(matches!(poll!(blocked.as_mut()), Poll::Ready(Ok(()))));
+    }
+}
