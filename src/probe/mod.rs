@@ -1,9 +1,12 @@
+pub mod adoption;
 pub mod alt_ips;
 pub mod client;
 pub mod dns_servers;
-pub mod limiter;
+pub mod jobs;
+pub mod lifecycle;
 pub mod progress;
 pub mod reconnect;
+pub mod settings;
 pub mod stats;
 pub mod sysinfo;
 pub mod uuid;

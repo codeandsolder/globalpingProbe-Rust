@@ -212,6 +212,34 @@ mod live {
     }
 
     #[tokio::test]
+    async fn live_udp_ipv6_cloudflare() {
+        let r = run_measurement("2606:4700:4700::1111", "UDP", 6)
+            .await
+            .expect("IPv6 mtr failed to spawn");
+
+        assert_eq!(r.status, MtrStatus::Finished, "raw:\n{}", r.raw_output);
+        assert!(r.hops.iter().any(|hop| {
+            hop.resolved_address
+                .as_deref()
+                .is_some_and(|address| address.contains(':'))
+        }));
+        assert!(
+            r.hops
+                .iter()
+                .filter(|hop| hop.resolved_address.is_some())
+                .skip(1)
+                .any(|hop| !hop.asn.is_empty()),
+            "expected at least one IPv6 hop with Team Cymru ASN enrichment; raw:\n{}",
+            r.raw_output
+        );
+        println!(
+            "MTR IPv6: {} hops; target host {:?}",
+            r.hops.len(),
+            r.resolved_hostname
+        );
+    }
+
+    #[tokio::test]
     async fn live_icmp_ipv4_cloudflare() {
         let r = run_measurement("1.1.1.1", "ICMP", 4)
             .await
@@ -234,13 +262,12 @@ mod live {
 
     #[tokio::test]
     async fn live_private_ip_rejected() {
-        let result = run_measurement("10.0.0.1", "UDP", 4).await;
-        assert!(
-            result.is_err(),
-            "private IP should be rejected before spawning"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("Private IP"), "err: {msg}");
+        let result = run_measurement("10.0.0.1", "UDP", 4)
+            .await
+            .expect("private IP should produce a structured failure");
+        assert_eq!(result.status, MtrStatus::Failed);
+        assert_eq!(result.failure_source.as_deref(), Some("target"));
+        assert_eq!(result.raw_output, "Private IP ranges are not allowed.");
     }
 
     #[tokio::test]

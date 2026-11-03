@@ -40,7 +40,8 @@ pub async fn tcp_ping_single(addr: &str, port: u16, timeout_ms: u64) -> TcpPingP
     }
 }
 
-/// Run `packets` TCP connect probes sequentially with `interval_ms` between them.
+/// Run TCP probes at fixed interval offsets under one shared deadline.
+/// This mirrors the official probe: a slow connect does not delay later probe starts.
 pub async fn tcp_ping(
     addr: &str,
     port: u16,
@@ -48,13 +49,22 @@ pub async fn tcp_ping(
     timeout_ms: u64,
     interval_ms: u64,
 ) -> TcpPingStats {
-    let mut probes = Vec::with_capacity(packets as usize);
-    for i in 0..packets {
-        if i > 0 {
-            sleep(Duration::from_millis(interval_ms)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let probes = futures::future::join_all((0..packets).map(|index| async move {
+        if index > 0 {
+            sleep(Duration::from_millis(u64::from(index) * interval_ms)).await;
         }
-        probes.push(tcp_ping_single(addr, port, timeout_ms).await);
-    }
+        let remaining_ms = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        if remaining_ms == 0 {
+            return TcpPingProbe { rtt_ms: None };
+        }
+        tcp_ping_single(addr, port, remaining_ms).await
+    }))
+    .await;
     compute_tcp_stats(&probes, packets)
 }
 

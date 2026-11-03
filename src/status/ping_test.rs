@@ -5,10 +5,10 @@ use tracing::warn;
 
 use crate::command::ping::parse::parse as parse_ping;
 
-const PACKETS: u8 = 3;
+const PACKETS: u8 = 6;
 const TRIALS: usize = 3;
 const REQUIRED_PASSES: usize = 2;
-const PING_TIMEOUT_SECS: u64 = 15;
+const PING_TIMEOUT_SECS: u64 = 12;
 
 pub struct PingTest {
     pub failed: bool,
@@ -35,7 +35,7 @@ impl PingTest {
         );
         self.failed = !ipv4_ok && !ipv6_ok;
         if self.failed {
-            warn!(target: "status-manager", "Both ping tests failed due to bad internet connection. Retrying in 10 minutes. Probe temporarily disconnected.");
+            warn!(target: "status:ping", "Both ping tests failed due to bad internet connection. Retrying in 10 minutes. Probe temporarily disconnected.");
         }
         (ipv4_ok, ipv6_ok)
     }
@@ -71,11 +71,11 @@ async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
         if let TrialOutcome::Fail { loss, raw } = outcome {
             match loss {
                 Some(l) if *l > 0.0 => warn!(
-                    target: "status-manager",
+                    target: "status:ping",
                     "IPv{ip_version} ping test unsuccessful for {target}: {l}% packet loss{pass_text}."
                 ),
                 _ => warn!(
-                    target: "status-manager",
+                    target: "status:ping",
                     "IPv{ip_version} ping test unsuccessful: {raw}{pass_text}."
                 ),
             }
@@ -84,7 +84,7 @@ async fn run_trials_for_version(target: &str, ip_version: u8) -> bool {
 
     if !meets_threshold {
         warn!(
-            target: "status-manager",
+            target: "status:ping",
             "IPv{ip_version} ping tests failed. Retrying in 10 minutes. Probe marked as not supporting IPv{ip_version}."
         );
     }
@@ -100,12 +100,14 @@ async fn ping_once(target: &str, ip_version: u8) -> TrialOutcome {
         Command::new("ping")
             .args([
                 flag.as_str(),
+                "-O",
+                "-n",
                 "-c",
                 &PACKETS.to_string(),
                 "-i",
-                "1",
-                "-w",
-                "10",
+                "0.5",
+                "-W",
+                "5",
                 target,
             ])
             .output(),
