@@ -1,6 +1,9 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": [
+    "config:recommended",
+    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+  ],
   "dependencyDashboard": true,
   "minimumReleaseAge": "3 days",
   "minimumReleaseAgeBehaviour": "timestamp-required",
@@ -12,15 +15,25 @@
   "rebaseWhen": "conflicted",
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": ["before 3am"],
+    "schedule": [
+      "before 3am"
+    ],
     "automerge": true,
     "automergeType": "pr"
   },
   "packageRules": [
     {
       "description": "Group ordinary compatible stable Rust dependency updates after CI",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["minor", "patch", "pin", "pinDigest", "digest"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "pinDigest",
+        "digest"
+      ],
       "matchCurrentVersion": "!/^0/",
       "groupName": "routine stable Rust dependencies",
       "automerge": true,
@@ -28,28 +41,42 @@
     },
     {
       "description": "Cargo lockfile maintenance is age-gated by repository CI",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["lockFileMaintenance"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "lockFileMaintenance"
+      ],
       "minimumReleaseAge": null,
       "automerge": true,
       "automergeType": "pr"
     },
     {
       "description": "Potentially breaking pre-1.0 updates are reviewed individually",
-      "matchManagers": ["cargo"],
+      "matchManagers": [
+        "cargo"
+      ],
       "matchCurrentVersion": "/^0\\./",
       "automerge": false
     },
     {
       "description": "Major Rust dependency updates are reviewed individually",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["major"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
       "automerge": false
     },
     {
       "description": "Package replacements stay open for review",
-      "matchManagers": ["cargo"],
-      "matchUpdateTypes": ["replacement"],
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "replacement"
+      ],
       "minimumReleaseAge": null,
       "automerge": false
     }
