@@ -1,17 +1,10 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended",
-    "github>codeandsolder/ci-workflows:renovate-ci-trust-root"
+    "github>codeandsolder/ci-workflows:renovate-fleet"
   ],
-  "dependencyDashboard": true,
-  "minimumReleaseAge": "3 days",
-  "minimumReleaseAgeBehaviour": "timestamp-required",
-  "internalChecksFilter": "strict",
   "separateMajorMinor": false,
   "separateMultipleMajor": false,
-  "prConcurrentLimit": 6,
-  "prHourlyLimit": 3,
   "rebaseWhen": "conflicted",
   "lockFileMaintenance": {
     "enabled": true,
@@ -23,23 +16,6 @@
   },
   "packageRules": [
     {
-      "description": "Group ordinary compatible stable Rust dependency updates after CI",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "minor",
-        "patch",
-        "pin",
-        "pinDigest",
-        "digest"
-      ],
-      "matchCurrentVersion": "!/^0/",
-      "groupName": "routine stable Rust dependencies",
-      "automerge": true,
-      "automergeType": "pr"
-    },
-    {
       "description": "Cargo lockfile maintenance is age-gated by repository CI",
       "matchManagers": [
         "cargo"
@@ -50,35 +26,6 @@
       "minimumReleaseAge": null,
       "automerge": true,
       "automergeType": "pr"
-    },
-    {
-      "description": "Potentially breaking pre-1.0 updates are reviewed individually",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchCurrentVersion": "/^0\\./",
-      "automerge": false
-    },
-    {
-      "description": "Major Rust dependency updates are reviewed individually",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "automerge": false
-    },
-    {
-      "description": "Package replacements stay open for review",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "replacement"
-      ],
-      "minimumReleaseAge": null,
-      "automerge": false
     }
   ]
 }
