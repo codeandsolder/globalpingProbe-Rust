@@ -34,7 +34,7 @@ jobs:
       - name: Install Rust 1.99.1
         run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@39f1e45632ec74fa43ef9976962c26f692c22b6e # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@a79d5260eee1f40d6499e04c6f7999effe071831 # main
         with:
           rust-toolchain: "1.99.1"
       - name: Toolchain versions
@@ -55,4 +55,4 @@ jobs:
         run: cargo +1.99.1 doc --locked --no-deps
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@39f1e45632ec74fa43ef9976962c26f692c22b6e # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@a79d5260eee1f40d6499e04c6f7999effe071831 # main
