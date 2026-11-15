@@ -229,9 +229,9 @@ mod tests {
         };
         let args = build_args(&opts);
         assert_eq!(args[0], "-4");
-        assert!(args.contains(&"-O".to_string()));
-        assert!(args.contains(&"-c".to_string()));
-        assert!(args.contains(&"3".to_string()));
+        assert!(args.iter().any(|arg| arg == "-O"));
+        assert!(args.iter().any(|arg| arg == "-c"));
+        assert!(args.iter().any(|arg| arg == "3"));
         assert_eq!(args.last().unwrap(), "1.1.1.1");
     }
 
@@ -247,8 +247,8 @@ mod tests {
         };
         let args = build_args(&opts);
         assert_eq!(args[0], "-6");
-        assert!(args.contains(&"-c".to_string()));
-        assert!(args.contains(&"5".to_string()));
+        assert!(args.iter().any(|arg| arg == "-c"));
+        assert!(args.iter().any(|arg| arg == "5"));
         assert_eq!(args.last().unwrap(), "2606:4700:4700::1111");
     }
 
