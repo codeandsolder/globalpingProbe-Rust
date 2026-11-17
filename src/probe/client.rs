@@ -368,7 +368,7 @@ pub async fn run_status_loop(
 
         // Refresh DNS servers in case resolvers changed since last connect.
         client
-            .emit("probe:dns:update", json!(get_dns_servers()))
+            .emit("probe:dns:update", json!(get_dns_servers().await))
             .await
             .ok();
 
@@ -407,7 +407,7 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
     let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
     debug!("Connection to API established.");
@@ -478,7 +478,7 @@ async fn handle_location(payload: Payload, client: Client) {
         );
     }
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
 }
