@@ -268,9 +268,9 @@ fn live_disk_info_nonzero() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn live_dns_servers_readable() {
-    let servers = globalping_probe::probe::dns_servers::get_dns_servers();
+#[tokio::test]
+async fn live_dns_servers_readable() {
+    let servers = globalping_probe::probe::dns_servers::get_dns_servers().await;
     println!("DNS servers: {servers:?}");
     // No assertion — empty is valid in minimal containers
 }
