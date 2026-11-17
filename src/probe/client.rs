@@ -1384,7 +1384,16 @@ async fn connect_once(
         cfg.is_hardware.is_some(),
         behavior_controller,
     );
-    let builder = ClientBuilder::new(connection_url(cfg))
+    // Collect synchronous disk and memory telemetry outside the Tokio worker.
+    let config_for_url = cfg.clone();
+    let url = match tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await {
+        Ok(url) => url,
+        Err(error) => {
+            error!(target: "api:error", "Failed to collect handshake metadata: {error}");
+            return ConnectOutcome::Transient;
+        }
+    };
+    let builder = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
     let socket = match register_socket_handlers(builder, &state).connect().await {
