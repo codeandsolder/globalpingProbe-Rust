@@ -916,7 +916,7 @@ async fn run_ping_status_cycle(
         .await
         .ok();
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
 }
@@ -1024,7 +1024,7 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
     let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
     debug!(target: "api-connection", "Connection to API established.");
@@ -1095,7 +1095,7 @@ async fn handle_location(payload: Payload, client: Client) {
         );
     }
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
 }
