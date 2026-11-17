@@ -670,7 +670,17 @@ async fn connect_once(
 ) -> (ConnectOutcome, bool) {
     let state = ConnectionHandlers::new(status_manager);
     let connected_reader = Arc::clone(&state.already_connected);
-    let builder = ClientBuilder::new(connection_url(cfg))
+    // Disk telemetry invokes `df`; keep process spawning and filesystem I/O
+    // off Tokio's worker threads during reconnects.
+    let config_for_url = cfg.clone();
+    let url = match tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await {
+        Ok(url) => url,
+        Err(error) => {
+            error!(target: "api:error", "Failed to collect handshake metadata: {error}");
+            return (ConnectOutcome::Transient, false);
+        }
+    };
+    let builder = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
     let socket = match register_socket_handlers(builder, &state).connect().await {
