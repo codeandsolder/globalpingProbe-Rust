@@ -890,6 +890,14 @@ pub async fn run_stats_loop(jobs: ActiveJobs, client: Client) {
 
 // ── Status loop ───────────────────────────────────────────────────────────────
 
+/// Report the current nameserver configuration without blocking the executor.
+async fn emit_dns_update(client: &Client) {
+    client
+        .emit("probe:dns:update", json!(get_dns_servers().await))
+        .await
+        .ok();
+}
+
 // Status checks run independently below: connectivity ping every 10 minutes,
 // ICMP/TCP VPN detection every hour, matching the official probe.
 async fn run_ping_status_cycle(
@@ -915,10 +923,7 @@ async fn run_ping_status_cycle(
         .emit("probe:status:update", json!(current_status))
         .await
         .ok();
-    client
-        .emit("probe:dns:update", json!(get_dns_servers().await))
-        .await
-        .ok();
+    emit_dns_update(client).await;
 }
 
 async fn run_icmp_tcp_status_cycle(status: &Arc<Mutex<StatusManager>>, client: &Client) {
@@ -1023,10 +1028,7 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
     }
     let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
-    client
-        .emit("probe:dns:update", json!(get_dns_servers().await))
-        .await
-        .ok();
+    emit_dns_update(client).await;
     debug!(target: "api-connection", "Connection to API established.");
 }
 
@@ -1094,10 +1096,7 @@ async fn handle_location(payload: Payload, client: Client) {
             number("latitude"), number("longitude"),
         );
     }
-    client
-        .emit("probe:dns:update", json!(get_dns_servers().await))
-        .await
-        .ok();
+    emit_dns_update(client).await;
 }
 
 async fn handle_adoption(state: ConnectionHandlers, payload: Payload, client: Client) {
