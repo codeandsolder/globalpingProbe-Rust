@@ -115,15 +115,20 @@ pub fn build_args(opts: &MtrOptions) -> Vec<String> {
 
 pub struct MtrCommand;
 
+async fn run_mtr_serialized(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
+    super::run_serialized(options, progress, |options: MtrOptions, tx| async move {
+        run_mtr(&options, tx).await
+    })
+    .await
+}
+
 impl MtrCommand {
     /// Execute an MTR command from a socket payload.
     ///
     /// # Errors
     /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
-        let opts: MtrOptions = serde_json::from_value(options)?;
-        let result = run_mtr(&opts, None).await?;
-        Ok(serde_json::to_value(result)?)
+        run_mtr_serialized(options, None).await
     }
 
     /// Execute MTR while streaming overwrite snapshots.
@@ -131,9 +136,7 @@ impl MtrCommand {
     /// # Errors
     /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
     pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
-        let opts: MtrOptions = serde_json::from_value(options)?;
-        let result = run_mtr(&opts, Some(tx)).await?;
-        Ok(serde_json::to_value(result)?)
+        run_mtr_serialized(options, Some(tx)).await
     }
 }
 
@@ -431,40 +434,11 @@ async fn run_native_mtr_inner(
     deadline: Option<&MeasurementDeadline>,
     raw_events: Option<&RawExecutionTx>,
 ) -> Result<NativeMtrOutput> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
-
-    let mut child = Command::new("mtr")
-        .args(args)
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("mtr stdout pipe unavailable"))?;
-    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("mtr stderr pipe unavailable"))?;
-    let raw_stderr = raw_events.cloned();
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(tx) = &raw_stderr {
-                        tx.stderr_chunk(&chunk[..read]).await;
-                    }
-                }
-            }
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
-    });
+    let super::StreamedCommand {
+        mut child,
+        stdout: mut stdout_lines,
+        stderr_task,
+    } = super::spawn_streamed_command("mtr", args, raw_events)?;
     let raw_stdout = Arc::new(RwLock::new(String::new()));
     let completed = timeout(process_timeout, async {
         while let Some(line) = stdout_lines.next_line().await? {

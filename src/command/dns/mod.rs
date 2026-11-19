@@ -2,11 +2,9 @@ pub mod parse;
 
 use super::{ProgressTx, RawExecutionTx};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::util::measurement_timeout::process_timeout;
@@ -212,38 +210,11 @@ async fn run_dig_inner(
     progress: Option<&ProgressTx>,
     raw_events: Option<&RawExecutionTx>,
 ) -> Result<NativeDnsOutput> {
-    let mut child = Command::new("dig")
-        .args(build_args(opts))
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("child stdout pipe was unavailable")?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .context("child stderr pipe was unavailable")?;
-    let raw_stderr = raw_events.cloned();
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(tx) = &raw_stderr {
-                        tx.stderr_chunk(&chunk[..read]).await;
-                    }
-                }
-            }
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
-    });
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let super::StreamedCommand {
+        mut child,
+        stdout: mut lines,
+        stderr_task,
+    } = super::spawn_streamed_command("dig", &build_args(opts), raw_events)?;
     let mut raw = String::new();
     let mut private_result = false;
     let completed = timeout(process_timeout(f64::from(opts.timeout)), async {

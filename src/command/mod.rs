@@ -4,12 +4,91 @@ pub mod mtr;
 pub mod ping;
 pub mod traceroute;
 
+use std::future::Future;
 use std::net::IpAddr;
+
+use anyhow::Result;
+use serde::{Serialize, de::DeserializeOwned};
 
 use serde_json::Value;
 
 use crate::util::progress_buffer::BufferMode;
 use tokio::sync::mpsc::{Receiver, Sender, error::SendError};
+
+/// Convert the socket JSON envelope exactly once at the command boundary.
+pub(crate) async fn run_serialized<Options, Output, Run, Fut>(
+    options: Value,
+    progress: Option<ProgressTx>,
+    run: Run,
+) -> Result<Value>
+where
+    Options: DeserializeOwned,
+    Output: Serialize,
+    Run: FnOnce(Options, Option<ProgressTx>) -> Fut,
+    Fut: Future<Output = Result<Output>>,
+{
+    let options = serde_json::from_value(options)?;
+    let result = run(options, progress).await?;
+    Ok(serde_json::to_value(result)?)
+}
+
+/// Running process, line reader, and independently drained stderr task.
+pub(crate) struct StreamedCommand {
+    pub child: tokio::process::Child,
+    pub stdout: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    pub stderr_task: tokio::task::JoinHandle<String>,
+}
+
+/// Spawn a native measurement and stream stdout lines and stderr bytes using
+/// the same bounded raw-event backpressure semantics for all CLI backends.
+///
+/// # Errors
+/// Returns an error if process creation or child pipe setup fails.
+pub(crate) fn spawn_streamed_command(
+    program: &str,
+    args: &[String],
+    raw_events: Option<&RawExecutionTx>,
+) -> Result<StreamedCommand> {
+    use anyhow::Context as _;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
+    let mut child = tokio::process::Command::new(program)
+        .args(args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("child stdout pipe was unavailable")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("child stderr pipe was unavailable")?;
+    let raw_stderr = raw_events.cloned();
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if let Some(tx) = &raw_stderr {
+                        tx.stderr_chunk(&chunk[..read]).await;
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    Ok(StreamedCommand {
+        child,
+        stdout: tokio::io::BufReader::new(stdout).lines(),
+        stderr_task,
+    })
+}
 
 pub(crate) const RAW_EXECUTION_EVENT_CAPACITY: usize = 32;
 pub(crate) const PROGRESS_EVENT_CAPACITY: usize = 16;

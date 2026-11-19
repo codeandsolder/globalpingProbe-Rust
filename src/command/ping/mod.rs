@@ -88,15 +88,20 @@ pub fn build_args(opts: &PingOptions) -> Vec<String> {
 
 pub struct PingCommand;
 
+async fn run_ping_serialized(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
+    super::run_serialized(options, progress, |options: PingOptions, tx| async move {
+        run_ping(&options, tx).await
+    })
+    .await
+}
+
 impl PingCommand {
     /// Execute a ping command from a socket payload.
     ///
     /// # Errors
     /// Returns an error for invalid options, process/IO failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
-        let opts: PingOptions = serde_json::from_value(options)?;
-        let result = run_ping(&opts, None).await?;
-        Ok(serde_json::to_value(result)?)
+        run_ping_serialized(options, None).await
     }
 
     /// Execute a ping command while streaming partial packet results.
@@ -104,9 +109,7 @@ impl PingCommand {
     /// # Errors
     /// Returns an error for invalid options, process/IO failures, or serialization failures.
     pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
-        let opts: PingOptions = serde_json::from_value(options)?;
-        let result = run_ping(&opts, Some(tx)).await?;
-        Ok(serde_json::to_value(result)?)
+        run_ping_serialized(options, Some(tx)).await
     }
 }
 

@@ -5,11 +5,9 @@ use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-use tokio::process::Command;
 use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
@@ -94,21 +92,26 @@ pub fn build_args(opts: &TracerouteOptions) -> Vec<String> {
 
 pub struct TracerouteCommand;
 
+async fn run_traceroute_serialized(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
+    super::run_serialized(
+        options,
+        progress,
+        |options: TracerouteOptions, tx| async move { run_traceroute(&options, tx).await },
+    )
+    .await
+}
+
 impl TracerouteCommand {
     /// # Errors
     /// Returns an error for invalid options, process/IO failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
-        let opts: TracerouteOptions = serde_json::from_value(options)?;
-        let result = run_traceroute(&opts, None).await?;
-        Ok(serde_json::to_value(result)?)
+        run_traceroute_serialized(options, None).await
     }
 
     /// # Errors
     /// Returns an error for invalid options, process/IO failures, or serialization failures.
     pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
-        let opts: TracerouteOptions = serde_json::from_value(options)?;
-        let result = run_traceroute(&opts, Some(tx)).await?;
-        Ok(serde_json::to_value(result)?)
+        run_traceroute_serialized(options, Some(tx)).await
     }
 }
 
@@ -295,38 +298,11 @@ async fn run_native_traceroute_inner(
     progress: Option<&ProgressTx>,
     raw_events: Option<&RawExecutionTx>,
 ) -> Result<NativeTraceOutput> {
-    let mut child = Command::new("traceroute")
-        .args(args)
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("child stdout pipe was unavailable")?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .context("child stderr pipe was unavailable")?;
-    let raw_stderr = raw_events.cloned();
-    let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; 4096];
-        loop {
-            match stderr.read(&mut chunk).await {
-                Ok(0) | Err(_) => break,
-                Ok(read) => {
-                    bytes.extend_from_slice(&chunk[..read]);
-                    if let Some(tx) = &raw_stderr {
-                        tx.stderr_chunk(&chunk[..read]).await;
-                    }
-                }
-            }
-        }
-        String::from_utf8_lossy(&bytes).into_owned()
-    });
-    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let super::StreamedCommand {
+        mut child,
+        stdout: mut lines,
+        stderr_task,
+    } = super::spawn_streamed_command("traceroute", args, raw_events)?;
     let mut raw_lines = Vec::new();
     let completed = timeout(process_timeout, async {
         while let Some(line) = lines.next_line().await? {

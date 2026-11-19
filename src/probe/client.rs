@@ -1028,7 +1028,7 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
     }
     let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
-    emit_dns_update(client).await;
+    emit_dns_update(&client).await;
     debug!(target: "api-connection", "Connection to API established.");
 }
 
@@ -1096,7 +1096,7 @@ async fn handle_location(payload: Payload, client: Client) {
             number("latitude"), number("longitude"),
         );
     }
-    emit_dns_update(client).await;
+    emit_dns_update(&client).await;
 }
 
 async fn handle_adoption(state: ConnectionHandlers, payload: Payload, client: Client) {

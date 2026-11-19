@@ -6,13 +6,6 @@
         reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
     )
 )]
-#![cfg_attr(
-    feature = "pre-completion-final-fixture",
-    expect(
-        unused_imports,
-        reason = "the adversarial fixture intentionally bypasses normal measurement handlers after host.start"
-    )
-)]
 
 //! Updateable Globalping measurement behavior component.
 //!
@@ -166,261 +159,152 @@ mod component {
 
     struct Behavior;
 
+    /// The single measurement dispatch used by production and every post-start
+    /// fault-injection fixture. Fixture features alter the returned result, not
+    /// whether the host executes the authorized measurement.
+    fn parse_measurement(job: &Job) -> Result<MeasurementRequest, BehaviorError> {
+        if job.measurement_json.is_empty() {
+            return Err(BehaviorError::InvalidJob(
+                "measurement request is empty".to_string(),
+            ));
+        }
+        let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
+            .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
+        if measurement.target.is_empty() {
+            return Err(BehaviorError::InvalidJob(
+                "measurement target is empty".to_string(),
+            ));
+        }
+        Ok(measurement)
+    }
+
+    fn execute_measurement(
+        job: &Job,
+        measurement: &MeasurementRequest,
+    ) -> Result<String, BehaviorError> {
+        match job.kind {
+            MeasurementKind::Dns => dns::run(
+                &job.token,
+                measurement.trace,
+                measurement.in_progress_updates,
+            ),
+            MeasurementKind::Ping => ping::run(
+                &job.token,
+                measurement.in_progress_updates,
+                measurement
+                    .protocol
+                    .as_deref()
+                    .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
+            ),
+            MeasurementKind::Traceroute => {
+                traceroute::run(&job.token, measurement.in_progress_updates)
+            }
+            MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
+            MeasurementKind::Http => {
+                let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
+                let method = measurement
+                    .request
+                    .as_ref()
+                    .map_or("HEAD", |request| request.method.as_str());
+                http::run(
+                    &job.token,
+                    protocol,
+                    method,
+                    measurement.in_progress_updates,
+                )
+            }
+        }
+    }
+
     impl Guest for Behavior {
-        #[cfg(not(any(
-            feature = "post-start-fault-fixture",
-            feature = "post-start-divergence-fixture",
-            feature = "post-start-invalid-output-fixture",
-            feature = "pre-completion-final-fixture"
-        )))]
         fn handle(job: Job) -> Result<String, BehaviorError> {
-            if job.measurement_json.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement request is empty".to_string(),
-                ));
-            }
-            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
-                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
-            if measurement.target.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement target is empty".to_string(),
-                ));
+            // This fixture must *not* execute a measurement: it deliberately
+            // attempts finalization immediately after host.start.
+            #[cfg(feature = "pre-completion-final-fixture")]
+            {
+                if job.measurement_json.is_empty() {
+                    return Err(BehaviorError::InvalidJob(
+                        "measurement request is empty".to_string(),
+                    ));
+                }
+                codeandsolder::globalping_behavior::host::start(job.token)
+                    .map_err(|error| BehaviorError::Internal(error.message))?;
+                Ok("{}".to_string())
             }
 
-            match job.kind {
-                MeasurementKind::Dns => dns::run(
-                    &job.token,
-                    measurement.trace,
-                    measurement.in_progress_updates,
-                ),
-                MeasurementKind::Ping => ping::run(
-                    &job.token,
-                    measurement.in_progress_updates,
-                    measurement
-                        .protocol
-                        .as_deref()
-                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
-                ),
-                MeasurementKind::Traceroute => {
-                    traceroute::run(&job.token, measurement.in_progress_updates)
-                }
-                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
-                MeasurementKind::Http => {
-                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
-                    let method = measurement
-                        .request
-                        .as_ref()
-                        .map_or("HEAD", |request| request.method.as_str());
-                    http::run(
-                        &job.token,
-                        protocol,
-                        method,
-                        measurement.in_progress_updates,
-                    )
-                }
-            }
-        }
+            #[cfg(not(feature = "pre-completion-final-fixture"))]
+            {
+                let measurement = parse_measurement(&job)?;
+                let result = execute_measurement(&job, &measurement)?;
 
-        #[cfg(all(
-            feature = "post-start-fault-fixture",
-            not(feature = "post-start-divergence-fixture"),
-            not(feature = "post-start-invalid-output-fixture"),
-            not(feature = "pre-completion-final-fixture")
-        ))]
-        fn handle(job: Job) -> Result<String, BehaviorError> {
-            if job.measurement_json.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement request is empty".to_string(),
-                ));
-            }
-            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
-                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
-            if measurement.target.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement target is empty".to_string(),
-                ));
-            }
-
-            let _ = match job.kind {
-                MeasurementKind::Dns => dns::run(
-                    &job.token,
-                    measurement.trace,
-                    measurement.in_progress_updates,
-                ),
-                MeasurementKind::Ping => ping::run(
-                    &job.token,
-                    measurement.in_progress_updates,
-                    measurement
-                        .protocol
-                        .as_deref()
-                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
-                ),
-                MeasurementKind::Traceroute => {
-                    traceroute::run(&job.token, measurement.in_progress_updates)
+                // Fixture precedence is fixed: invalid output, divergence,
+                // fault, then normal authoritative result. Do not execute
+                // the privileged measurement again for fault injection.
+                #[cfg(feature = "post-start-invalid-output-fixture")]
+                {
+                    let _ = result;
+                    Ok(r#"{"__intentionalInvalidOutput":true}"#.to_string())
                 }
-                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
-                MeasurementKind::Http => {
-                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
-                    let method = measurement
-                        .request
-                        .as_ref()
-                        .map_or("HEAD", |request| request.method.as_str());
-                    http::run(
-                        &job.token,
-                        protocol,
-                        method,
-                        measurement.in_progress_updates,
-                    )
-                }
-            }?;
-            if measurement.in_progress_updates {
-                let payload = serde_json::to_string(&serde_json::json!({
-                    "rawOutput": "__post_start_fault_fixture_progress__"
-                }))
-                .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-                execution::emit_progress(&job.token, &payload, execution::ProgressMode::Diff)?;
-            }
-            Err(BehaviorError::InvalidJob(
-                "intentional post-start health-test fault".to_string(),
-            ))
-        }
 
-        #[cfg(all(
-            feature = "post-start-divergence-fixture",
-            not(feature = "post-start-invalid-output-fixture"),
-            not(feature = "pre-completion-final-fixture")
-        ))]
-        fn handle(job: Job) -> Result<String, BehaviorError> {
-            if job.measurement_json.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement request is empty".to_string(),
-                ));
-            }
-            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
-                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
-            if measurement.target.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement target is empty".to_string(),
-                ));
-            }
-
-            let result = match job.kind {
-                MeasurementKind::Dns => dns::run(
-                    &job.token,
-                    measurement.trace,
-                    measurement.in_progress_updates,
-                ),
-                MeasurementKind::Ping => ping::run(
-                    &job.token,
-                    measurement.in_progress_updates,
-                    measurement
-                        .protocol
-                        .as_deref()
-                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
-                ),
-                MeasurementKind::Traceroute => {
-                    traceroute::run(&job.token, measurement.in_progress_updates)
+                #[cfg(all(
+                    not(feature = "post-start-invalid-output-fixture"),
+                    feature = "post-start-divergence-fixture"
+                ))]
+                {
+                    let mut value: serde_json::Value = serde_json::from_str(&result)
+                        .map_err(|error| BehaviorError::Internal(error.to_string()))?;
+                    let raw_output = value
+                        .get("rawOutput")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("");
+                    let divergent_raw = if raw_output.is_empty() {
+                        "__intentional_divergence__".to_string()
+                    } else {
+                        alloc::format!("{raw_output}\n__intentional_divergence__")
+                    };
+                    let object = value.as_object_mut().ok_or_else(|| {
+                        BehaviorError::Internal("measurement result is not an object".to_string())
+                    })?;
+                    object.insert(
+                        "rawOutput".to_string(),
+                        serde_json::Value::String(divergent_raw),
+                    );
+                    serde_json::to_string(&value)
+                        .map_err(|error| BehaviorError::Internal(error.to_string()))
                 }
-                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
-                MeasurementKind::Http => {
-                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
-                    let method = measurement
-                        .request
-                        .as_ref()
-                        .map_or("HEAD", |request| request.method.as_str());
-                    http::run(
-                        &job.token,
-                        protocol,
-                        method,
-                        measurement.in_progress_updates,
-                    )
-                }
-            }?;
-            let mut value: serde_json::Value = serde_json::from_str(&result)
-                .map_err(|error| BehaviorError::Internal(error.to_string()))?;
-            let raw_output = value
-                .get("rawOutput")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let divergent_raw = if raw_output.is_empty() {
-                "__intentional_divergence__".to_string()
-            } else {
-                alloc::format!("{raw_output}\n__intentional_divergence__")
-            };
-            let object = value.as_object_mut().ok_or_else(|| {
-                BehaviorError::Internal("measurement result is not an object".to_string())
-            })?;
-            object.insert(
-                "rawOutput".to_string(),
-                serde_json::Value::String(divergent_raw),
-            );
-            serde_json::to_string(&value)
-                .map_err(|error| BehaviorError::Internal(error.to_string()))
-        }
 
-        #[cfg(all(
-            feature = "post-start-invalid-output-fixture",
-            not(feature = "pre-completion-final-fixture")
-        ))]
-        fn handle(job: Job) -> Result<String, BehaviorError> {
-            if job.measurement_json.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement request is empty".to_string(),
-                ));
-            }
-            let measurement: MeasurementRequest = serde_json::from_str(&job.measurement_json)
-                .map_err(|error| BehaviorError::InvalidJob(error.to_string()))?;
-            if measurement.target.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement target is empty".to_string(),
-                ));
-            }
-
-            let _real_result = match job.kind {
-                MeasurementKind::Dns => dns::run(
-                    &job.token,
-                    measurement.trace,
-                    measurement.in_progress_updates,
-                ),
-                MeasurementKind::Ping => ping::run(
-                    &job.token,
-                    measurement.in_progress_updates,
-                    measurement
-                        .protocol
-                        .as_deref()
-                        .is_some_and(|protocol| protocol.eq_ignore_ascii_case("TCP")),
-                ),
-                MeasurementKind::Traceroute => {
-                    traceroute::run(&job.token, measurement.in_progress_updates)
+                #[cfg(all(
+                    not(feature = "post-start-invalid-output-fixture"),
+                    not(feature = "post-start-divergence-fixture"),
+                    feature = "post-start-fault-fixture"
+                ))]
+                {
+                    let _ = result;
+                    if measurement.in_progress_updates {
+                        let payload = serde_json::to_string(&serde_json::json!({
+                            "rawOutput": "__post_start_fault_fixture_progress__"
+                        }))
+                        .map_err(|error| BehaviorError::Internal(error.to_string()))?;
+                        execution::emit_progress(
+                            &job.token,
+                            &payload,
+                            execution::ProgressMode::Diff,
+                        )?;
+                    }
+                    Err(BehaviorError::InvalidJob(
+                        "intentional post-start health-test fault".to_string(),
+                    ))
                 }
-                MeasurementKind::Mtr => mtr::run(&job.token, measurement.in_progress_updates),
-                MeasurementKind::Http => {
-                    let protocol = measurement.protocol.as_deref().unwrap_or("HTTPS");
-                    let method = measurement
-                        .request
-                        .as_ref()
-                        .map_or("HEAD", |request| request.method.as_str());
-                    http::run(
-                        &job.token,
-                        protocol,
-                        method,
-                        measurement.in_progress_updates,
-                    )
-                }
-            }?;
-            Ok(r#"{"__intentionalInvalidOutput":true}"#.to_string())
-        }
 
-        #[cfg(feature = "pre-completion-final-fixture")]
-        fn handle(job: Job) -> Result<String, BehaviorError> {
-            if job.measurement_json.is_empty() {
-                return Err(BehaviorError::InvalidJob(
-                    "measurement request is empty".to_string(),
-                ));
+                #[cfg(not(any(
+                    feature = "post-start-invalid-output-fixture",
+                    feature = "post-start-divergence-fixture",
+                    feature = "post-start-fault-fixture"
+                )))]
+                {
+                    Ok(result)
+                }
             }
-            codeandsolder::globalping_behavior::host::start(job.token)
-                .map_err(|error| BehaviorError::Internal(error.message))?;
-            Ok("{}".to_string())
         }
 
         fn self_test() -> Result<(), String> {

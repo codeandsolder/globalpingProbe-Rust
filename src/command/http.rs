@@ -1014,15 +1014,20 @@ async fn run_http(opts: &HttpOptions, progress: Option<ProgressTx>) -> Result<Pa
 
 pub struct HttpCommand;
 
+async fn run_http_serialized(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
+    super::run_serialized(options, progress, |options: HttpOptions, tx| async move {
+        run_http(&options, tx).await
+    })
+    .await
+}
+
 impl HttpCommand {
     /// Execute an HTTP command from a socket payload.
     ///
     /// # Errors
     /// Returns an error for invalid options, DNS/process failures, or serialization failures.
     pub async fn run(&self, options: Value) -> Result<Value> {
-        let opts: HttpOptions = serde_json::from_value(options)?;
-        let result = run_http(&opts, None).await?;
-        Ok(serde_json::to_value(result)?)
+        run_http_serialized(options, None).await
     }
 
     /// Execute an HTTP command while streaming response-body progress.
@@ -1030,9 +1035,7 @@ impl HttpCommand {
     /// # Errors
     /// Returns an error for invalid options, DNS/process failures, or serialization failures.
     pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
-        let opts: HttpOptions = serde_json::from_value(options)?;
-        let result = run_http(&opts, Some(tx)).await?;
-        Ok(serde_json::to_value(result)?)
+        run_http_serialized(options, Some(tx)).await
     }
 }
 
