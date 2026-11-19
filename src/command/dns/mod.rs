@@ -422,13 +422,13 @@ mod tests {
         assert_eq!(args[0], "-t");
         assert_eq!(args[1], "A");
         assert_eq!(args[2], "example.com");
-        assert!(args.contains(&"-p".to_string()));
-        assert!(args.contains(&"53".to_string()));
-        assert!(args.contains(&"-4".to_string()));
-        assert!(args.contains(&"+timeout=5".to_string()));
-        assert!(args.contains(&"+nofail".to_string()));
-        assert!(!args.contains(&"+trace".to_string()));
-        assert!(!args.contains(&"+tcp".to_string()));
+        assert!(args.iter().any(|arg| arg == "-p"));
+        assert!(args.iter().any(|arg| arg == "53"));
+        assert!(args.iter().any(|arg| arg == "-4"));
+        assert!(args.iter().any(|arg| arg == "+timeout=5"));
+        assert!(args.iter().any(|arg| arg == "+nofail"));
+        assert!(!args.iter().any(|arg| arg == "+trace"));
+        assert!(!args.iter().any(|arg| arg == "+tcp"));
     }
 
     #[test]
@@ -443,14 +443,14 @@ mod tests {
     fn build_args_trace_adds_plus_trace() {
         let opts = make_opts("A", true, "UDP");
         let args = build_args(&opts);
-        assert!(args.contains(&"+trace".to_string()));
+        assert!(args.iter().any(|arg| arg == "+trace"));
     }
 
     #[test]
     fn build_args_tcp_protocol_adds_plus_tcp() {
         let opts = make_opts("A", false, "TCP");
         let args = build_args(&opts);
-        assert!(args.contains(&"+tcp".to_string()));
+        assert!(args.iter().any(|arg| arg == "+tcp"));
     }
 
     #[test]
@@ -458,7 +458,7 @@ mod tests {
         let mut opts = make_opts("A", false, "UDP");
         opts.resolver = Some("8.8.8.8".into());
         let args = build_args(&opts);
-        assert!(args.contains(&"@8.8.8.8".to_string()));
+        assert!(args.iter().any(|arg| arg == "@8.8.8.8"));
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
         let mut opts = make_opts("AAAA", false, "UDP");
         opts.ip_version = 6;
         let args = build_args(&opts);
-        assert!(args.contains(&"-6".to_string()));
+        assert!(args.iter().any(|arg| arg == "-6"));
     }
 
     #[test]

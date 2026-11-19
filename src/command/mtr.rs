@@ -917,11 +917,11 @@ x 3 1";
             in_progress_updates: false,
             timeout: 10,
         });
-        assert!(args.contains(&"-4".to_string()));
-        assert!(!args.contains(&"--icmp".to_string()));
-        assert!(args.contains(&"--raw".to_string()));
-        assert!(args.contains(&"-c".to_string()));
-        assert!(args.contains(&"3".to_string()));
+        assert!(args.iter().any(|arg| arg == "-4"));
+        assert!(!args.iter().any(|arg| arg == "--icmp"));
+        assert!(args.iter().any(|arg| arg == "--raw"));
+        assert!(args.iter().any(|arg| arg == "-c"));
+        assert!(args.iter().any(|arg| arg == "3"));
     }
 
     #[test]
@@ -935,9 +935,9 @@ x 3 1";
             in_progress_updates: false,
             timeout: 10,
         });
-        assert!(args.contains(&"--tcp".to_string()));
-        assert!(args.contains(&"-P".to_string()));
-        assert!(args.contains(&"443".to_string()));
+        assert!(args.iter().any(|arg| arg == "--tcp"));
+        assert!(args.iter().any(|arg| arg == "-P"));
+        assert!(args.iter().any(|arg| arg == "443"));
     }
 
     #[test]
@@ -951,8 +951,8 @@ x 3 1";
             in_progress_updates: false,
             timeout: 10,
         });
-        assert!(args.contains(&"-6".to_string()));
-        assert!(args.contains(&"--udp".to_string()));
+        assert!(args.iter().any(|arg| arg == "-6"));
+        assert!(args.iter().any(|arg| arg == "--udp"));
     }
 
     #[test]

@@ -448,31 +448,31 @@ mod tests {
     #[test]
     fn build_args_icmp_ipv4() {
         let args = build_args(&make_opts("ICMP", 4));
-        assert!(args.contains(&"-4".to_string()));
-        assert!(args.contains(&"--icmp".to_string()));
-        assert!(args.contains(&"-m".to_string()));
-        assert!(args.contains(&"20".to_string()));
-        assert!(args.contains(&"-w".to_string()));
-        assert!(args.contains(&"2".to_string()));
-        assert!(args.contains(&"-q".to_string()));
-        assert!(args.contains(&"-N".to_string()));
-        assert!(!args.contains(&"-p".to_string()));
+        assert!(args.iter().any(|arg| arg == "-4"));
+        assert!(args.iter().any(|arg| arg == "--icmp"));
+        assert!(args.iter().any(|arg| arg == "-m"));
+        assert!(args.iter().any(|arg| arg == "20"));
+        assert!(args.iter().any(|arg| arg == "-w"));
+        assert!(args.iter().any(|arg| arg == "2"));
+        assert!(args.iter().any(|arg| arg == "-q"));
+        assert!(args.iter().any(|arg| arg == "-N"));
+        assert!(!args.iter().any(|arg| arg == "-p"));
         assert_eq!(args.last().unwrap(), "1.1.1.1");
     }
 
     #[test]
     fn build_args_tcp_adds_port() {
         let args = build_args(&make_opts("TCP", 4));
-        assert!(args.contains(&"--tcp".to_string()));
-        assert!(args.contains(&"-p".to_string()));
-        assert!(args.contains(&"80".to_string()));
+        assert!(args.iter().any(|arg| arg == "--tcp"));
+        assert!(args.iter().any(|arg| arg == "-p"));
+        assert!(args.iter().any(|arg| arg == "80"));
     }
 
     #[test]
     fn build_args_udp_ipv6() {
         let args = build_args(&make_opts("UDP", 6));
-        assert!(args.contains(&"-6".to_string()));
-        assert!(args.contains(&"--udp".to_string()));
+        assert!(args.iter().any(|arg| arg == "-6"));
+        assert!(args.iter().any(|arg| arg == "--udp"));
     }
 
     #[test]
