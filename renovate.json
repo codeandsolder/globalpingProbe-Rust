@@ -13,19 +13,5 @@
     ],
     "automerge": true,
     "automergeType": "pr"
-  },
-  "packageRules": [
-    {
-      "description": "Cargo lockfile maintenance is age-gated by repository CI",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchUpdateTypes": [
-        "lockFileMaintenance"
-      ],
-      "minimumReleaseAge": null,
-      "automerge": true,
-      "automergeType": "pr"
-    }
-  ]
+  }
 }
