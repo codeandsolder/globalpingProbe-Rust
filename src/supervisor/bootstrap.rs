@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use ed25519_dalek::VerifyingKey;
 use semver::Version;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use super::health::{
     BehaviorDiagnosticEvent, BehaviorHealthEvent, BehaviorHealthPolicy, BehaviorHealthSnapshot,
@@ -21,8 +21,6 @@ use super::health::{
 use super::runtime::{BehaviorExecutor, RuntimeError};
 use super::storage::{PersistentBehaviorSlots, StorageError};
 use super::update::{BehaviorManifest, UpdateError, verify_candidate, verify_manifest};
-
-type SharedSlots = Arc<StdMutex<Option<PersistentBehaviorSlots>>>;
 
 #[derive(Debug, Clone)]
 pub struct BehaviorBootstrapConfig {
@@ -165,8 +163,8 @@ pub struct BehaviorController {
     root: PathBuf,
     verifying_key: VerifyingKey,
     supervisor_version: Version,
-    update_lock: Mutex<()>,
-    slots: SharedSlots,
+    update_lock: Arc<Mutex<()>>,
+    slots: StdMutex<Option<PersistentBehaviorSlots>>,
     executors: RwLock<ExecutorSlots>,
     health: Mutex<BehaviorHealthState>,
 }
@@ -222,8 +220,8 @@ impl BehaviorController {
             root: config.root,
             verifying_key: config.verifying_key,
             supervisor_version,
-            update_lock: Mutex::new(()),
-            slots: Arc::new(StdMutex::new(slots)),
+            update_lock: Arc::new(Mutex::new(())),
+            slots: StdMutex::new(slots),
             health: Mutex::new(BehaviorHealthState::new(
                 health_policy,
                 active_executor.as_ref().map(|executor| executor.sequence()),
@@ -282,10 +280,11 @@ impl BehaviorController {
     /// # Errors
     /// Returns an error only when a recommended rollback cannot be persisted.
     pub async fn observe_health(
-        &self,
+        self: &Arc<Self>,
         sequence: u64,
         event: BehaviorHealthEvent,
     ) -> Result<BehaviorHealthAction, BootstrapError> {
+        let update = Arc::clone(&self.update_lock).lock_owned().await;
         let decision = {
             let mut health = self.health.lock().await;
             health.observe(sequence, event)
@@ -298,23 +297,12 @@ impl BehaviorController {
             HealthDecision::RollbackRecommended => {}
         }
 
-        let _update = self.update_lock.lock().await;
-        if self.active_sequence()? != Some(sequence) {
-            return Ok(BehaviorHealthAction::IgnoredStaleSequence);
-        }
         if !self.has_previous()? {
             return Ok(BehaviorHealthAction::ThresholdReachedNoPrevious);
         }
 
-        let next_executor = match self.rollback_locked().await {
-            Ok(executor) => executor,
-            Err(error) => {
-                self.health.lock().await.clear_rollback_recommendation();
-                return Err(error);
-            }
-        };
+        let next_executor = self.rollback_with_guard(update).await?;
         let to_sequence = next_executor.sequence();
-        self.health.lock().await.reset(Some(to_sequence));
         Ok(BehaviorHealthAction::RolledBack {
             from_sequence: sequence,
             to_sequence,
@@ -393,11 +381,11 @@ impl BehaviorController {
     /// component runtime/self-test failure, persistence failure, or a poisoned
     /// storage lock.
     pub async fn activate_candidate(
-        &self,
+        self: &Arc<Self>,
         manifest: BehaviorManifest,
         component: Vec<u8>,
     ) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
-        let _update = self.update_lock.lock().await;
+        let update = Arc::clone(&self.update_lock).lock_owned().await;
         let accepted_sequence = self.accepted_sequence()?;
         let verified = verify_candidate(
             manifest,
@@ -407,31 +395,31 @@ impl BehaviorController {
             &self.supervisor_version,
         )?;
         let next_executor = Arc::new(BehaviorExecutor::from_verified(verified.clone()).await?);
-        let root = self.root.clone();
-        let slots = Arc::clone(&self.slots);
-        tokio::task::spawn_blocking(move || -> Result<(), BootstrapError> {
-            let mut guard = slots
+        let controller = Arc::clone(self);
+        complete_transition(update, move || {
+            let mut slots = controller
+                .slots
                 .lock()
                 .map_err(|_| BootstrapError::StorageLockPoisoned)?;
-            if let Some(existing) = guard.as_mut() {
+            if let Some(existing) = slots.as_mut() {
                 existing.activate(verified)?;
             } else {
-                *guard = Some(PersistentBehaviorSlots::initialize(root, verified)?);
+                *slots = Some(PersistentBehaviorSlots::initialize(
+                    controller.root.clone(),
+                    verified,
+                )?);
             }
-            drop(guard);
-            Ok(())
+            let mut executors = controller.executors.blocking_write();
+            let mut health = controller.health.blocking_lock();
+            executors.previous = executors.active.replace(Arc::clone(&next_executor));
+            health.reset(Some(next_executor.sequence()));
+            // Keep the durable slots locked until both live views are updated.
+            drop(health);
+            drop(executors);
+            drop(slots);
+            Ok(next_executor)
         })
         .await
-        .map_err(BootstrapError::BlockingTask)??;
-        let mut executors = self.executors.write().await;
-        let old_active = executors.active.replace(Arc::clone(&next_executor));
-        executors.previous = old_active;
-        drop(executors);
-        self.health
-            .lock()
-            .await
-            .reset(Some(next_executor.sequence()));
-        Ok(next_executor)
     }
 
     /// Roll back to the immediately previous verified local slot while keeping
@@ -444,43 +432,50 @@ impl BehaviorController {
     /// # Errors
     /// Returns an error when no previous slot exists, persistence fails, or the
     /// storage lock is poisoned.
-    pub async fn rollback(&self) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
-        let _update = self.update_lock.lock().await;
-        let next_executor = self.rollback_locked().await?;
-        self.health
-            .lock()
-            .await
-            .reset(Some(next_executor.sequence()));
-        Ok(next_executor)
+    pub async fn rollback(self: &Arc<Self>) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
+        let update = Arc::clone(&self.update_lock).lock_owned().await;
+        self.rollback_with_guard(update).await
     }
 
-    async fn rollback_locked(&self) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
-        if !self.has_previous()? {
-            return Err(UpdateError::NoPreviousVersion.into());
-        }
+    async fn rollback_with_guard(
+        self: &Arc<Self>,
+        update: OwnedMutexGuard<()>,
+    ) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
+        let controller = Arc::clone(self);
+        complete_transition(update, move || {
+            let result = controller.rollback_locked();
+            if result.is_err() {
+                controller
+                    .health
+                    .blocking_lock()
+                    .clear_rollback_recommendation();
+            }
+            result
+        })
+        .await
+    }
+
+    fn rollback_locked(&self) -> Result<Arc<BehaviorExecutor>, BootstrapError> {
         let next_executor = self
             .executors
-            .read()
-            .await
+            .blocking_read()
             .previous
             .clone()
             .ok_or(UpdateError::NoPreviousVersion)?;
-        let slots = Arc::clone(&self.slots);
-        tokio::task::spawn_blocking(move || -> Result<(), BootstrapError> {
-            let mut guard = slots
-                .lock()
-                .map_err(|_| BootstrapError::StorageLockPoisoned)?;
-            let existing = guard.as_mut().ok_or(UpdateError::NoPreviousVersion)?;
-            existing.rollback()?;
-            drop(guard);
-            Ok(())
-        })
-        .await
-        .map_err(BootstrapError::BlockingTask)??;
-        let mut executors = self.executors.write().await;
+        let mut slots = self
+            .slots
+            .lock()
+            .map_err(|_| BootstrapError::StorageLockPoisoned)?;
+        let existing = slots.as_mut().ok_or(UpdateError::NoPreviousVersion)?;
+        existing.rollback()?;
+        let mut executors = self.executors.blocking_write();
+        let mut health = self.health.blocking_lock();
         executors.active = Some(Arc::clone(&next_executor));
         executors.previous = None;
+        health.reset(Some(next_executor.sequence()));
+        drop(health);
         drop(executors);
+        drop(slots);
         Ok(next_executor)
     }
 
@@ -493,5 +488,54 @@ impl BehaviorController {
             .lock()
             .map_err(|_| BootstrapError::StorageLockPoisoned)?;
         Ok(inspect(guard.as_ref()))
+    }
+}
+
+/// Transfer the serialization guard into the blocking commit itself. Dropping
+/// the caller's future cannot interrupt a started commit or admit another
+/// transition before durable state and live executor/health state agree.
+async fn complete_transition<T: Send + 'static>(
+    update: OwnedMutexGuard<()>,
+    commit: impl FnOnce() -> Result<T, BootstrapError> + Send + 'static,
+) -> Result<T, BootstrapError> {
+    tokio::task::spawn_blocking(move || {
+        let _update = update;
+        commit()
+    })
+    .await
+    .map_err(BootstrapError::BlockingTask)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn cancelling_transition_waiter_does_not_release_serialization_guard()
+    -> anyhow::Result<()> {
+        let lock = Arc::new(Mutex::new(()));
+        let update = Arc::clone(&lock).lock_owned().await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+        let waiter = tokio::spawn(complete_transition(update, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.blocking_recv();
+            let _ = committed_tx.send(());
+            Ok(())
+        }));
+        started_rx.await?;
+        waiter.abort();
+        assert!(waiter.await.is_err_and(|error| error.is_cancelled()));
+        let locked = lock.try_lock().is_err();
+        let _ = release_tx.send(());
+        committed_rx.await?;
+        let _next_update = lock.lock().await;
+        assert!(
+            locked,
+            "cancellation released the transition lock before commit"
+        );
+        Ok(())
     }
 }

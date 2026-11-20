@@ -235,7 +235,7 @@ fn make_command(mtype: &str) -> Option<CommandKind> {
 }
 
 async fn apply_behavior_health(
-    controller: &BehaviorController,
+    controller: &Arc<BehaviorController>,
     sequence: u64,
     event: BehaviorHealthEvent,
 ) {
@@ -479,7 +479,7 @@ async fn finish_behavior_diagnostic(
 }
 
 async fn finish_behavior_fault(
-    controller: &BehaviorController,
+    controller: &Arc<BehaviorController>,
     oracle: BehaviorOracle,
     error: &RuntimeError,
     measurement_id: &str,
@@ -1903,7 +1903,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     async fn activate_health_test_fixture(
-        controller: &BehaviorController,
+        controller: &Arc<BehaviorController>,
         env_name: &str,
         sequence: u64,
         build_id: &str,

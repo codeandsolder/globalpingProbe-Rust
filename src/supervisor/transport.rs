@@ -269,7 +269,7 @@ impl BehaviorUpdater {
     /// reported by the controller during activation.
     pub async fn check_once(
         &self,
-        controller: &BehaviorController,
+        controller: &Arc<BehaviorController>,
     ) -> Result<BehaviorUpdateOutcome, BehaviorTransportError> {
         let manifest_bytes = self
             .fetch_limited(&self.manifest_url, MAX_MANIFEST_BYTES, "manifest")
@@ -955,7 +955,7 @@ mod tests {
             ));
         }
 
-        async fn activate(&self, controller: &BehaviorController, sequence: u64) {
+        async fn activate(&self, controller: &Arc<BehaviorController>, sequence: u64) {
             assert_eq!(
                 self.updater
                     .check_once(controller)
@@ -993,7 +993,7 @@ mod tests {
             controller
         }
 
-        async fn assert_bad_update_rolls_back(&self, controller: &BehaviorController) {
+        async fn assert_bad_update_rolls_back(&self, controller: &Arc<BehaviorController>) {
             self.serve(2, self.invalid.clone());
             self.activate(controller, 2).await;
             assert_eq!(controller.active_sequence().unwrap_or(None), Some(2));
@@ -1042,7 +1042,7 @@ mod tests {
 
         async fn assert_stale_is_not_redownloaded_and_recover(
             &self,
-            controller: &BehaviorController,
+            controller: &Arc<BehaviorController>,
         ) {
             let hits_before = self.https.component_hits();
             assert_eq!(
