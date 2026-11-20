@@ -256,16 +256,25 @@ async fn run_dig_inner(
     })
 }
 
-pub(crate) fn shape_classic_output(
+/// Apply the same resolution and private-address policy to classic and trace
+/// output shaping; only the typed behavior-core formatter varies.
+fn shape_dns_output<T>(
     raw: &str,
     stderr: &str,
     timed_out: bool,
     process_failed: bool,
     private_result: bool,
     target: &str,
-) -> ClassicResult {
+    shape: impl for<'a> FnOnce(
+        &str,
+        &str,
+        globalping_behavior_core::dns::DnsExecutionStatus,
+        bool,
+        globalping_behavior_core::dns::DnsPolicy<'a>,
+    ) -> T,
+) -> T {
     let local_addresses = crate::util::private_ip::local_address_strings();
-    globalping_behavior_core::dns::shape_classic_output(
+    shape(
         raw,
         stderr,
         globalping_behavior_core::dns::DnsExecutionStatus {
@@ -280,6 +289,25 @@ pub(crate) fn shape_classic_output(
     )
 }
 
+pub(crate) fn shape_classic_output(
+    raw: &str,
+    stderr: &str,
+    timed_out: bool,
+    process_failed: bool,
+    private_result: bool,
+    target: &str,
+) -> ClassicResult {
+    shape_dns_output(
+        raw,
+        stderr,
+        timed_out,
+        process_failed,
+        private_result,
+        target,
+        globalping_behavior_core::dns::shape_classic_output,
+    )
+}
+
 pub(crate) fn shape_trace_output(
     raw: &str,
     stderr: &str,
@@ -288,19 +316,14 @@ pub(crate) fn shape_trace_output(
     private_result: bool,
     target: &str,
 ) -> TraceResult {
-    let local_addresses = crate::util::private_ip::local_address_strings();
-    globalping_behavior_core::dns::shape_trace_output(
+    shape_dns_output(
         raw,
         stderr,
-        globalping_behavior_core::dns::DnsExecutionStatus {
-            timed_out,
-            process_failed,
-        },
+        timed_out,
+        process_failed,
         private_result,
-        globalping_behavior_core::dns::DnsPolicy {
-            target_is_icann: target_is_icann(target),
-            local_addresses: &local_addresses,
-        },
+        target,
+        globalping_behavior_core::dns::shape_trace_output,
     )
 }
 

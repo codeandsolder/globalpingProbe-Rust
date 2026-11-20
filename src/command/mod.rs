@@ -15,6 +15,41 @@ use serde_json::Value;
 use crate::util::progress_buffer::BufferMode;
 use tokio::sync::mpsc::{Receiver, Sender, error::SendError};
 
+/// The external JSON command surface is identical for every native CLI backend.
+/// Keep only the typed runner as the backend-specific implementation.
+macro_rules! json_command {
+    ($name:ident, $options:ty, $runner:ident, $adapter:ident, $normal_doc:literal, $progress_doc:literal) => {
+        pub struct $name;
+
+        async fn $adapter(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
+            super::run_serialized(options, progress, |opts: $options, tx| async move {
+                $runner(&opts, tx).await
+            })
+            .await
+        }
+
+        impl $name {
+            #[doc = concat!($normal_doc, "
+
+# Errors
+Returns an error on invalid options, execution failure, or JSON serialization.")]
+            pub async fn run(&self, options: Value) -> Result<Value> {
+                $adapter(options, None).await
+            }
+
+            #[doc = concat!($progress_doc, "
+
+# Errors
+Returns an error on invalid options, execution failure, or JSON serialization.")]
+            pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+                $adapter(options, Some(tx)).await
+            }
+        }
+    };
+}
+
+pub(crate) use json_command;
+
 /// Convert the socket JSON envelope exactly once at the command boundary.
 pub(crate) async fn run_serialized<Options, Output, Run, Fut>(
     options: Value,
@@ -30,6 +65,48 @@ where
     let options = serde_json::from_value(options)?;
     let result = run(options, progress).await?;
     Ok(serde_json::to_value(result)?)
+}
+
+/// Shared deadline-aware resolution boundary for native CLI measurements.
+/// Failed resolution is returned as the measurement's own typed error result.
+pub(crate) async fn resolve_for_cli<Failure>(
+    target: &str,
+    ip_version: u8,
+    dns_headroom_seconds: f64,
+    shape_failure: impl FnOnce(&crate::util::resolve_target::ResolveTargetError) -> Failure,
+) -> std::result::Result<crate::util::resolve_target::ResolvedTarget, Failure> {
+    let budget = std::time::Duration::from_secs_f64(dns_headroom_seconds.max(0.0));
+    crate::util::resolve_target::resolve_command_target(target, ip_version, budget)
+        .await
+        .map_err(|error| shape_failure(&error))
+}
+
+/// Single-flight address lookups are shared across repeated consumers, without
+/// holding a map lock while awaiting or executing the lookup.
+pub(crate) fn lookup_cell_for<Key, Value>(
+    map: &std::sync::RwLock<
+        std::collections::HashMap<Key, std::sync::Arc<tokio::sync::OnceCell<Value>>>,
+    >,
+    key: Key,
+) -> std::sync::Arc<tokio::sync::OnceCell<Value>>
+where
+    Key: Eq + std::hash::Hash,
+{
+    if let Some(cell) = map
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return std::sync::Arc::clone(cell);
+    }
+    let mut cells = map
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::sync::Arc::clone(
+        cells
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::OnceCell::new())),
+    )
 }
 
 /// Running process, line reader, and independently drained stderr task.

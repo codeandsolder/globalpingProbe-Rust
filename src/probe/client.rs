@@ -1879,26 +1879,69 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
-    async fn live_exact_behavior_results_are_selected_for_all_six_measurements() {
-        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
-            });
-        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-        let config =
-            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key());
-        let controller = BehaviorController::load(config)
+    async fn load_health_test_controller(
+        root: &Path,
+        health_policy: Option<BehaviorHealthPolicy>,
+    ) -> std::sync::Arc<BehaviorController> {
+        let config = BehaviorBootstrapConfig::new(root, health_test_signing_key().verifying_key());
+        let config = if let Some(policy) = health_policy {
+            config.with_health_policy(policy)
+        } else {
+            config
+        };
+        BehaviorController::load(config)
             .await
-            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
-        let (manifest, component) =
-            signed_health_test_component(&component_path, 1, "authority-healthy");
+            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn one_fault_health_policy() -> BehaviorHealthPolicy {
+        let threshold =
+            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
+        BehaviorHealthPolicy::new(threshold)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn activate_health_test_fixture(
+        controller: &BehaviorController,
+        env_name: &str,
+        sequence: u64,
+        build_id: &str,
+    ) {
+        let path = std::env::var_os(env_name)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| panic!("{env_name} must point to the corresponding WASIp2 fixture"));
+        let (manifest, component) = signed_health_test_component(&path, sequence, build_id);
         controller
             .activate_candidate(manifest, component)
             .await
-            .unwrap_or_else(|error| panic!("behavior activation failed: {error}"));
+            .unwrap_or_else(|error| panic!("behavior fixture activation failed: {error}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reload_health_test_slots(root: &Path) -> PersistentBehaviorSlots {
+        PersistentBehaviorSlots::load(
+            root,
+            &health_test_signing_key().verifying_key(),
+            &Version::parse(env!("CARGO_PKG_VERSION"))
+                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
+    async fn live_exact_behavior_results_are_selected_for_all_six_measurements() {
+        let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+        let controller = load_health_test_controller(root.path(), None).await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_HEALTH_COMPONENT",
+            1,
+            "authority-healthy",
+        )
+        .await;
 
         BEHAVIOR_COMPONENT_AUTHORITIES.store(0, Ordering::SeqCst);
         BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
@@ -1936,33 +1979,23 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live network tools/access plus a prebuilt WASIp2 behavior component"]
     async fn live_behavior_health_records_all_six_divergences_without_rollback() {
-        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
-            });
         let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-        let threshold =
-            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
-        let config =
-            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
-                .with_health_policy(BehaviorHealthPolicy::new(threshold));
-        let controller = BehaviorController::load(config)
-            .await
-            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
-
-        let (normal_manifest, normal_component) =
-            signed_health_test_component(&component_path, 1, "health-normal");
-        controller
-            .activate_candidate(normal_manifest, normal_component)
-            .await
-            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
-        let (active_manifest, active_component) =
-            signed_health_test_component(&component_path, 2, "health-test-active");
-        controller
-            .activate_candidate(active_manifest, active_component)
-            .await
-            .unwrap_or_else(|error| panic!("test behavior activation failed: {error}"));
+        let controller =
+            load_health_test_controller(root.path(), Some(one_fault_health_policy())).await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_HEALTH_COMPONENT",
+            1,
+            "health-normal",
+        )
+        .await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_HEALTH_COMPONENT",
+            2,
+            "health-test-active",
+        )
+        .await;
 
         struct ForcedDivergenceGuard;
         impl Drop for ForcedDivergenceGuard {
@@ -2021,13 +2054,7 @@ mod tests {
         assert_eq!(health.runtime_faults, 0);
         assert_eq!(health.inconclusive, 0);
 
-        let persisted = PersistentBehaviorSlots::load(
-            root.path(),
-            &health_test_signing_key().verifying_key(),
-            &Version::parse(env!("CARGO_PKG_VERSION"))
-                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        let persisted = reload_health_test_slots(root.path());
         assert_eq!(persisted.active().manifest.sequence, 2);
         assert_eq!(persisted.active().manifest.build_id, "health-test-active");
         assert_eq!(persisted.accepted_sequence(), 2);
@@ -2042,23 +2069,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live network access plus a post-start-fault WASIp2 behavior fixture"]
     async fn live_post_start_behavior_fault_preserves_native_without_fallback() {
-        let component_path = std::env::var_os("GLOBALPING_BEHAVIOR_FAULT_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("GLOBALPING_BEHAVIOR_FAULT_COMPONENT must point to the fault fixture")
-            });
         let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-        let config =
-            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key());
-        let controller = BehaviorController::load(config)
-            .await
-            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
-        let (manifest, component) =
-            signed_health_test_component(&component_path, 1, "post-start-fault");
-        controller
-            .activate_candidate(manifest, component)
-            .await
-            .unwrap_or_else(|error| panic!("fault fixture activation failed: {error}"));
+        let controller = load_health_test_controller(root.path(), None).await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_FAULT_COMPONENT",
+            1,
+            "post-start-fault",
+        )
+        .await;
 
         BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
         let measurement = json!({
@@ -2116,40 +2135,23 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live network access plus normal and divergent WASIp2 behavior fixtures"]
     async fn live_signed_valid_divergence_is_authoritative_and_remains_active() {
-        let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
-            });
-        let divergent_path = std::env::var_os("GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!(
-                    "GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT must point to the divergence fixture"
-                )
-            });
         let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-        let threshold =
-            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
-        let config =
-            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
-                .with_health_policy(BehaviorHealthPolicy::new(threshold));
-        let controller = BehaviorController::load(config)
-            .await
-            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
-
-        let (normal_manifest, normal_component) =
-            signed_health_test_component(&normal_path, 1, "divergence-normal");
-        controller
-            .activate_candidate(normal_manifest, normal_component)
-            .await
-            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
-        let (divergent_manifest, divergent_component) =
-            signed_health_test_component(&divergent_path, 2, "divergence-authoritative");
-        controller
-            .activate_candidate(divergent_manifest, divergent_component)
-            .await
-            .unwrap_or_else(|error| panic!("divergent behavior activation failed: {error}"));
+        let controller =
+            load_health_test_controller(root.path(), Some(one_fault_health_policy())).await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_HEALTH_COMPONENT",
+            1,
+            "divergence-normal",
+        )
+        .await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_DIVERGENCE_COMPONENT",
+            2,
+            "divergence-authoritative",
+        )
+        .await;
 
         BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
         BEHAVIOR_DIAGNOSTIC_COMPLETIONS.store(0, Ordering::SeqCst);
@@ -2189,13 +2191,7 @@ mod tests {
         assert_eq!(health.runtime_faults, 0);
         assert_eq!(health.inconclusive, 0);
 
-        let persisted = PersistentBehaviorSlots::load(
-            root.path(),
-            &health_test_signing_key().verifying_key(),
-            &Version::parse(env!("CARGO_PKG_VERSION"))
-                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        let persisted = reload_health_test_slots(root.path());
         assert_eq!(persisted.active().manifest.sequence, 2);
         assert_eq!(
             persisted.active().manifest.build_id,
@@ -2216,40 +2212,23 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live network access plus normal and invalid-output WASIp2 behavior fixtures"]
     async fn live_signed_invalid_output_falls_back_and_rolls_back() {
-        let normal_path = std::env::var_os("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("GLOBALPING_BEHAVIOR_HEALTH_COMPONENT must point to the release component")
-            });
-        let invalid_path = std::env::var_os("GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!(
-                    "GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT must point to the invalid-output fixture"
-                )
-            });
         let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
-        let threshold =
-            NonZeroU32::new(1).unwrap_or_else(|| panic!("health threshold must be non-zero"));
-        let config =
-            BehaviorBootstrapConfig::new(root.path(), health_test_signing_key().verifying_key())
-                .with_health_policy(BehaviorHealthPolicy::new(threshold));
-        let controller = BehaviorController::load(config)
-            .await
-            .unwrap_or_else(|error| panic!("behavior controller bootstrap failed: {error}"));
-
-        let (normal_manifest, normal_component) =
-            signed_health_test_component(&normal_path, 1, "invalid-output-normal");
-        controller
-            .activate_candidate(normal_manifest, normal_component)
-            .await
-            .unwrap_or_else(|error| panic!("normal behavior activation failed: {error}"));
-        let (invalid_manifest, invalid_component) =
-            signed_health_test_component(&invalid_path, 2, "invalid-output-active");
-        controller
-            .activate_candidate(invalid_manifest, invalid_component)
-            .await
-            .unwrap_or_else(|error| panic!("invalid-output behavior activation failed: {error}"));
+        let controller =
+            load_health_test_controller(root.path(), Some(one_fault_health_policy())).await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_HEALTH_COMPONENT",
+            1,
+            "invalid-output-normal",
+        )
+        .await;
+        activate_health_test_fixture(
+            &controller,
+            "GLOBALPING_BEHAVIOR_INVALID_OUTPUT_COMPONENT",
+            2,
+            "invalid-output-active",
+        )
+        .await;
 
         BEHAVIOR_PRESTART_FALLBACKS.store(0, Ordering::SeqCst);
         let result = run_measurement(
@@ -2278,13 +2257,7 @@ mod tests {
             .unwrap_or_else(|| panic!("rolled-back executor must exist"));
         assert_eq!(executor.build_id(), "invalid-output-normal");
 
-        let persisted = PersistentBehaviorSlots::load(
-            root.path(),
-            &health_test_signing_key().verifying_key(),
-            &Version::parse(env!("CARGO_PKG_VERSION"))
-                .unwrap_or_else(|error| panic!("package version is invalid semver: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("persisted behavior reload failed: {error}"));
+        let persisted = reload_health_test_slots(root.path());
         assert_eq!(persisted.active().manifest.sequence, 1);
         assert_eq!(
             persisted.active().manifest.build_id,

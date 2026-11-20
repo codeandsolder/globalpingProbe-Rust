@@ -11,7 +11,7 @@ use tokio::time::timeout;
 
 use super::{ProgressTx, RawExecutionTx};
 use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
-use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, resolve_command_target};
+use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget};
 use crate::util::tcp_ping::{TcpPingProbe, compute_tcp_stats, tcp_ping_single};
 use crate::util::validate::is_safe_host;
 use parse::{ParsedPing, failed_ping};
@@ -86,32 +86,14 @@ pub fn build_args(opts: &PingOptions) -> Vec<String> {
 
 // ── Command ──────────────────────────────────────────────────────────────────
 
-pub struct PingCommand;
-
-async fn run_ping_serialized(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
-    super::run_serialized(options, progress, |options: PingOptions, tx| async move {
-        run_ping(&options, tx).await
-    })
-    .await
-}
-
-impl PingCommand {
-    /// Execute a ping command from a socket payload.
-    ///
-    /// # Errors
-    /// Returns an error for invalid options, process/IO failures, or serialization failures.
-    pub async fn run(&self, options: Value) -> Result<Value> {
-        run_ping_serialized(options, None).await
-    }
-
-    /// Execute a ping command while streaming partial packet results.
-    ///
-    /// # Errors
-    /// Returns an error for invalid options, process/IO failures, or serialization failures.
-    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
-        run_ping_serialized(options, Some(tx)).await
-    }
-}
+super::json_command!(
+    PingCommand,
+    PingOptions,
+    run_ping,
+    run_ping_serialized,
+    "Execute a ping command from a socket payload.",
+    "Execute ping while streaming partial packet results."
+);
 
 pub(crate) fn resolution_failure(error: &ResolveTargetError) -> ParsedPing {
     failed_ping(error.failure_source_or("internal"), error.public_message())
@@ -121,25 +103,39 @@ async fn run_ping(opts: &PingOptions, progress: Option<ProgressTx>) -> Result<Pa
     validate(opts)?;
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = ping_budget(opts.packets, opts.timeout, None);
-    let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
+    let target = match super::resolve_for_cli(
+        &opts.target,
+        opts.ip_version,
+        budget.dns_headroom,
+        resolution_failure,
+    )
+    .await
+    {
         Ok(target) => target,
-        Err(error) => return Ok(resolution_failure(&error)),
+        Err(failure) => return Ok(failure),
     };
-
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
-    if opts.protocol.eq_ignore_ascii_case("TCP") {
-        run_tcp(&resolved_options, &target, progress, deadline.remaining()).await
+    let native = if opts.protocol.eq_ignore_ascii_case("TCP") {
+        run_tcp_raw_inner(
+            &resolved_options,
+            &target,
+            progress,
+            deadline.remaining(),
+            None,
+        )
+        .await?
     } else {
-        run_icmp(
+        run_icmp_raw_inner(
             &resolved_options,
             &target,
             progress,
             deadline.process_timeout(),
+            None,
         )
-        .await
-    }
+        .await?
+    };
+    Ok(shape_native_ping(&native, &target))
 }
 
 pub(crate) struct NativePingRaw {
@@ -148,19 +144,13 @@ pub(crate) struct NativePingRaw {
     pub(crate) exit_code: Option<i32>,
 }
 
-async fn run_icmp(
-    opts: &PingOptions,
-    target: &ResolvedTarget,
-    progress: Option<ProgressTx>,
-    process_timeout: Duration,
-) -> Result<ParsedPing> {
-    let native = run_icmp_raw_inner(opts, target, progress, process_timeout, None).await?;
-    Ok(shape_ping_output(
+fn shape_native_ping(native: &NativePingRaw, target: &ResolvedTarget) -> ParsedPing {
+    shape_ping_output(
         &native.raw,
         &target.address.to_string(),
         &target.hostname,
         native.timed_out,
-    ))
+    )
 }
 
 pub(crate) async fn run_icmp_raw_stream(
@@ -266,21 +256,6 @@ fn spawn_tcp_probes(
         }));
     }
     tasks
-}
-
-async fn run_tcp(
-    opts: &PingOptions,
-    target: &ResolvedTarget,
-    progress: Option<ProgressTx>,
-    remaining: Duration,
-) -> Result<ParsedPing> {
-    let native = run_tcp_raw_inner(opts, target, progress, remaining, None).await?;
-    Ok(shape_ping_output(
-        &native.raw,
-        &target.address.to_string(),
-        &target.hostname,
-        native.timed_out,
-    ))
 }
 
 pub(crate) async fn run_tcp_raw_stream(

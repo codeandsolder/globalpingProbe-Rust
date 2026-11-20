@@ -1772,18 +1772,19 @@ no answer yet for icmp_seq=1\n\
     }
 
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
-    async fn live_behavior_icmp_ping_matches_native_result() {
-        let measurement = json!({
+    async fn assert_live_ping_matches_native(protocol: &str, port: Option<u16>) {
+        let mut measurement = json!({
             "type": "ping",
             "target": "1.1.1.1",
-            "protocol": "ICMP",
+            "protocol": protocol,
             "packets": 2,
             "ipVersion": 4,
             "timeout": 10,
             "inProgressUpdates": false
         });
+        if let Some(port) = port {
+            measurement["port"] = json!(port);
+        }
         let native = PingCommand
             .run(measurement.clone())
             .await
@@ -1812,40 +1813,15 @@ no answer yet for icmp_seq=1\n\
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
+    async fn live_behavior_icmp_ping_matches_native_result() {
+        assert_live_ping_matches_native("ICMP", None).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires live network access and a prebuilt wasm32-wasip2 behavior component"]
     async fn live_behavior_tcp_ping_matches_native_result() {
-        let measurement = json!({
-            "type": "ping",
-            "target": "1.1.1.1",
-            "protocol": "TCP",
-            "port": 443,
-            "packets": 2,
-            "ipVersion": 4,
-            "timeout": 10,
-            "inProgressUpdates": false
-        });
-        let native = PingCommand
-            .run(measurement.clone())
-            .await
-            .unwrap_or_else(|error| panic!("native live TCP ping failed: {error}"));
-        let raw = native["rawOutput"]
-            .as_str()
-            .unwrap_or_else(|| panic!("native live TCP ping omitted rawOutput"));
-        let address = native["resolvedAddress"]
-            .as_str()
-            .unwrap_or_else(|| panic!("native live TCP ping omitted resolvedAddress"));
-        let hostname = native["resolvedHostname"]
-            .as_str()
-            .unwrap_or_else(|| panic!("native live TCP ping omitted resolvedHostname"));
-        let actual = run_fixture_with_identity(
-            FixtureKind::Ping,
-            measurement,
-            vec![stdout(raw), wit_host::ExecutionEvent::Exited(0)],
-            HashMap::new(),
-            address,
-            hostname,
-        )
-        .await;
-        assert_eq!(actual.final_json, native);
+        assert_live_ping_matches_native("TCP", Some(443)).await;
     }
 
     #[cfg(target_os = "linux")]

@@ -123,6 +123,31 @@ struct StartedExecution {
     mtr_enrichment: Option<crate::command::mtr::MtrEnrichmentBroker>,
 }
 
+/// One native execution feeds both the component event stream and its
+/// same-run diagnostic oracle; these handles always refer to the same job.
+struct PreparedRawStream {
+    tx: crate::command::RawExecutionTx,
+    events: tokio::sync::mpsc::Receiver<crate::command::RawExecutionEvent>,
+    oracle: SharedOracleSlot,
+    task_oracle: SharedOracleSlot,
+    task_target: crate::util::resolve_target::ResolvedTarget,
+}
+
+impl PreparedRawStream {
+    fn new(target: &crate::util::resolve_target::ResolvedTarget) -> Self {
+        let (tx, events) = crate::command::RawExecutionTx::channel();
+        let oracle = new_oracle_slot();
+        let task_oracle = std::sync::Arc::clone(&oracle);
+        Self {
+            tx,
+            events,
+            oracle,
+            task_oracle,
+            task_target: target.clone(),
+        }
+    }
+}
+
 struct ProductionHost {
     limits: StoreLimits,
     lease: crate::supervisor::capability::CapabilityLease,
@@ -436,6 +461,47 @@ fn resolution_failed_execution(
     resolution_failed_execution_with_message(reason, None, native)
 }
 
+/// Common resolver boundary for CLI measurements. A rejected or timed-out
+/// target must populate the same native oracle and WIT failure indication.
+enum PreparedResolution {
+    Ready(crate::util::resolve_target::ResolvedTarget),
+    Failed(StartedExecution),
+}
+
+async fn resolve_for_behavior<Output, F>(
+    target: &str,
+    ip_version: u8,
+    dns_budget: std::time::Duration,
+    failure: F,
+) -> Result<PreparedResolution, wit_host::HostError>
+where
+    Output: serde::Serialize,
+    F: FnOnce(&crate::util::resolve_target::ResolveTargetError) -> Output,
+{
+    use crate::util::resolve_target::resolve_command_target;
+    match resolve_command_target(target, ip_version, dns_budget).await {
+        Ok(target) => Ok(PreparedResolution::Ready(target)),
+        Err(error) => {
+            let reason = resolution_failure_kind(&error);
+            let native = serde_json::to_value(failure(&error)).map_err(native_error)?;
+            Ok(PreparedResolution::Failed(resolution_failed_execution(
+                reason, native,
+            )))
+        }
+    }
+}
+
+/// All CLI measurement hosts must return a typed WIT resolution failure
+/// without starting a native process. The early return is intentional.
+macro_rules! resolve_or_early_failure {
+    ($opts:ident, $dns_budget:expr, $shape:path) => {{
+        match resolve_for_behavior(&$opts.target, $opts.ip_version, $dns_budget, $shape).await? {
+            PreparedResolution::Ready(target) => target,
+            PreparedResolution::Failed(execution) => return Ok(execution),
+        }
+    }};
+}
+
 const COMPONENT_PENDING: u8 = 0;
 const COMPONENT_SUCCESS: u8 = 1;
 const COMPONENT_FAULT: u8 = 2;
@@ -573,7 +639,6 @@ async fn prepare_ping(
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::ping;
     use crate::util::measurement_timeout::{MeasurementDeadline, ping_budget};
-    use crate::util::resolve_target::resolve_command_target;
     use std::time::Duration;
 
     let opts: ping::PingOptions =
@@ -582,21 +647,16 @@ async fn prepare_ping(
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = ping_budget(opts.packets, opts.timeout, None);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
-        Ok(target) => target,
-        Err(error) => {
-            let reason = resolution_failure_kind(&error);
-            let native =
-                serde_json::to_value(ping::resolution_failure(&error)).map_err(native_error)?;
-            return Ok(resolution_failed_execution(reason, native));
-        }
-    };
+    let target = resolve_or_early_failure!(opts, dns_budget, ping::resolution_failure);
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
-    let (tx, events) = crate::command::RawExecutionTx::channel();
-    let oracle = new_oracle_slot();
-    let task_oracle = std::sync::Arc::clone(&oracle);
-    let task_target = target.clone();
+    let PreparedRawStream {
+        tx,
+        events,
+        oracle,
+        task_oracle,
+        task_target,
+    } = PreparedRawStream::new(&target);
     tokio::spawn(async move {
         let native = if resolved_options.protocol.eq_ignore_ascii_case("TCP") {
             ping::run_tcp_raw_stream(
@@ -800,7 +860,6 @@ async fn prepare_traceroute(
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::traceroute;
     use crate::util::measurement_timeout::{MeasurementDeadline, traceroute_budget};
-    use crate::util::resolve_target::resolve_command_target;
     use std::time::Duration;
 
     let opts: traceroute::TracerouteOptions =
@@ -809,22 +868,17 @@ async fn prepare_traceroute(
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = traceroute_budget(opts.timeout, 2);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
-        Ok(target) => target,
-        Err(error) => {
-            let reason = resolution_failure_kind(&error);
-            let native = serde_json::to_value(traceroute::resolution_failure(&error))
-                .map_err(native_error)?;
-            return Ok(resolution_failed_execution(reason, native));
-        }
-    };
+    let target = resolve_or_early_failure!(opts, dns_budget, traceroute::resolution_failure);
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
     let args = traceroute::build_args(&resolved_options);
-    let (tx, events) = crate::command::RawExecutionTx::channel();
-    let oracle = new_oracle_slot();
-    let task_oracle = std::sync::Arc::clone(&oracle);
-    let task_target = target.clone();
+    let PreparedRawStream {
+        tx,
+        events,
+        oracle,
+        task_oracle,
+        task_target,
+    } = PreparedRawStream::new(&target);
     let shared_enrichment = traceroute::TracerouteEnrichmentBroker::default();
     let task_enrichment = shared_enrichment.clone();
     tokio::spawn(async move {
@@ -927,7 +981,6 @@ async fn prepare_mtr(
 ) -> Result<StartedExecution, wit_host::HostError> {
     use crate::command::mtr;
     use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
-    use crate::util::resolve_target::resolve_command_target;
     use std::time::Duration;
 
     let opts: mtr::MtrOptions =
@@ -936,22 +989,17 @@ async fn prepare_mtr(
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = mtr_budget(opts.packets, opts.timeout);
     let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
-        Ok(target) => target,
-        Err(error) => {
-            let reason = resolution_failure_kind(&error);
-            let native =
-                serde_json::to_value(mtr::resolution_failure(&error)).map_err(native_error)?;
-            return Ok(resolution_failed_execution(reason, native));
-        }
-    };
+    let target = resolve_or_early_failure!(opts, dns_budget, mtr::resolution_failure);
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
     let args = mtr::build_args(&resolved_options);
-    let (tx, events) = crate::command::RawExecutionTx::channel();
-    let oracle = new_oracle_slot();
-    let task_oracle = std::sync::Arc::clone(&oracle);
-    let task_target = target.clone();
+    let PreparedRawStream {
+        tx,
+        events,
+        oracle,
+        task_oracle,
+        task_target,
+    } = PreparedRawStream::new(&target);
     let shared_enrichment = mtr::MtrEnrichmentBroker::new(&target);
     let task_enrichment = shared_enrichment.clone();
     tokio::spawn(async move {

@@ -16,9 +16,7 @@ use tokio::time::{Duration, timeout};
 
 use crate::util::measurement_timeout::{MeasurementDeadline, mtr_budget};
 use crate::util::private_ip::is_ip_private;
-use crate::util::resolve_target::{
-    ResolveTargetError, ResolvedTarget, resolve_command_target, reverse_lookup,
-};
+use crate::util::resolve_target::{ResolveTargetError, ResolvedTarget, reverse_lookup};
 use crate::util::validate::is_safe_host;
 use parse::{
     MtrEnrichmentEntry, MtrEnrichmentMap, MtrStatus, ParsedMtr, normalize_ip_text, render_progress,
@@ -113,32 +111,14 @@ pub fn build_args(opts: &MtrOptions) -> Vec<String> {
 
 // ── Command ───────────────────────────────────────────────────────────────────
 
-pub struct MtrCommand;
-
-async fn run_mtr_serialized(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
-    super::run_serialized(options, progress, |options: MtrOptions, tx| async move {
-        run_mtr(&options, tx).await
-    })
-    .await
-}
-
-impl MtrCommand {
-    /// Execute an MTR command from a socket payload.
-    ///
-    /// # Errors
-    /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
-    pub async fn run(&self, options: Value) -> Result<Value> {
-        run_mtr_serialized(options, None).await
-    }
-
-    /// Execute MTR while streaming overwrite snapshots.
-    ///
-    /// # Errors
-    /// Returns an error for invalid options, process failures, ASN lookup failures, or serialization failures.
-    pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
-        run_mtr_serialized(options, Some(tx)).await
-    }
-}
+super::json_command!(
+    MtrCommand,
+    MtrOptions,
+    run_mtr,
+    run_mtr_serialized,
+    "Execute an MTR command from a socket payload.",
+    "Execute MTR while streaming overwrite snapshots."
+);
 
 // ── Internal runner ───────────────────────────────────────────────────────────
 
@@ -230,23 +210,7 @@ impl MtrEnrichmentBroker {
     }
 
     fn lookup_cell(&self, address: IpAddr) -> Arc<OnceCell<MtrEnrichmentEntry>> {
-        if let Some(cell) = self
-            .lookups
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&address)
-        {
-            return Arc::clone(cell);
-        }
-        let mut lookups = self
-            .lookups
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Arc::clone(
-            lookups
-                .entry(address)
-                .or_insert_with(|| Arc::new(OnceCell::new())),
-        )
+        super::lookup_cell_for(&self.lookups, address)
     }
 
     pub(crate) async fn lookup(&self, address: IpAddr, budget: Duration) -> MtrEnrichmentEntry {
@@ -505,10 +469,16 @@ async fn run_mtr(opts: &MtrOptions, progress: Option<ProgressTx>) -> Result<Pars
     validate(opts)?;
     let deadline = MeasurementDeadline::new(opts.timeout);
     let budget = mtr_budget(opts.packets, opts.timeout);
-    let dns_budget = Duration::from_secs_f64(budget.dns_headroom.max(0.0));
-    let target = match resolve_command_target(&opts.target, opts.ip_version, dns_budget).await {
+    let target = match super::resolve_for_cli(
+        &opts.target,
+        opts.ip_version,
+        budget.dns_headroom,
+        resolution_failure,
+    )
+    .await
+    {
         Ok(target) => target,
-        Err(error) => return Ok(resolution_failure(&error)),
+        Err(failure) => return Ok(failure),
     };
     let mut resolved_options = opts.clone();
     resolved_options.target = target.address.to_string();
