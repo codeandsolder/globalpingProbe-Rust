@@ -21,8 +21,11 @@ macro_rules! json_command {
     ($name:ident, $options:ty, $runner:ident, $adapter:ident, $normal_doc:literal, $progress_doc:literal) => {
         pub struct $name;
 
-        async fn $adapter(options: Value, progress: Option<ProgressTx>) -> Result<Value> {
-            super::run_serialized(options, progress, |opts: $options, tx| async move {
+        async fn $adapter(
+            options: serde_json::Value,
+            progress: Option<$crate::command::ProgressTx>,
+        ) -> anyhow::Result<serde_json::Value> {
+            $crate::command::run_serialized(options, progress, |opts: $options, tx| async move {
                 $runner(&opts, tx).await
             })
             .await
@@ -33,7 +36,10 @@ macro_rules! json_command {
 
 # Errors
 Returns an error on invalid options, execution failure, or JSON serialization.")]
-            pub async fn run(&self, options: Value) -> Result<Value> {
+            pub async fn run(
+                &self,
+                options: serde_json::Value,
+            ) -> anyhow::Result<serde_json::Value> {
                 $adapter(options, None).await
             }
 
@@ -41,7 +47,11 @@ Returns an error on invalid options, execution failure, or JSON serialization.")
 
 # Errors
 Returns an error on invalid options, execution failure, or JSON serialization.")]
-            pub async fn run_with_progress(&self, options: Value, tx: ProgressTx) -> Result<Value> {
+            pub async fn run_with_progress(
+                &self,
+                options: serde_json::Value,
+                tx: $crate::command::ProgressTx,
+            ) -> anyhow::Result<serde_json::Value> {
                 $adapter(options, Some(tx)).await
             }
         }
