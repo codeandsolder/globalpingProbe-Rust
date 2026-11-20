@@ -5,7 +5,7 @@ A Rust rewrite of the [globalping-probe](https://github.com/jsdelivr/globalping-
 **Why Rust?**
 - Memory safety at compile time — no buffer overflows, use-after-free, or data races
 - ~70 % RAM reduction vs Node.js (target: 10–20 MB idle vs 50–70 MB)
-- Single static binary — no runtime, no `node_modules`, no self-update logic
+- Single static probe binary — no Node.js runtime or `node_modules`; optional signed WASM behavior updates stay behind the native trust boundary
 - Async via Tokio — maps directly onto the probe's concurrent measurement model
 
 ---
@@ -14,7 +14,7 @@ A Rust rewrite of the [globalping-probe](https://github.com/jsdelivr/globalping-
 
 | Tool | Version | Notes |
 |---|---|---|
-| Rust (stable) | ≥ 1.85 | edition 2024 |
+| Rust (stable) | 1.99.0 | edition 2024 |
 | Linux (WSL Ubuntu-24.04 or native) | — | Build and run target |
 | `libssl-dev`, `pkg-config` | — | Required by `rust_socketio` → `openssl-sys` |
 | `traceroute` | any | Must have `cap_net_raw` for ICMP mode (see below) |
@@ -39,28 +39,28 @@ globalPing-Rust/
 │   ├── lib.rs                Library root — re-exports all modules for tests
 │   ├── config.rs             AppConfig skeleton (future config-file support)
 │   ├── command/
-│   │   ├── mod.rs            MeasurementCommand trait + ProgressTx type alias
-│   │   ├── ping/             PingCommand — spawns system ping, line-by-line output
-│   │   │   ├── mod.rs        run_icmp(), run_with_progress(), build_args()
-│   │   │   └── parse.rs      ParsedPing, PingStatus, timing + stats extraction
-│   │   ├── traceroute/       TracerouteCommand — spawns traceroute, per-hop streaming
-│   │   │   ├── mod.rs        run_traceroute(), HOP_LINE regex, build_args()
-│   │   │   └── parse.rs      ParsedTraceroute, hop/timing extraction
-│   │   ├── dns/              DnsCommand — spawns dig, classic + trace modes
-│   │   │   ├── mod.rs        query_classic(), query_trace(), build_args()
-│   │   │   └── parse.rs      ParsedDns, answer/metadata extraction
-│   │   ├── mtr.rs            MtrCommand — spawns mtr --json, parses hub list
-│   │   └── http.rs           HttpCommand — spawns curl, parses headers/body/TLS
+│   │   ├── mod.rs            Native execution traits + typed progress/raw-event channels
+│   │   ├── ping/             Privileged ping/TCP execution; parse.rs re-exports shared core
+│   │   ├── traceroute/       Privileged traceroute execution + shared PTR broker; parse.rs re-exports core
+│   │   ├── dns/              Privileged dig execution/resolver policy; parse.rs re-exports shared core
+│   │   ├── mtr.rs            Privileged mtr --raw execution + shared PTR/ASN enrichment
+│   │   └── http.rs           Privileged curl/OpenSSL execution; parse.rs re-exports shared core
 │   ├── probe/
 │   │   ├── mod.rs            Module registry
-│   │   ├── client.rs         Socket.io client, connect/reconnect loop, dispatch
-│   │   ├── dns_servers.rs    get_dns_servers() — reads /etc/resolv.conf
-│   │   ├── limiter.rs        MeasurementLimiter — semaphore cap of 3, wait_idle()
-│   │   ├── progress.rs       ProgressEmitter — drains channel → socket.io events
-│   │   ├── reconnect.rs      ConnectOutcome, classify_error(), ExponentialBackoff
-│   │   ├── stats.rs          MeasurementStats — lock-free atomic counters, take()
-│   │   ├── sysinfo.rs        total_memory_bytes(), disk_info_mb()
+│   │   ├── client.rs         Socket.io client, reconnect loop, dispatch + behavior authority/fallback
+│   │   ├── jobs.rs           Active-job tracking used by shutdown/status accounting
+│   │   ├── progress.rs       ProgressEmitter — drains mode-tagged progress → socket.io events
+│   │   ├── reconnect.rs      ConnectOutcome and upstream-compatible reconnect policy
+│   │   ├── stats.rs          Per-CPU /proc/stat utilization sampling
+│   │   ├── sysinfo.rs        Memory/disk/hardware metadata
 │   │   └── uuid.rs           ProbeUuid::load_or_create(), resolve_uuid_path()
+│   ├── supervisor/
+│   │   ├── bootstrap.rs      Trusted controller, active/previous executors, health rollback
+│   │   ├── capability.rs     Immutable per-measurement capability leases and quotas
+│   │   ├── runtime.rs        Wasmtime component runtime + diagnostic/fault oracle
+│   │   ├── storage.rs        Crash-safe signed active/previous/high-water slots
+│   │   ├── transport.rs      Opt-in HTTPS signed update bootstrap/poller
+│   │   └── update.rs         Manifest signature/digest/ABI/sequence verification
 │   ├── status/
 │   │   ├── mod.rs
 │   │   ├── status_manager.rs StatusManager — aggregates ping/ICMP/proxy/disconnect state
@@ -75,6 +75,9 @@ globalPing-Rust/
 │       ├── private_ip.rs     is_ip_private() — blocks all RFC-reserved ranges
 │       ├── progress_buffer.rs ProgressBuffer — Append / Diff / Overwrite modes
 │       └── tcp_ping.rs       TCP ping via connect() for latency measurement
+├── crates/
+│   ├── globalping-behavior/       no_std authoritative WASIp2 behavior component
+│   └── globalping-behavior-core/  shared no_std parsers/result shaping/address policy
 ├── tests/
 │   └── integration/
 │       ├── mod.rs
@@ -128,10 +131,35 @@ RUST_LOG=info \
 | `GP_ADOPTION_TOKEN` | _(none)_ | Adoption token sent in WebSocket handshake |
 | `GP_API_HOST` | `https://api.globalping.io` | Globalping API endpoint |
 | `GP_PING_TARGET` | `api.globalping.io` | Target for periodic QA ping tests |
+| `GP_BEHAVIOR_VERIFYING_KEY` | _(none)_ | 64-hex-character Ed25519 public key that explicitly enables trusted WASM behavior bootstrap |
+| `GP_BEHAVIOR_ROOT` | `/.globalping-behavior` | Absolute persistent active/previous behavior-slot directory; only used when behavior bootstrap is enabled |
+| `GP_BEHAVIOR_UPDATE_URL` | _(none)_ | Optional HTTPS directory serving signed `manifest.json` and `component.wasm`; redirects, embedded credentials, query strings, and fragments are rejected |
+| `GP_BEHAVIOR_UPDATE_INTERVAL_SECS` | `300` | Signed behavior update polling interval; valid only when `GP_BEHAVIOR_UPDATE_URL` is set |
 | `RUST_LOG` | `info` | Log level (`error`, `warn`, `info`, `debug`, `trace`) |
 | `RUST_BACKTRACE` | `0` | Set to `1` for panic backtraces |
 
 The probe UUID is persisted to `/.globalping-probe-uuid` (falls back to `$HOME/.globalping-probe-uuid` if the root path is not writable).
+
+Behavior bootstrap is opt-in and fail-closed. With no `GP_BEHAVIOR_*` variables, startup remains native-only. If any behavior option is set, `GP_BEHAVIOR_VERIFYING_KEY` is mandatory; persisted behavior is re-verified and self-tested before use. The update URL is only a transport/discovery source—the locally provisioned Ed25519 key, manifest signature, SHA-256 digest, ABI/supervisor compatibility, and monotonic sequence decide whether an artifact can activate. Put `GP_BEHAVIOR_ROOT` on persistent storage if active/rollback slots must survive container or host replacement. When behavior is active, native execution is shared with the bounded WASM host rather than duplicated. A successful structurally valid verified WASM final result is authoritative and may return before the same-run native diagnostic oracle finishes shaping or enrichment, but only after the guest has observed either a resolution failure or the native execution terminal event; signed behavior cannot return a successful final result while its native measurement is still running. Match/divergence/oracle-failure diagnostics finish independently, are sequence-gated, and cannot mutate the hard-fault rollback streak. Successful traceroute and MTR diagnostics reuse only PTR/ASN results the verified component already requested and do not initiate enrichment network traffic; if the component faults and native fallback becomes API-facing, the oracle may backfill missing enrichment. A native execution failure that is already known when the component finishes still selects the native internal-failure result. Only attributable component faults (for example traps/call failures, rejected authorized jobs, policy violations, or malformed typed final output) advance the rollback streak; post-start component faults wait for the already-running same-run native oracle and fall back to it without rerunning the measurement. When behavior is active, bounded WASM progress is API-facing too; native progress is suppressed on the shared execution and remains only for native-only startup or pre-start behavior fallback. Behavior ABI v6 carries an explicit append/diff/overwrite progress mode, so the verified component—not native command dispatch—owns progress coalescing policy on the behavior path.
+
+### Packaging signed behavior updates
+
+The signing key stays outside the probe runtime. Build the WASIp2 behavior component, then use the separate offline packer to create the exact two files consumed by `GP_BEHAVIOR_UPDATE_URL`:
+
+```bash
+cargo +1.99.0 build --locked --release \
+  -p globalping-behavior --target wasm32-wasip2
+
+printf '%s\n' "$GP_BEHAVIOR_SIGNING_SEED_HEX" | \
+  cargo +1.99.0 run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
+    --component target/wasm32-wasip2/release/globalping_behavior.wasm \
+    --output-dir target/behavior-release-42 \
+    --sequence 42 \
+    --build-id git-$(git rev-parse --short=12 HEAD) \
+    --signing-key -
+```
+
+`--signing-key` accepts either `-` for stdin or a file containing exactly a 32-byte Ed25519 seed encoded as 64 hexadecimal characters. The sequence must be positive and strictly newer than the probe's persisted accepted high-water mark. The output directory must not already exist; on success it contains only `manifest.json` and `component.wasm`. The packer hashes and signs the component, then round-trips the pair through the production verifier before writing it. Publish the pair together under the configured HTTPS update directory; never place private signing material on the probe host.
 
 ---
 
@@ -145,7 +173,7 @@ cargo test --all -- --nocapture           # show stdout during tests
 cargo test <name>                         # run tests matching name
 ```
 
-614 tests pass as of the latest build, covering every module and command.
+The Rust 1.99 CI matrix covers unit, integration, signed-behavior runtime, deterministic differential, and strict Clippy/rustdoc gates.
 
 ### Test layout
 

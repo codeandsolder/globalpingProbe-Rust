@@ -1,10 +1,8 @@
 use super::disconnect::DisconnectTracker;
-use super::icmp_tcp_test::IcmpTcpTest;
+use super::icmp_tcp_test::{DEFAULT_TARGETS, IcmpTcpTest};
 use super::ping_test::PingTest;
 
-const DEFAULT_ICMP_TCP_TARGETS: &[&str] = &["1.1.1.1", "8.8.8.8", "9.9.9.9"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeStatus {
     Initializing,
     Ready,
@@ -59,18 +57,21 @@ impl StatusManager {
     }
 
     /// Derive the current probe status. Mirrors `StatusManager.getStatus()` in TypeScript.
-    /// Priority (highest → lowest): sigterm → initializing → ping-test-failed →
-    /// icmp-tcp-test-failed → too-many-disconnects → ready.
+    /// Priority (highest → lowest): sigterm → ping initialization/failure →
+    /// ICMP/TCP initialization/failure → too-many-disconnects → ready.
     #[must_use]
     pub fn status(&self) -> ProbeStatus {
         if self.sigterm {
             return ProbeStatus::Sigterm;
         }
-        if self.ping_test_failed.is_none() || self.icmp_tcp_test_failed.is_none() {
+        if self.ping_test_failed.is_none() {
             return ProbeStatus::Initializing;
         }
         if self.ping_test_failed == Some(true) {
             return ProbeStatus::PingTestFailed;
+        }
+        if self.icmp_tcp_test_failed.is_none() {
+            return ProbeStatus::Initializing;
         }
         if self.icmp_tcp_test_failed == Some(true) {
             return ProbeStatus::IcmpTcpTestFailed;
@@ -90,21 +91,31 @@ impl StatusManager {
         (ipv4, ipv6)
     }
 
-    /// Run the ICMP/TCP VPN-detection test and record result.
-    /// Returns true if VPN detected (test failed).
-    pub async fn run_icmp_tcp_test(&mut self) -> bool {
-        let detected = self.icmp_tcp_test.run_once(DEFAULT_ICMP_TCP_TARGETS).await;
+    /// Run the ICMP/TCP VPN-detection measurement. Upstream does not
+    /// finalize the status until the API `isProxy` value is known.
+    pub async fn run_icmp_tcp_test(&mut self) -> Option<bool> {
+        if self.icmp_tcp_test.is_proxy().is_none() {
+            self.icmp_tcp_test.measure_once(DEFAULT_TARGETS).await;
+            self.icmp_tcp_test_failed = None;
+            return None;
+        }
+        let detected = self.icmp_tcp_test.run_once(DEFAULT_TARGETS).await;
         self.icmp_tcp_test_failed = Some(detected);
-        detected
+        Some(detected)
     }
 
-    /// Notify that `is_proxy` info arrived from the API (via socket event).
-    /// Re-evaluates VPN detection with existing diffs.
-    pub fn on_proxy_status(&mut self, is_proxy: bool) {
+    /// Notify that `is_proxy` info arrived from the API. Returns true when an
+    /// existing measurement crosses the VPN threshold and needs confirmation.
+    pub fn on_proxy_status(&mut self, is_proxy: bool) -> bool {
         let vpn = self.icmp_tcp_test.set_proxy_and_evaluate(is_proxy);
-        if self.icmp_tcp_test_failed.is_some() {
-            self.icmp_tcp_test_failed = Some(vpn);
+        if !self.icmp_tcp_test.has_measurements() {
+            return false;
         }
+        if vpn {
+            return true;
+        }
+        self.icmp_tcp_test_failed = Some(false);
+        false
     }
 
     /// Record a disconnect; returns true if the "too-many-disconnects" threshold is hit.
@@ -208,6 +219,14 @@ mod tests {
     }
 
     #[test]
+    fn ping_test_failure_precedes_pending_icmp_tcp_test() {
+        let mut m = mgr();
+        m.ping_test_failed = Some(true);
+        m.icmp_tcp_test_failed = None;
+        assert_eq!(m.status(), ProbeStatus::PingTestFailed);
+    }
+
+    #[test]
     fn icmp_tcp_takes_priority_over_disconnects() {
         let mut m = mgr();
         m.ping_test_failed = Some(false);
@@ -246,9 +265,9 @@ mod tests {
         m.icmp_tcp_test.diffs_v6 = vec![];
         assert_eq!(m.status(), ProbeStatus::Ready);
 
-        m.on_proxy_status(true);
-        assert_eq!(m.icmp_tcp_test_failed, Some(true));
-        assert_eq!(m.status(), ProbeStatus::IcmpTcpTestFailed);
+        assert!(m.on_proxy_status(true));
+        assert_eq!(m.icmp_tcp_test_failed, Some(false));
+        assert_eq!(m.status(), ProbeStatus::Ready);
     }
 
     #[test]

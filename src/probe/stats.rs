@@ -1,126 +1,125 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use anyhow::{Context, Result};
+use serde::Serialize;
+use tokio::time::{Duration, sleep};
 
-/// Tracks how many measurements were started and finished in the current
-/// reporting window.  All methods are lock-free (atomic operations).
-pub struct MeasurementStats {
-    started: AtomicU64,
-    finished: AtomicU64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTimes {
+    total: u64,
+    idle: u64,
 }
 
-impl MeasurementStats {
-    #[must_use]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            started: AtomicU64::new(0),
-            finished: AtomicU64::new(0),
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct CpuLoad {
+    pub usage: f64,
+}
+
+/// Parse per-logical-CPU counters from Linux `/proc/stat`.
+#[must_use]
+pub fn parse_proc_stat(input: &str) -> Vec<CpuTimes> {
+    input
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let name = fields.next()?;
+            if !name.starts_with("cpu")
+                || name == "cpu"
+                || !name[3..].bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            let values: Vec<u64> = fields.filter_map(|field| field.parse().ok()).collect();
+            if values.len() < 4 {
+                return None;
+            }
+            let total = values.iter().take(8).copied().sum();
+            let idle = values[3].saturating_add(values.get(4).copied().unwrap_or(0));
+            Some(CpuTimes { total, idle })
         })
-    }
-
-    pub fn record_start(&self) {
-        self.started.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn record_finish(&self) {
-        self.finished.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn started(&self) -> u64 {
-        self.started.load(Ordering::Relaxed)
-    }
-    pub fn finished(&self) -> u64 {
-        self.finished.load(Ordering::Relaxed)
-    }
-
-    /// Take a snapshot and reset both counters to zero atomically.
-    pub fn take(&self) -> (u64, u64) {
-        let s = self.started.swap(0, Ordering::Relaxed);
-        let f = self.finished.swap(0, Ordering::Relaxed);
-        (s, f)
-    }
+        .collect()
 }
 
-// ── Unit tests ────────────────────────────────────────────────────────────────
+fn usage_percent(start: CpuTimes, end: CpuTimes) -> f64 {
+    let total = end.total.saturating_sub(start.total);
+    if total == 0 {
+        return 0.0;
+    }
+    let idle = end.idle.saturating_sub(start.idle).min(total);
+    let idle_basis_points =
+        ((u128::from(idle) * 10_000 + u128::from(total / 2)) / u128::from(total)).min(10_000);
+    let busy_basis_points = 10_000_u128.saturating_sub(idle_basis_points);
+    let bounded = u32::try_from(busy_basis_points).unwrap_or(10_000);
+    f64::from(bounded) / 100.0
+}
+
+async fn read_cpu_times() -> Result<Vec<CpuTimes>> {
+    let stat = tokio::fs::read_to_string("/proc/stat")
+        .await
+        .context("failed to read /proc/stat")?;
+    Ok(parse_proc_stat(&stat))
+}
+
+/// Sample per-CPU utilization over one second, matching the official probe's cadence.
+///
+/// # Errors
+/// Returns an error when Linux CPU counters cannot be read.
+pub async fn get_cpu_usage() -> Result<Vec<CpuLoad>> {
+    let start = read_cpu_times().await?;
+    sleep(Duration::from_secs(1)).await;
+    let end = read_cpu_times().await?;
+    Ok(start
+        .into_iter()
+        .zip(end)
+        .map(|(before, after)| CpuLoad {
+            usage: usage_percent(before, after),
+        })
+        .collect())
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn initial_counts_are_zero() {
-        let s = MeasurementStats::new();
-        assert_eq!(s.started(), 0);
-        assert_eq!(s.finished(), 0);
+    fn parses_only_per_cpu_lines() {
+        let input =
+            "cpu  30 0 20 50 0 0 0 0\ncpu0 10 0 5 25 0 0 0 0\ncpu1 20 0 15 25 0 0 0 0\nintr 7\n";
+        let parsed = parse_proc_stat(input);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0],
+            CpuTimes {
+                total: 40,
+                idle: 25
+            }
+        );
+        assert_eq!(
+            parsed[1],
+            CpuTimes {
+                total: 60,
+                idle: 25
+            }
+        );
     }
 
     #[test]
-    fn record_start_increments() {
-        let s = MeasurementStats::new();
-        s.record_start();
-        s.record_start();
-        assert_eq!(s.started(), 2);
-        assert_eq!(s.finished(), 0);
+    fn computes_usage_to_two_decimal_places() {
+        let start = CpuTimes {
+            total: 100,
+            idle: 40,
+        };
+        let end = CpuTimes {
+            total: 300,
+            idle: 90,
+        };
+        assert_eq!(usage_percent(start, end), 75.0);
     }
 
     #[test]
-    fn record_finish_increments() {
-        let s = MeasurementStats::new();
-        s.record_start();
-        s.record_finish();
-        assert_eq!(s.started(), 1);
-        assert_eq!(s.finished(), 1);
-    }
-
-    #[test]
-    fn take_returns_snapshot_and_resets() {
-        let s = MeasurementStats::new();
-        s.record_start();
-        s.record_start();
-        s.record_finish();
-        let (started, finished) = s.take();
-        assert_eq!(started, 2);
-        assert_eq!(finished, 1);
-        // counters reset after take
-        assert_eq!(s.started(), 0);
-        assert_eq!(s.finished(), 0);
-    }
-
-    #[test]
-    fn take_on_zero_returns_zeros() {
-        let s = MeasurementStats::new();
-        let (a, b) = s.take();
-        assert_eq!(a, 0);
-        assert_eq!(b, 0);
-    }
-
-    #[tokio::test]
-    async fn shared_arc_accumulates_from_multiple_tasks() {
-        let s = MeasurementStats::new();
-        let mut handles = vec![];
-        for _ in 0..10 {
-            let s2 = Arc::clone(&s);
-            handles.push(tokio::spawn(async move {
-                s2.record_start();
-                s2.record_finish();
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-        assert_eq!(s.started(), 10);
-        assert_eq!(s.finished(), 10);
-    }
-
-    #[test]
-    fn second_take_after_new_activity() {
-        let s = MeasurementStats::new();
-        s.record_start();
-        s.take(); // clears to 0
-        s.record_start();
-        s.record_start();
-        let (started, _) = s.take();
-        assert_eq!(started, 2);
+    fn zero_delta_is_zero_usage() {
+        let times = CpuTimes {
+            total: 100,
+            idle: 40,
+        };
+        assert_eq!(usage_percent(times, times), 0.0);
     }
 }

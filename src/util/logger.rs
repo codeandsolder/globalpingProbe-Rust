@@ -11,6 +11,32 @@ use tracing_subscriber::{
 
 use crate::util::logs_transport::ApiLogsLayer;
 
+pub const REGISTERED_SCOPES: &[&str] = &[
+    "adoption-code",
+    "adoption-server",
+    "adoption-status",
+    "api-connection",
+    "api-logs-transport",
+    "general",
+    "measurement:dns",
+    "measurement:http",
+    "measurement:mtr",
+    "measurement:ping",
+    "measurement:traceroute",
+    "probe-alt-ips",
+    "probe-location",
+    "probe-self-update",
+    "probe-settings",
+    "probe-stats-reporter",
+    "status:icmp-tcp",
+    "status:ping",
+];
+
+#[must_use]
+pub fn log_scope_report_delay() -> std::time::Duration {
+    std::time::Duration::from_millis(rand::random_range(0..=60_000))
+}
+
 /// Custom log formatter that matches the Node.js probe log format exactly:
 /// [YYYY-MM-DD HH:MM:SS +00:00] [LEVEL] [scope] message
 struct GpFormat;
@@ -79,4 +105,21 @@ pub fn init() {
         .with(fmt_layer)
         .with(ApiLogsLayer.with_filter(filter2))
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_report_delay_is_within_upstream_window() {
+        for _ in 0..64 {
+            assert!(log_scope_report_delay() <= std::time::Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn upstream_scope_set_is_nonempty() {
+        assert!(REGISTERED_SCOPES.contains(&"probe-settings"));
+    }
 }
