@@ -5,7 +5,7 @@ pub mod parse;
 use super::{ProgressTx, RawExecutionEvent, RawExecutionTx};
 use anyhow::{Result, bail};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashMap;
 use tokio::fs;
 use tokio::process::Command;

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
