@@ -21,7 +21,7 @@ env:
 jobs:
   strict-rust:
     name: Strict Rust
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@3119e52afb16c956bd072363d1f64f0fd916afbb # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@82886ae85915af41ea90bf225bdffb3d9d359f69 # main
     with:
       allow-test-panics: true
 
@@ -34,7 +34,7 @@ jobs:
       - name: Install Rust 1.99.1
         run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
       - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@73448b1d381ada61a26dc3483d10342a7a41246c # main
+        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9190509a6314e35770f27b70dc771d14227e95aa # main
         with:
           rust-toolchain: "1.99.1"
       - name: Toolchain versions
@@ -55,4 +55,4 @@ jobs:
         run: cargo +1.99.1 doc --locked --no-deps
       - name: Finalize mandatory sccache
         if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@73448b1d381ada61a26dc3483d10342a7a41246c # main
+        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9190509a6314e35770f27b70dc771d14227e95aa # main
