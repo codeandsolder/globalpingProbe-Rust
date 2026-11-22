@@ -1387,12 +1387,16 @@ async fn connect_once(
     let builder = ClientBuilder::new(connection_url(cfg))
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
-    let socket = match register_socket_handlers(builder, &state).connect().await {
-        Ok(socket) => socket,
-        Err(error) => {
-            error!(target: "api-connection", "Connection to API failed: {error}");
-            return ConnectOutcome::Transient;
-        }
+    let connect = register_socket_handlers(builder, &state).connect();
+    let socket = tokio::select! {
+        _ = shutdown_rx.changed() => return ConnectOutcome::CleanShutdown,
+        result = connect => match result {
+            Ok(socket) => socket,
+            Err(error) => {
+                error!(target: "api-connection", "Connection to API failed: {error}");
+                return ConnectOutcome::Transient;
+            }
+        },
     };
 
     let tasks = ConnectionTasks::spawn(&state, &socket, &cfg.ping_target);
