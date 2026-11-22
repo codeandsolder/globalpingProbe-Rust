@@ -1706,7 +1706,11 @@ mod tests {
     #[tokio::test]
     async fn pending_shutdown_skips_connection() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let config = cfg("shutdown");
+        let config = ClientConfig {
+            api_host: "http://127.0.0.1:9".into(),
+            ping_target: "127.0.0.1".into(),
+            ..cfg("shutdown")
+        };
         let state = connection_state(&config, &root.path().join("settings.json"));
         let (_shutdown_tx, shutdown_rx) = watch::channel(true);
         assert_eq!(

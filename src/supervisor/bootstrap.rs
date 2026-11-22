@@ -306,11 +306,13 @@ impl BehaviorController {
             return Ok(BehaviorHealthAction::ThresholdReachedNoPrevious);
         }
 
-        let next_executor = self.rollback_with_guard(update).await?;
-        let to_sequence = next_executor.sequence();
-        Ok(BehaviorHealthAction::RolledBack {
-            from_sequence: sequence,
-            to_sequence,
+        // Transfer ownership of the guard to the cancellation-safe transition;
+        // it is released by the commit, not by this waiting future.
+        self.rollback_with_guard(update).await.map(|next_executor| {
+            BehaviorHealthAction::RolledBack {
+                from_sequence: sequence,
+                to_sequence: next_executor.sequence(),
+            }
         })
     }
 
