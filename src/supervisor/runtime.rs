@@ -70,7 +70,7 @@ impl std::error::Error for RuntimeError {}
 impl RuntimeError {
     /// Whether this execution failure is attributable to the behavior component
     /// strongly enough to advance automatic rollback health accounting.
-    #[must_use]
+    #[must_use = "the classification determines whether to count a behavior health fault"]
     pub const fn is_component_health_fault(&self) -> bool {
         matches!(
             self,
@@ -99,7 +99,7 @@ impl BehaviorRuntime {
         Ok(Self { engine })
     }
 
-    #[must_use]
+    #[must_use = "the returned engine is the configured component runtime"]
     pub const fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -144,7 +144,7 @@ impl BehaviorRuntime {
         result.map_err(RuntimeError::GuestSelfTest)
     }
 
-    #[must_use]
+    #[must_use = "the returned limits must be installed to bound guest resources"]
     pub fn store_limits() -> StoreLimits {
         StoreLimitsBuilder::new()
             .memory_size(MAX_GUEST_MEMORY_BYTES)

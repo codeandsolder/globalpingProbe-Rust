@@ -200,7 +200,7 @@ pub(crate) enum RawExecutionEvent {
 pub(crate) struct RawExecutionTx(Sender<RawExecutionEvent>);
 
 impl RawExecutionTx {
-    #[must_use]
+    #[must_use = "both returned endpoints are needed to communicate measurement events"]
     pub(crate) fn channel() -> (Self, Receiver<RawExecutionEvent>) {
         let (tx, rx) = tokio::sync::mpsc::channel(RAW_EXECUTION_EVENT_CAPACITY);
         (Self(tx), rx)
@@ -243,14 +243,14 @@ pub enum ProgressUpdate {
 }
 
 impl ProgressUpdate {
-    #[must_use]
+    #[must_use = "the returned mode determines how progress is combined"]
     pub const fn mode(&self) -> BufferMode {
         match self {
             Self::Value { mode, .. } | Self::Lazy { mode, .. } => *mode,
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned JSON contains the resolved progress value"]
     pub fn resolve(self) -> Value {
         match self {
             Self::Value { value, .. } => value,
@@ -265,13 +265,13 @@ impl ProgressUpdate {
 pub(crate) struct ProgressSink(Sender<ProgressUpdate>);
 
 impl ProgressSink {
-    #[must_use]
+    #[must_use = "both returned endpoints are needed to communicate measurement events"]
     pub(crate) fn channel() -> (Self, Receiver<ProgressUpdate>) {
         let (tx, rx) = tokio::sync::mpsc::channel(PROGRESS_EVENT_CAPACITY);
         (Self(tx), rx)
     }
 
-    #[must_use]
+    #[must_use = "the returned sender binds the progress mode for this measurement"]
     pub(crate) fn fixed(&self, mode: BufferMode) -> ProgressTx {
         ProgressTx {
             tx: self.0.clone(),
@@ -300,7 +300,7 @@ pub struct ProgressTx {
 }
 
 impl ProgressTx {
-    #[must_use]
+    #[must_use = "both returned endpoints are needed to communicate measurement events"]
     pub fn channel(mode: BufferMode) -> (Self, Receiver<ProgressUpdate>) {
         let (sink, rx) = ProgressSink::channel();
         (sink.fixed(mode), rx)

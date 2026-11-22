@@ -87,7 +87,7 @@ pub struct ParsedHttp {
 
 /// Parse the `-D` dump-header file content into (name, value) pairs.
 /// Skips the first line (HTTP status line) and empty lines.
-#[must_use]
+#[must_use = "the returned pairs contain the parsed HTTP headers"]
 pub fn parse_header_file(raw: &str) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for (i, line) in raw.lines().enumerate() {
@@ -106,7 +106,7 @@ pub fn parse_header_file(raw: &str) -> Vec<(String, String)> {
 
 /// Extract HTTP status text from the dump-header first line.
 /// e.g. "HTTP/1.1 200 OK" → Some("OK")
-#[must_use]
+#[must_use = "the returned text is the parsed HTTP status description"]
 pub fn parse_status_text(raw: &str) -> Option<String> {
     let first = raw.lines().next()?.trim_end_matches('\r');
     let parts: Vec<&str> = first.splitn(3, ' ').collect();
@@ -131,7 +131,7 @@ fn pair_min_size(k: &str, v: &str) -> usize {
     k.len() + v.len().min(TRUNCATION_MARK.len()) + 3
 }
 
-#[must_use]
+#[must_use = "the returned result contains the bounded headers and truncation state"]
 pub fn truncate_headers(pairs: Vec<(String, String)>) -> TruncateResult {
     if pairs.is_empty() {
         return TruncateResult {
@@ -240,7 +240,7 @@ pub fn truncate_headers(pairs: Vec<(String, String)>) -> TruncateResult {
 }
 
 /// Collapse header pairs into the deduplicated map (lowercased keys, single or Vec values)
-#[must_use]
+#[must_use = "the returned map contains the combined HTTP header values"]
 pub fn dedup_headers(pairs: &[(String, String)]) -> BTreeMap<String, serde_json::Value> {
     let mut map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     for (k, v) in pairs {
@@ -266,7 +266,7 @@ pub fn dedup_headers(pairs: &[(String, String)]) -> BTreeMap<String, serde_json:
 
 /// Parse curl -v stderr output for TLS connection details.
 /// Returns None if no TLS info found (plain HTTP).
-#[must_use]
+#[must_use = "the returned metadata contains the parsed TLS handshake information"]
 pub fn parse_tls_verbose(verbose: &str, ssl_verify_result: u32) -> Option<TlsInfo> {
     let mut protocol: Option<String> = None;
     let mut cipher_name: Option<String> = None;
@@ -396,7 +396,7 @@ fn parse_curl_date(s: &str) -> Option<String> {
 
 // ── rawOutput builder ─────────────────────────────────────────────────────
 
-#[must_use]
+#[must_use = "the returned string contains the formatted HTTP measurement output"]
 pub fn build_raw_output(
     http_version: Option<&str>,
     status_code: Option<u16>,
@@ -476,7 +476,7 @@ pub fn parse_metrics(raw: &str, verbose: &str) -> Result<HttpMetrics, String> {
     }
 }
 
-#[must_use]
+#[must_use = "the returned message describes the curl failure"]
 pub fn curl_failure_message(verbose: &str, prefer_last: bool) -> String {
     let candidate =
         |line: &&str| line.contains("curl:") || line.contains("error") || line.starts_with("* ");
@@ -492,7 +492,7 @@ pub fn curl_failure_message(verbose: &str, prefer_last: bool) -> String {
     )
 }
 
-#[must_use]
+#[must_use = "the returned message describes the timed-out HTTP phase"]
 pub fn curl_timeout_message(verbose: &str, is_https: bool) -> String {
     if verbose.contains("< HTTP/") || verbose.contains("< HTTP/2") {
         return "Request timed out while downloading the response.".to_string();
@@ -520,7 +520,7 @@ fn rounded_millis(seconds: f64) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-#[must_use]
+#[must_use = "the returned timings contain the derived HTTP phase durations"]
 pub fn build_http_timings(
     metrics: &HttpMetrics,
     dns_ms: Option<u64>,
@@ -549,7 +549,7 @@ pub fn build_http_timings(
     }
 }
 
-#[must_use]
+#[must_use = "the returned value contains the normalized HTTP version"]
 pub fn normalize_http_version(version: &str) -> Option<String> {
     match version {
         "2" | "2.0" => Some("2".to_string()),
@@ -560,7 +560,7 @@ pub fn normalize_http_version(version: &str) -> Option<String> {
     }
 }
 
-#[must_use]
+#[must_use = "the returned body and flag describe the bounded HTTP response"]
 pub fn truncate_body(raw_body: &[u8]) -> (String, bool) {
     if raw_body.len() > BODY_SIZE_LIMIT {
         (
@@ -572,7 +572,7 @@ pub fn truncate_body(raw_body: &[u8]) -> (String, bool) {
     }
 }
 
-#[must_use]
+#[must_use = "the returned result represents the failed HTTP measurement"]
 pub fn failed_result(failure_source: &str, message: String) -> ParsedHttp {
     ParsedHttp {
         status: HttpStatus::Failed,
@@ -602,7 +602,7 @@ pub struct HttpSuccessInput<'a> {
     pub tls: Option<TlsInfo>,
 }
 
-#[must_use]
+#[must_use = "the returned result is the API-facing HTTP measurement"]
 pub fn shape_success_http_result(input: HttpSuccessInput<'_>) -> ParsedHttp {
     let is_https = !input.protocol.eq_ignore_ascii_case("HTTP");
     let status_text = parse_status_text(input.raw_header_file);

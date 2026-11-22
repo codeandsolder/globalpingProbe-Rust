@@ -6,7 +6,7 @@ use core::fmt::Write as _;
 use core::net::IpAddr;
 use serde::{Deserialize, Serialize};
 
-#[must_use]
+#[must_use = "the canonicalized address is returned rather than modifying the input"]
 pub fn normalize_ip_text(raw: &str) -> String {
     let address = raw.split_once('%').map_or(raw, |(address, _)| address);
     address
@@ -83,7 +83,7 @@ const fn fresh() -> HopBuilder {
 
 /// Parse mtr `--raw` output into hops.
 /// `is_final` controls whether the last probe-in-flight is counted as a drop.
-#[must_use]
+#[must_use = "the returned hops contain the parsed MTR measurement"]
 pub fn parse_raw(data: &str, is_final: bool) -> Vec<MtrHop> {
     let mut builders: Vec<Option<HopBuilder>> = Vec::new();
     let mut addr_to_hostname: BTreeMap<String, String> = BTreeMap::new();
@@ -189,7 +189,7 @@ fn count_as_f64(count: usize) -> f64 {
     f64::from(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
-#[must_use]
+#[must_use = "the returned statistics summarize the supplied hop timings"]
 pub fn compute_stats(timings: &[HopTiming], is_final: bool) -> HopStats {
     if timings.is_empty() {
         return HopStats::default();
@@ -417,7 +417,7 @@ fn render_row(display_index: usize, hop: &MtrHop, widths: &OutputWidths) -> Stri
 
 /// Build a human-readable table from parsed hops.
 /// First hop hostname is replaced with `_gateway` (mirrors Node.js behavior).
-#[must_use]
+#[must_use = "the returned string contains the rendered measurement output"]
 pub fn build_output(hops: &[MtrHop]) -> String {
     if hops.is_empty() {
         return String::new();
@@ -459,14 +459,14 @@ pub fn apply_enrichment(hops: &mut [MtrHop], entries: &MtrEnrichmentMap) {
     }
 }
 
-#[must_use]
+#[must_use = "the returned string contains the rendered MTR progress"]
 pub fn render_progress(raw: &str, entries: &MtrEnrichmentMap) -> String {
     let mut hops = parse_raw(raw, false);
     apply_enrichment(&mut hops, entries);
     build_output(&hops)
 }
 
-#[must_use]
+#[must_use = "the returned result contains the API-facing MTR measurement"]
 pub fn shape_result(
     stdout: &str,
     stderr: &str,

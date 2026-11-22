@@ -88,7 +88,7 @@ pub(crate) fn validate(opts: &DnsOptions) -> Result<()> {
     Ok(())
 }
 
-#[must_use]
+#[must_use = "the returned argument list is required to launch the measurement"]
 pub fn build_args(opts: &DnsOptions) -> Vec<String> {
     let mut args = Vec::new();
     if opts.query.record_type == "PTR" {

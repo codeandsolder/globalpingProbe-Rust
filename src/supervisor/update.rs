@@ -26,7 +26,7 @@ pub struct BehaviorManifest {
 }
 
 impl BehaviorManifest {
-    #[must_use]
+    #[must_use = "the returned bytes are the exact manifest data to sign or verify"]
     pub fn signing_payload(&self) -> Vec<u8> {
         format!(
             concat!(
@@ -94,7 +94,7 @@ pub struct VerifiedBehavior {
 }
 
 /// Return whether a manifest build ID is safe for the canonical signed payload and operator logs.
-#[must_use]
+#[must_use = "the validation result must govern whether the build identifier is accepted"]
 pub fn is_valid_build_id(build_id: &str) -> bool {
     !build_id.is_empty()
         && build_id.len() <= MAX_BUILD_ID_BYTES
@@ -216,7 +216,7 @@ pub struct BehaviorSlots {
 }
 
 impl BehaviorSlots {
-    #[must_use]
+    #[must_use = "retain the slot state to track the verified behavior and anti-rollback sequence"]
     pub const fn new(active: VerifiedBehavior) -> Self {
         let accepted_sequence = active.manifest.sequence;
         Self {
@@ -226,12 +226,12 @@ impl BehaviorSlots {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned artifact identifies the currently active behavior"]
     pub const fn active(&self) -> &VerifiedBehavior {
         &self.active
     }
 
-    #[must_use]
+    #[must_use = "the returned high-water mark is needed to enforce anti-rollback"]
     pub const fn accepted_sequence(&self) -> u64 {
         self.accepted_sequence
     }

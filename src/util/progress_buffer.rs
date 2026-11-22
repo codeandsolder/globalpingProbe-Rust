@@ -14,7 +14,7 @@ pub struct ProgressBuffer {
 }
 
 impl ProgressBuffer {
-    #[must_use]
+    #[must_use = "retain the buffer to coalesce measurement progress"]
     pub fn new(mode: BufferMode) -> Self {
         Self {
             buffer: HashMap::new(),
@@ -23,17 +23,17 @@ impl ProgressBuffer {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned mode determines how progress is combined"]
     pub const fn mode(&self) -> BufferMode {
         self.mode
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether progress replaces previous output"]
     pub const fn overwrite(&self) -> bool {
         matches!(self.mode, BufferMode::Overwrite)
     }
 
-    #[must_use]
+    #[must_use = "the result indicates whether buffered progress remains"]
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }

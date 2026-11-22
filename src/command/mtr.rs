@@ -76,7 +76,7 @@ pub(crate) fn validate(opts: &MtrOptions) -> Result<()> {
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 
-#[must_use]
+#[must_use = "the returned argument list is required to launch the measurement"]
 pub fn build_args(opts: &MtrOptions) -> Vec<String> {
     let budget = mtr_budget(opts.packets, opts.timeout);
     let mut args: Vec<String> = vec![

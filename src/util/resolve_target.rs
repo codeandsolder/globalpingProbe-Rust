@@ -39,7 +39,7 @@ impl std::fmt::Display for ResolveTargetError {
 impl std::error::Error for ResolveTargetError {}
 
 impl ResolveTargetError {
-    #[must_use]
+    #[must_use = "the returned source identifies the failure for reporting"]
     pub const fn failure_source_or<'a>(&self, fallback: &'a str) -> &'a str {
         match self {
             Self::PrivateIp => "target",
@@ -48,12 +48,12 @@ impl ResolveTargetError {
         }
     }
 
-    #[must_use]
+    #[must_use = "the result determines whether failure details may be exposed"]
     pub const fn is_exposed(&self) -> bool {
         matches!(self, Self::PrivateIp | Self::TimedOut)
     }
 
-    #[must_use]
+    #[must_use = "the returned message is the sanitized failure description"]
     pub fn public_message(&self) -> String {
         if self.is_exposed() {
             self.to_string()

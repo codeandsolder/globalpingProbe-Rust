@@ -14,7 +14,7 @@ pub struct CpuLoad {
 }
 
 /// Parse per-logical-CPU counters from Linux `/proc/stat`.
-#[must_use]
+#[must_use = "the returned counters are needed to calculate CPU usage"]
 pub fn parse_proc_stat(input: &str) -> Vec<CpuTimes> {
     input
         .lines()

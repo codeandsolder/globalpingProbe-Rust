@@ -47,7 +47,7 @@ pub struct AdoptionServer {
 }
 
 impl AdoptionServer {
-    #[must_use]
+    #[must_use = "retain the server to manage adoption sessions"]
     pub fn new(port: u16, lifetime: Duration, dashboard_url: impl Into<String>) -> Self {
         Self {
             port,
@@ -57,7 +57,7 @@ impl AdoptionServer {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned instance contains the production configuration"]
     pub fn production() -> Self {
         Self::new(
             DEFAULT_ADOPTION_PORT,
@@ -175,7 +175,7 @@ async fn adoption_request(
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-#[must_use]
+#[must_use = "the returned addresses are needed for local interface discovery"]
 pub fn local_ips(limit: usize) -> Vec<String> {
     let interfaces = match get_if_addrs() {
         Ok(interfaces) => interfaces,

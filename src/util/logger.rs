@@ -32,7 +32,7 @@ pub const REGISTERED_SCOPES: &[&str] = &[
     "status:ping",
 ];
 
-#[must_use]
+#[must_use = "the returned duration determines when to report the log scope"]
 pub fn log_scope_report_delay() -> std::time::Duration {
     std::time::Duration::from_millis(rand::random_range(0..=60_000))
 }

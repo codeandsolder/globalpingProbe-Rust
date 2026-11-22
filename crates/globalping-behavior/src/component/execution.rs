@@ -162,7 +162,7 @@ where
     }))
 }
 
-#[must_use]
+#[must_use = "the returned source identifies the resolution failure for reporting"]
 pub const fn resolution_failure_source<'a>(
     failure: &ResolutionFailure,
     fallback: &'a str,
@@ -174,7 +174,7 @@ pub const fn resolution_failure_source<'a>(
     }
 }
 
-#[must_use]
+#[must_use = "the returned message describes the resolution failure"]
 pub fn resolution_failure_message(failure: &ResolutionFailure) -> String {
     match failure.kind {
         ResolutionFailureKind::PrivateAddress => "Private IP ranges are not allowed.",

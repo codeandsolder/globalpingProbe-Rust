@@ -35,7 +35,7 @@ impl BehaviorBootstrapConfig {
     /// The root is intentionally explicit: the supervisor does not guess a
     /// production filesystem location. Relative paths are rejected by
     /// [`BehaviorController::load`].
-    #[must_use]
+    #[must_use = "retain the configuration to initialize the trusted behavior controller"]
     pub fn new(root: impl Into<PathBuf>, verifying_key: VerifyingKey) -> Self {
         Self {
             root: root.into(),
@@ -44,23 +44,23 @@ impl BehaviorBootstrapConfig {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned path identifies the behavior storage root"]
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    #[must_use]
+    #[must_use = "the returned key identifies the configured trust root"]
     pub const fn verifying_key(&self) -> &VerifyingKey {
         &self.verifying_key
     }
 
-    #[must_use]
+    #[must_use = "the returned configuration replaces the consumed configuration"]
     pub const fn with_health_policy(mut self, health_policy: BehaviorHealthPolicy) -> Self {
         self.health_policy = health_policy;
         self
     }
 
-    #[must_use]
+    #[must_use = "the returned policy determines when a behavior fault triggers rollback"]
     pub const fn health_policy(&self) -> BehaviorHealthPolicy {
         self.health_policy
     }
@@ -234,12 +234,12 @@ impl BehaviorController {
     }
 
     /// Return the behavior executor currently admitted for new measurements.
-    #[must_use]
+    #[must_use = "the returned executor is the admitted behavior for new measurements"]
     pub async fn executor(&self) -> Option<Arc<BehaviorExecutor>> {
         self.executors.read().await.active.clone()
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot contains the current behavior health counters"]
     pub async fn health_snapshot(&self) -> BehaviorHealthSnapshot {
         self.health.lock().await.snapshot()
     }

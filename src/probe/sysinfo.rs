@@ -4,7 +4,7 @@ use std::path::Path;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Total physical system RAM in bytes, read from `/proc/meminfo` on Linux.
-#[must_use]
+#[must_use = "the returned byte count is the host memory capacity"]
 pub fn host_total_memory_bytes() -> u64 {
     parse_meminfo_total(&std::fs::read_to_string("/proc/meminfo").unwrap_or_default())
 }
@@ -12,7 +12,7 @@ pub fn host_total_memory_bytes() -> u64 {
 /// Memory effectively available to this process. Upstream v0.53.0 runs on
 /// Node 22.22.3 / libuv 1.51.0, where `process.constrainedMemory()` is derived
 /// from cgroup v1/v2 memory limits only.
-#[must_use]
+#[must_use = "the returned byte count reflects memory constraints"]
 pub fn effective_total_memory_bytes() -> u64 {
     let host_total = host_total_memory_bytes();
     constrained_memory_bytes().map_or(host_total, |limit| host_total.min(limit))
@@ -85,7 +85,7 @@ fn parse_memory_limit(value: &str) -> u64 {
     }
 }
 
-#[must_use]
+#[must_use = "the returned byte count is the parsed memory capacity"]
 pub fn parse_meminfo_total(content: &str) -> u64 {
     for line in content.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
@@ -102,7 +102,7 @@ pub fn parse_meminfo_total(content: &str) -> u64 {
 
 /// Disk usage of "/" in (`total_mb`, `available_mb`).
 /// Returns (0, 0) if unavailable.
-#[must_use]
+#[must_use = "the returned values contain the disk capacity and available space"]
 pub fn disk_info_mb() -> (u64, u64) {
     parse_df_output(&run_df())
 }
@@ -118,7 +118,7 @@ fn run_df() -> String {
 }
 
 /// Parse `df -BM --output=size,avail /` output.
-#[must_use]
+#[must_use = "the returned values contain the parsed disk statistics"]
 pub fn parse_df_output(output: &str) -> (u64, u64) {
     let mut lines = output.lines().skip(1); // skip header
     if let Some(line) = lines.next() {
@@ -132,7 +132,7 @@ pub fn parse_df_output(output: &str) -> (u64, u64) {
     (0, 0)
 }
 
-#[must_use]
+#[must_use = "the classification determines the reported hardware identity"]
 pub fn looks_like_v1_hardware_device() -> bool {
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
@@ -145,7 +145,7 @@ pub fn looks_like_v1_hardware_device() -> bool {
     )
 }
 
-#[must_use]
+#[must_use = "the classification determines the reported hardware identity"]
 pub fn looks_like_v1_hardware_values(
     logical_cpus: usize,
     cpuinfo: &str,

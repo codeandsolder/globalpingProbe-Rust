@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 
-#[must_use]
+#[must_use = "the result determines whether the address may be measured"]
 pub fn is_ip_private(ip: IpAddr) -> bool {
     globalping_behavior_core::ip::is_private_or_reserved(ip, local_addresses())
 }

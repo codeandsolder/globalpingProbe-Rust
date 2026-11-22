@@ -46,12 +46,12 @@ fn ceil_native_timeout(value: f64) -> u64 {
     5
 }
 
-#[must_use]
+#[must_use = "the returned duration bounds the DNS phase of the HTTP measurement"]
 pub fn http_dns_timeout(timeout_seconds: u32) -> f64 {
     round_down((f64::from(timeout_seconds) * 0.4).max(2.0))
 }
 
-#[must_use]
+#[must_use = "the returned budget bounds the ping measurement"]
 pub fn ping_budget(
     packets: u8,
     timeout_seconds: u32,
@@ -108,7 +108,7 @@ pub fn ping_budget(
     }
 }
 
-#[must_use]
+#[must_use = "the returned budget bounds the traceroute measurement"]
 pub fn traceroute_budget(timeout_seconds: u32, probe_waves: u8) -> TracerouteBudget {
     let maximum_wait: f64 = 5.0;
     let timeout = f64::from(timeout_seconds);
@@ -120,7 +120,7 @@ pub fn traceroute_budget(timeout_seconds: u32, probe_waves: u8) -> TracerouteBud
     }
 }
 
-#[must_use]
+#[must_use = "the returned budget bounds the MTR measurement"]
 pub fn mtr_budget(packets: u8, timeout_seconds: u32) -> MtrBudget {
     let minimum_response_timeout = 1.0;
     let preferred_response_timeout = 3.0;
@@ -162,7 +162,7 @@ pub fn mtr_budget(packets: u8, timeout_seconds: u32) -> MtrBudget {
     }
 }
 
-#[must_use]
+#[must_use = "the returned duration bounds subprocess execution"]
 pub fn process_timeout(timeout_seconds: f64) -> Duration {
     Duration::from_secs_f64(timeout_seconds.max(0.0)).saturating_add(PROCESS_GRACE)
 }
@@ -173,19 +173,19 @@ pub struct MeasurementDeadline {
 }
 
 impl MeasurementDeadline {
-    #[must_use]
+    #[must_use = "retain the deadline to bound the measurement phases"]
     pub fn new(timeout_seconds: u32) -> Self {
         Self {
             deadline: Instant::now() + Duration::from_secs(u64::from(timeout_seconds)),
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned duration is the remaining deadline budget"]
     pub fn remaining(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
 
-    #[must_use]
+    #[must_use = "the returned duration bounds subprocess execution"]
     pub fn process_timeout(&self) -> Duration {
         self.remaining().saturating_add(PROCESS_GRACE)
     }

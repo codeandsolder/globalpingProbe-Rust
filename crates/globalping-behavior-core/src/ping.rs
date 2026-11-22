@@ -86,7 +86,7 @@ fn reply_hostname(lines: &[&str]) -> String {
         .to_string()
 }
 
-#[must_use]
+#[must_use = "the returned string contains normalized ping output; the input is unchanged"]
 pub fn normalize_ping_output(raw: &str, address: &str, hostname: &str) -> String {
     if address == hostname {
         return raw.to_string();
@@ -160,7 +160,7 @@ fn parse_stats(raw: &str) -> PingStats {
     stats
 }
 
-#[must_use]
+#[must_use = "the returned result represents the ping failure"]
 pub fn failed_ping(failure_source: impl Into<String>, raw_output: impl Into<String>) -> ParsedPing {
     ParsedPing {
         status: PingStatus::Failed,
@@ -174,7 +174,7 @@ pub fn failed_ping(failure_source: impl Into<String>, raw_output: impl Into<Stri
 }
 
 #[cfg(feature = "ping-standalone")]
-#[must_use]
+#[must_use = "the returned result contains the parsed measurement"]
 pub fn parse(raw_output: &str) -> ParsedPing {
     let lines = raw_output.lines().collect::<Vec<_>>();
     let Some(resolved_address) = header_address(raw_output) else {
@@ -207,7 +207,7 @@ pub fn parse(raw_output: &str) -> ParsedPing {
     }
 }
 
-#[must_use]
+#[must_use = "the returned result is the API-facing ping measurement"]
 pub fn shape_ping_output(
     raw_output: &str,
     address: &str,

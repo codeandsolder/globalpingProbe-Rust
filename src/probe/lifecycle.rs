@@ -31,7 +31,7 @@ pub struct LifecycleTasks {
 }
 
 impl LifecycleTasks {
-    #[must_use]
+    #[must_use = "retain the task handles to supervise and stop the lifecycle tasks"]
     pub fn spawn(shutdown_tx: watch::Sender<bool>) -> Self {
         let update = (std::env::var("NODE_ENV").as_deref() != Ok("development")).then(|| {
             let shutdown_tx = shutdown_tx.clone();

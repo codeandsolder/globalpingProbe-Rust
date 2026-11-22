@@ -20,7 +20,7 @@ pub enum ConnectOutcome {
 }
 
 /// Parse the socket.io connect-error message and return the upstream reconnect policy.
-#[must_use]
+#[must_use = "the returned outcome determines the reconnect policy"]
 pub fn classify_error(msg: &str) -> ConnectOutcome {
     let lower = msg.to_lowercase();
     if lower.starts_with("invalid probe version") || lower.contains("invalid version") {
@@ -50,7 +50,7 @@ pub fn classify_error(msg: &str) -> ConnectOutcome {
 }
 
 /// How long to wait before the next connection attempt.
-#[must_use]
+#[must_use = "the returned delay determines whether and when to reconnect"]
 pub const fn reconnect_delay(outcome: &ConnectOutcome) -> Option<Duration> {
     match outcome {
         ConnectOutcome::CleanShutdown

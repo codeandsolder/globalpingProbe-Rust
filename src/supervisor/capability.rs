@@ -146,7 +146,7 @@ pub struct CapabilityLease {
 }
 
 impl CapabilityLease {
-    #[must_use]
+    #[must_use = "retain the lease to authorize and bound measurement operations"]
     pub fn new(token: CapabilityToken, scope: MeasurementScope, now: Instant) -> Self {
         let expires_at = now + scope.timeout + Duration::from_secs(2);
         Self {
@@ -350,7 +350,7 @@ impl CapabilityLease {
         Ok(())
     }
 
-    #[must_use]
+    #[must_use = "the returned duration is the remaining deadline budget"]
     pub fn remaining(&self, now: Instant) -> Duration {
         self.expires_at.saturating_duration_since(now)
     }

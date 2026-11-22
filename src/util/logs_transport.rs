@@ -49,7 +49,7 @@ pub struct ApiLogsBuffer {
 }
 
 impl ApiLogsBuffer {
-    #[must_use]
+    #[must_use = "retain the transport to collect and forward logs"]
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {

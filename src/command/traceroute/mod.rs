@@ -64,7 +64,7 @@ pub(crate) fn validate(opts: &TracerouteOptions) -> Result<()> {
     Ok(())
 }
 
-#[must_use]
+#[must_use = "the returned argument list is required to launch the measurement"]
 pub fn build_args(opts: &TracerouteOptions) -> Vec<String> {
     let budget = traceroute_budget(opts.timeout, TRACEROUTE_PACKETS);
     let mut args = vec![

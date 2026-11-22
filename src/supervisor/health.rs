@@ -23,14 +23,14 @@ impl Default for BehaviorHealthPolicy {
 }
 
 impl BehaviorHealthPolicy {
-    #[must_use]
+    #[must_use = "the returned policy determines the rollback threshold"]
     pub const fn new(consecutive_faults_before_rollback: NonZeroU32) -> Self {
         Self {
             consecutive_faults_before_rollback,
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned threshold governs fault-triggered rollback"]
     pub const fn consecutive_faults_before_rollback(self) -> NonZeroU32 {
         self.consecutive_faults_before_rollback
     }
@@ -82,7 +82,7 @@ pub struct BehaviorHealthState {
 }
 
 impl BehaviorHealthState {
-    #[must_use]
+    #[must_use = "retain the state to track behavior health against the active sequence"]
     pub const fn new(policy: BehaviorHealthPolicy, active_sequence: Option<u64>) -> Self {
         Self {
             policy,
@@ -98,7 +98,7 @@ impl BehaviorHealthState {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot contains the current behavior health state"]
     pub const fn snapshot(&self) -> BehaviorHealthSnapshot {
         self.snapshot
     }

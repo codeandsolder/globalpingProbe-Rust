@@ -20,7 +20,7 @@ enum TrialOutcome {
 }
 
 impl PingTest {
-    #[must_use]
+    #[must_use = "retain the test state to track connectivity health"]
     pub const fn new() -> Self {
         Self { failed: false }
     }

@@ -37,12 +37,12 @@ pub struct StatusManager {
 }
 
 impl StatusManager {
-    #[must_use]
+    #[must_use = "retain the manager to track and report probe health"]
     pub fn new() -> Self {
         Self::with_api_host("api.globalping.io")
     }
 
-    #[must_use]
+    #[must_use = "the returned status manager owns the selected API host"]
     pub fn with_api_host(host: &str) -> Self {
         Self {
             ping_test_failed: None,
@@ -59,7 +59,7 @@ impl StatusManager {
     /// Derive the current probe status. Mirrors `StatusManager.getStatus()` in TypeScript.
     /// Priority (highest → lowest): sigterm → ping initialization/failure →
     /// ICMP/TCP initialization/failure → too-many-disconnects → ready.
-    #[must_use]
+    #[must_use = "the returned status is the probe state to report"]
     pub fn status(&self) -> ProbeStatus {
         if self.sigterm {
             return ProbeStatus::Sigterm;
@@ -136,7 +136,7 @@ impl StatusManager {
         self.sigterm = true;
     }
 
-    #[must_use]
+    #[must_use = "the result indicates the known IPv4 support state"]
     pub fn ipv4_supported(&self) -> Option<bool> {
         // If ping test hasn't run, unknown
         self.ping_test_failed

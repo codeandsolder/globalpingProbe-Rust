@@ -177,17 +177,17 @@ impl ProductionBehaviorConfig {
         }))
     }
 
-    #[must_use]
+    #[must_use = "the returned configuration is needed to initialize the controller"]
     pub fn bootstrap_config(&self) -> BehaviorBootstrapConfig {
         self.bootstrap.clone()
     }
 
-    #[must_use]
+    #[must_use = "the returned path identifies the behavior storage root"]
     pub fn root(&self) -> &Path {
         self.bootstrap.root()
     }
 
-    #[must_use]
+    #[must_use = "the returned URL identifies the configured signed-update source"]
     pub const fn update_base(&self) -> Option<&Url> {
         self.update_base.as_ref()
     }

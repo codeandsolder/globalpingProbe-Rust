@@ -1434,12 +1434,12 @@ impl BehaviorExecutor {
         Ok(Self { runtime, compiled })
     }
 
-    #[must_use]
+    #[must_use = "the returned sequence identifies the admitted signed behavior"]
     pub const fn sequence(&self) -> u64 {
         self.compiled.sequence
     }
 
-    #[must_use]
+    #[must_use = "the returned identifier identifies the admitted signed build"]
     pub fn build_id(&self) -> &str {
         &self.compiled.build_id
     }

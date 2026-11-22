@@ -264,7 +264,7 @@ fn parse_classic_inner(raw: &str, local_addresses: &[String]) -> ClassicResult {
 }
 
 /// Parse classic `dig` output and redact resolver addresses rejected by the shared policy.
-#[must_use]
+#[must_use = "the returned result contains the parsed classic DNS response"]
 pub fn parse_classic(raw: &str, local_addresses: &[String]) -> ClassicResult {
     parse_classic_inner(raw, local_addresses)
 }
@@ -295,7 +295,7 @@ fn push_trace_hop(
 }
 
 /// Parse `dig +trace` output.
-#[must_use]
+#[must_use = "the returned result contains the parsed DNS trace"]
 pub fn parse_trace(raw: &str) -> TraceResult {
     let lines = raw.split('\n').collect::<Vec<_>>();
     if lines.len() < 3
@@ -354,7 +354,7 @@ fn classic_has_private_answer_inner(result: &ClassicResult, policy: DnsPolicy<'_
             .any(|answer| answer_is_private(&answer.value, policy.local_addresses))
 }
 
-#[must_use]
+#[must_use = "the classification determines whether to reject the classic DNS response"]
 pub fn classic_has_private_answer(result: &ClassicResult, policy: DnsPolicy<'_>) -> bool {
     classic_has_private_answer_inner(result, policy)
 }
@@ -368,13 +368,13 @@ fn trace_has_private_answer_inner(result: &TraceResult, policy: DnsPolicy<'_>) -
             .any(|answer| answer_is_private(&answer.value, policy.local_addresses))
 }
 
-#[must_use]
+#[must_use = "the classification determines whether to reject the DNS trace"]
 pub fn trace_has_private_answer(result: &TraceResult, policy: DnsPolicy<'_>) -> bool {
     trace_has_private_answer_inner(result, policy)
 }
 
 /// Classify an incremental DNS stdout prefix for API progress.
-#[must_use]
+#[must_use = "the returned value contains the API-facing progress update"]
 pub fn progress_output(raw: &str, trace: bool, policy: DnsPolicy<'_>) -> DnsProgress {
     if trace {
         let result = parse_trace(raw);
@@ -471,7 +471,7 @@ fn apply_failure(
     }
 }
 
-#[must_use]
+#[must_use = "the returned result is the API-facing classic DNS response"]
 pub fn shape_classic_output(
     raw: &str,
     stderr: &str,
@@ -495,7 +495,7 @@ pub fn shape_classic_output(
     result
 }
 
-#[must_use]
+#[must_use = "the returned result is the API-facing DNS trace"]
 pub fn shape_trace_output(
     raw: &str,
     stderr: &str,

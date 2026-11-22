@@ -63,7 +63,7 @@ fn failed(raw_output: &str) -> ParsedTraceroute {
     }
 }
 
-#[must_use]
+#[must_use = "the returned result represents the traceroute failure"]
 pub fn failed_traceroute(
     failure_source: impl Into<String>,
     raw_output: impl Into<String>,
@@ -100,7 +100,7 @@ fn line_address_tokens(line: &str) -> Vec<(&str, IpAddr)> {
         .collect()
 }
 
-#[must_use]
+#[must_use = "the returned addresses are the hop addresses parsed from the line"]
 pub fn line_addresses(line: &str) -> Vec<IpAddr> {
     line_address_tokens(line)
         .into_iter()
@@ -158,7 +158,7 @@ fn parse_hop(line: &str) -> TracerouteHop {
     }
 }
 
-#[must_use]
+#[must_use = "the returned result contains the parsed measurement"]
 pub fn parse(raw_output: &str) -> ParsedTraceroute {
     let mut lines = raw_output.lines();
     let Some(header) = lines.next() else {
@@ -223,7 +223,7 @@ fn normalize_header(first: &str, identity: TracerouteIdentity<'_>) -> String {
     )
 }
 
-#[must_use]
+#[must_use = "the returned string contains normalized traceroute output; the input is unchanged"]
 pub fn normalize_numeric_output(
     raw: &str,
     identity: TracerouteIdentity<'_>,
@@ -266,7 +266,7 @@ pub fn normalize_numeric_output(
     output.join("\n")
 }
 
-#[must_use]
+#[must_use = "the returned value contains the API-facing progress update"]
 pub fn progress_output(raw: &str, identity: TracerouteIdentity<'_>) -> String {
     normalize_numeric_output(raw, identity, &TracerouteHostnames::new())
 }
@@ -299,7 +299,7 @@ fn timeout_failure_source(
     }
 }
 
-#[must_use]
+#[must_use = "the returned result is the API-facing traceroute measurement"]
 pub fn shape_traceroute_output(
     raw: &str,
     stderr: &str,

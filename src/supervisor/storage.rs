@@ -180,17 +180,17 @@ impl PersistentBehaviorSlots {
         })
     }
 
-    #[must_use]
+    #[must_use = "the returned artifact identifies the currently active behavior"]
     pub const fn active(&self) -> &VerifiedBehavior {
         &self.active
     }
 
-    #[must_use]
+    #[must_use = "the returned artifact is the available rollback target"]
     pub const fn previous(&self) -> Option<&VerifiedBehavior> {
         self.previous.as_ref()
     }
 
-    #[must_use]
+    #[must_use = "the returned high-water mark is needed to enforce anti-rollback"]
     pub const fn accepted_sequence(&self) -> u64 {
         self.accepted_sequence
     }

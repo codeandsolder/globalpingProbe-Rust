@@ -21,13 +21,13 @@ pub struct ActiveJobs {
 }
 
 impl ActiveJobs {
-    #[must_use]
+    #[must_use = "retain the tracker to account for active measurements"]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register one active measurement. Dropping the returned guard completes it.
-    #[must_use]
+    #[must_use = "dropping the job guard immediately removes the job from active tracking"]
     pub fn start(&self) -> ActiveJob {
         self.inner.count.fetch_add(1, Ordering::AcqRel);
         ActiveJob {
@@ -35,7 +35,7 @@ impl ActiveJobs {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned count indicates how many jobs are still active"]
     pub fn count(&self) -> usize {
         self.inner.count.load(Ordering::Acquire)
     }

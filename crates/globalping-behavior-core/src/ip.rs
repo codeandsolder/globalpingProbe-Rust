@@ -15,7 +15,7 @@ fn prefix_matches(bytes: &[u8], network: &[u8], prefix_bits: u8) -> bool {
 
 /// Collapse IPv6 forms that embed IPv4 addresses so private-range checks apply
 /// to the address that will actually be routed.
-#[must_use]
+#[must_use = "the returned canonical IP must be used in place of the original address"]
 pub fn canonical_address(address: IpAddr) -> IpAddr {
     let IpAddr::V6(v6) = address else {
         return address;
@@ -37,7 +37,7 @@ pub fn canonical_address(address: IpAddr) -> IpAddr {
 ///
 /// `local_addresses` is caller-supplied because discovering interface state is
 /// privileged/native work; the pure classifier remains usable from `WASIp2`.
-#[must_use]
+#[must_use = "the result determines whether the address may be measured"]
 pub fn is_private_or_reserved<I>(address: IpAddr, local_addresses: I) -> bool
 where
     I: IntoIterator<Item = IpAddr>,

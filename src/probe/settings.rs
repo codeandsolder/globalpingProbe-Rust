@@ -55,7 +55,7 @@ pub struct ProbeSettingsStore {
 }
 
 impl ProbeSettingsStore {
-    #[must_use]
+    #[must_use = "retain the store to read and persist probe settings"]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         Self {
@@ -65,7 +65,7 @@ impl ProbeSettingsStore {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned instance contains the production configuration"]
     pub fn production() -> Self {
         Self::new(DEFAULT_SETTINGS_PATH)
     }
