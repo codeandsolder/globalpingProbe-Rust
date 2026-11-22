@@ -11,6 +11,8 @@
 # ── Stage 1: dependency cache ─────────────────────────────────────────────────
 # Pre-build all crate dependencies so that rebuilds triggered by source-only
 # changes don't re-download/re-compile the entire dependency tree.
+# Bootstrap rustup from the distro-compatible image; the native manifest
+# below selects the compiler for every Cargo invocation.
 FROM rust:1.100.0-slim-bookworm AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -21,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # Copy manifests only (.cargo/config.toml is a local Windows dev artifact, not needed in container)
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 
 # Stub out src so we can compile deps without the real source
 RUN mkdir -p src tests/integration \
@@ -29,7 +31,7 @@ RUN mkdir -p src tests/integration \
  && echo '' > tests/integration/mod.rs
 
 # Build dependencies only (will be cached unless Cargo.toml/Cargo.lock change)
-RUN cargo build --release \
+RUN cargo build --locked --release \
  && rm -rf src tests
 
 # ── Stage 2: compile the probe ────────────────────────────────────────────────
@@ -41,7 +43,7 @@ COPY tests ./tests
 # Touch main.rs so cargo knows it changed (avoids stale-artifact issues)
 RUN touch src/main.rs
 
-RUN cargo build --release
+RUN cargo build --locked --release
 
 # ── Stage 3: minimal runtime image ───────────────────────────────────────────
 FROM debian:bookworm-slim

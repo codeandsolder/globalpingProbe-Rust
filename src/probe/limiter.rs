@@ -17,12 +17,12 @@ pub struct MeasurementLimiter {
 }
 
 impl MeasurementLimiter {
-    #[must_use]
+    #[must_use = "the returned limiter owns the measurement budget"]
     pub fn new() -> Self {
         Self::with_capacity(MAX_CONCURRENT)
     }
 
-    #[must_use]
+    #[must_use = "the returned limiter owns the measurement budget"]
     pub fn with_capacity(n: usize) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(n)),
@@ -32,20 +32,20 @@ impl MeasurementLimiter {
 
     /// Attempt to acquire a slot without blocking.
     /// Returns `Some(slot)` if capacity is available, `None` if full.
-    #[must_use]
+    #[must_use = "the returned permit must be retained for the measurement lifetime"]
     pub fn try_acquire(&self) -> Option<MeasurementSlot> {
         Arc::clone(&self.semaphore).try_acquire_owned().ok()
     }
 
     /// Number of measurements currently running.
-    #[must_use]
+    #[must_use = "the returned count reports active measurements"]
     pub fn in_flight(&self) -> usize {
         self.capacity
             .saturating_sub(self.semaphore.available_permits())
     }
 
     /// Maximum simultaneous measurements.
-    #[must_use]
+    #[must_use = "the returned limit bounds concurrent measurements"]
     pub const fn capacity(&self) -> usize {
         self.capacity
     }

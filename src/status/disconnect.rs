@@ -9,7 +9,7 @@ pub struct DisconnectTracker {
 }
 
 impl DisconnectTracker {
-    #[must_use]
+    #[must_use = "the returned tracker owns the disconnect state"]
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),

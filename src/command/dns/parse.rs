@@ -199,7 +199,7 @@ pub fn parse_classic(raw: &str) -> ClassicResult {
 }
 
 /// Parse `dig +trace` output.
-#[must_use]
+#[must_use = "the returned trace describes the DNS resolution path"]
 pub fn parse_trace(raw: &str) -> TraceResult {
     let lines: Vec<&str> = raw.split('\n').collect();
 

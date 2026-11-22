@@ -402,7 +402,7 @@ pub mod parse {
 
     /// Build a human-readable table from parsed hops.
     /// First hop hostname is replaced with `_gateway` (mirrors Node.js behavior).
-    #[must_use]
+    #[must_use = "the returned string represents the measured route"]
     pub fn build_output(hops: &[MtrHop]) -> String {
         if hops.is_empty() {
             return String::new();
@@ -489,7 +489,7 @@ fn validate(opts: &MtrOptions) -> Result<()> {
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 
-#[must_use]
+#[must_use = "the returned arguments are needed to execute the measurement command"]
 pub fn build_args(opts: &MtrOptions) -> Vec<String> {
     let mut args: Vec<String> = vec![
         format!("-{}", opts.ip_version),

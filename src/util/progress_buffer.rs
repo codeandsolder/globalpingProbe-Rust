@@ -14,7 +14,7 @@ pub struct ProgressBuffer {
 }
 
 impl ProgressBuffer {
-    #[must_use]
+    #[must_use = "the returned buffer owns measurement progress updates"]
     pub fn new(mode: BufferMode) -> Self {
         Self {
             buffer: HashMap::new(),

@@ -24,7 +24,7 @@ pub struct IcmpTcpTest {
 }
 
 impl IcmpTcpTest {
-    #[must_use]
+    #[must_use = "the returned test owns the protocol comparison state"]
     pub const fn new() -> Self {
         Self {
             failed: false,
@@ -58,16 +58,16 @@ impl IcmpTcpTest {
         self.failed
     }
 
-    #[must_use]
+    #[must_use = "the returned decision indicates whether VPN characteristics were observed"]
     pub fn is_vpn_detected(&self) -> bool {
         is_vpn(&self.diffs_v4, self.is_proxy) || is_vpn(&self.diffs_v6, self.is_proxy)
     }
 
-    #[must_use]
+    #[must_use = "the returned differences describe IPv4 measurement evidence"]
     pub fn diffs_v4(&self) -> &[Option<f64>] {
         &self.diffs_v4
     }
-    #[must_use]
+    #[must_use = "the returned differences describe IPv6 measurement evidence"]
     pub fn diffs_v6(&self) -> &[Option<f64>] {
         &self.diffs_v6
     }
@@ -81,7 +81,7 @@ impl Default for IcmpTcpTest {
 
 /// Returns true if the diffs indicate a VPN/proxy setup.
 /// null diffs (error cases) are treated as pass (conservative).
-#[must_use]
+#[must_use = "the returned decision describes the measurement evidence for a VPN"]
 pub fn is_vpn(diffs: &[Option<f64>], is_proxy: Option<bool>) -> bool {
     let numeric: Vec<f64> = diffs.iter().filter_map(|d| *d).collect();
     let over_high = numeric.iter().filter(|&&d| d >= VPN_DIFF_HIGH).count();

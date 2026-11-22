@@ -11,7 +11,7 @@ enum AltIpError {
 
 /// Enumerate all public IP addresses from local network interfaces.
 /// Uses `ip -o addr show scope global` to filter out loopback and link-local.
-#[must_use]
+#[must_use = "the returned addresses identify the probe interfaces"]
 pub async fn get_local_public_ips() -> Vec<IpAddr> {
     let Ok(out) = tokio::process::Command::new("ip")
         .args(["-o", "addr", "show", "scope", "global"])

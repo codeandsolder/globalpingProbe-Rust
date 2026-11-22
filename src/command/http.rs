@@ -81,7 +81,7 @@ pub mod parse {
 
     /// Parse the `-D` dump-header file content into (name, value) pairs.
     /// Skips the first line (HTTP status line) and empty lines.
-    #[must_use]
+    #[must_use = "the returned pairs contain the parsed response headers"]
     pub fn parse_header_file(raw: &str) -> Vec<(String, String)> {
         let mut pairs = Vec::new();
         for (i, line) in raw.lines().enumerate() {
@@ -100,7 +100,7 @@ pub mod parse {
 
     /// Extract HTTP status text from the dump-header first line.
     /// e.g. "HTTP/1.1 200 OK" → Some("OK")
-    #[must_use]
+    #[must_use = "the returned status text describes the HTTP response"]
     pub fn parse_status_text(raw: &str) -> Option<String> {
         let first = raw.lines().next()?.trim_end_matches('\r');
         let parts: Vec<&str> = first.splitn(3, ' ').collect();
@@ -125,7 +125,7 @@ pub mod parse {
         k.len() + v.len().min(TRUNCATION_MARK.len()) + 3
     }
 
-    #[must_use]
+    #[must_use = "the returned header set incorporates the configured output limit"]
     pub fn truncate_headers(pairs: Vec<(String, String)>) -> TruncateResult {
         if pairs.is_empty() {
             return TruncateResult {
@@ -235,7 +235,7 @@ pub mod parse {
     }
 
     /// Collapse header pairs into the deduplicated map (lowercased keys, single or Vec values)
-    #[must_use]
+    #[must_use = "the returned map represents the normalized response headers"]
     pub fn dedup_headers(pairs: &[(String, String)]) -> HashMap<String, serde_json::Value> {
         let mut map: HashMap<String, serde_json::Value> = HashMap::new();
         for (k, v) in pairs {
@@ -261,7 +261,7 @@ pub mod parse {
 
     /// Parse curl -v stderr output for TLS connection details.
     /// Returns None if no TLS info found (plain HTTP).
-    #[must_use]
+    #[must_use = "the returned information describes the negotiated TLS connection"]
     pub fn parse_tls_verbose(verbose: &str, ssl_verify_result: u32) -> Option<TlsInfo> {
         let mut protocol: Option<String> = None;
         let mut cipher_name: Option<String> = None;
@@ -367,7 +367,7 @@ pub mod parse {
 
     // ── rawOutput builder ─────────────────────────────────────────────────────
 
-    #[must_use]
+    #[must_use = "the returned string represents the measurement response"]
     pub fn build_raw_output(
         http_version: Option<&str>,
         status_code: Option<u16>,
