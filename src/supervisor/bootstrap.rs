@@ -290,14 +290,19 @@ impl BehaviorController {
             health.observe(sequence, event)
         };
         match decision {
-            HealthDecision::None => return Ok(BehaviorHealthAction::None),
+            HealthDecision::None => {
+                drop(update);
+                return Ok(BehaviorHealthAction::None);
+            }
             HealthDecision::IgnoredStaleSequence => {
+                drop(update);
                 return Ok(BehaviorHealthAction::IgnoredStaleSequence);
             }
             HealthDecision::RollbackRecommended => {}
         }
 
         if !self.has_previous()? {
+            drop(update);
             return Ok(BehaviorHealthAction::ThresholdReachedNoPrevious);
         }
 

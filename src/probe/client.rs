@@ -1370,42 +1370,44 @@ async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_ti
 /// Connect once and run until shutdown, an API-requested restart, or disconnect.
 async fn connect_once(
     cfg: &ClientConfig,
-    status_manager: Arc<Mutex<StatusManager>>,
-    settings: Arc<ProbeSettingsStore>,
-    adoption: Arc<AdoptionServer>,
-    behavior_controller: Option<Arc<BehaviorController>>,
+    state: ConnectionHandlers,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> ConnectOutcome {
-    let state = ConnectionHandlers::new(
-        status_manager,
-        settings,
-        adoption,
-        cfg.is_hardware.is_some(),
-        behavior_controller,
-    );
     // Collect synchronous disk and memory telemetry outside the Tokio worker.
     let config_for_url = cfg.clone();
-    let url = match tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await {
-        Ok(url) => url,
-        Err(error) => {
-            error!(target: "api:error", "Failed to collect handshake metadata: {error}");
-            return ConnectOutcome::Transient;
+    let url = tokio::select! {
+        biased;
+        _ = shutdown_rx.wait_for(|requested| *requested) => return ConnectOutcome::CleanShutdown,
+        result = async { tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await } => {
+            match result {
+                Ok(url) => url,
+                Err(error) => {
+                    error!(target: "api:error", "Failed to collect handshake metadata: {error}");
+                    return ConnectOutcome::Transient;
+                }
+            }
         }
     };
     let builder = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
-    let socket = match register_socket_handlers(builder, &state).connect().await {
-        Ok(socket) => socket,
-        Err(error) => {
-            error!(target: "api-connection", "Connection to API failed: {error}");
-            return ConnectOutcome::Transient;
+    let socket = tokio::select! {
+        biased;
+        _ = shutdown_rx.wait_for(|requested| *requested) => return ConnectOutcome::CleanShutdown,
+        result = register_socket_handlers(builder, &state).connect() => {
+            match result {
+                Ok(socket) => socket,
+                Err(error) => {
+                    error!(target: "api-connection", "Connection to API failed: {error}");
+                    return ConnectOutcome::Transient;
+                }
+            }
         }
     };
 
     let tasks = ConnectionTasks::spawn(&state, &socket, &cfg.ping_target);
     let outcome = tokio::select! {
-        _ = shutdown_rx.changed() => ConnectOutcome::CleanShutdown,
+        _ = shutdown_rx.wait_for(|requested| *requested) => ConnectOutcome::CleanShutdown,
         outcome = state.signal.wait() => outcome,
     };
     tasks.abort();
@@ -1493,15 +1495,14 @@ pub async fn run_with_behavior_controller(
             break;
         }
 
-        let outcome = connect_once(
-            &cfg,
+        let state = ConnectionHandlers::new(
             Arc::clone(&status),
             Arc::clone(&settings),
             Arc::clone(&adoption),
+            cfg.is_hardware.is_some(),
             behavior_controller.clone(),
-            shutdown_rx.clone(),
-        )
-        .await;
+        );
+        let outcome = connect_once(&cfg, state, shutdown_rx.clone()).await;
 
         match reconnect_delay(&outcome) {
             None => {
@@ -1528,7 +1529,7 @@ pub async fn run_with_behavior_controller(
                     () = tokio::time::sleep(delay) => {}
                     () = async {
                         let mut rx = shutdown_rx.clone();
-                        let _ = rx.changed().await;
+                        let _ = rx.wait_for(|requested| *requested).await;
                     } => break,
                 }
             }
@@ -1681,6 +1682,63 @@ mod tests {
         assert!(url.contains("isHardware=true"), "url: {url}");
         assert!(url.contains("hardwareDevice=v1"), "url: {url}");
         assert!(url.contains("hardwareDeviceFirmware=v2.3"), "url: {url}");
+    }
+
+    fn connection_state(
+        config: &ClientConfig,
+        settings_path: &std::path::Path,
+    ) -> ConnectionHandlers {
+        ConnectionHandlers::new(
+            Arc::new(Mutex::new(StatusManager::with_api_host(
+                &config.ping_target,
+            ))),
+            Arc::new(ProbeSettingsStore::new(settings_path)),
+            Arc::new(AdoptionServer::new(
+                0,
+                Duration::from_secs(1),
+                "https://example.com",
+            )),
+            false,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn pending_shutdown_skips_connection() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let config = cfg("shutdown");
+        let state = connection_state(&config, &root.path().join("settings.json"));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        assert_eq!(
+            connect_once(&config, state, shutdown_rx).await,
+            ConnectOutcome::CleanShutdown
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_stalled_handshake() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let host = listener.local_addr()?;
+        let config = ClientConfig {
+            api_host: format!("http://{host}"),
+            ping_target: host.ip().to_string(),
+            ..cfg("shutdown")
+        };
+        let state = connection_state(&config, &root.path().join("settings.json"));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (outcome, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(connect_once(&config, state, shutdown_rx), async {
+                let (stream, _) = listener.accept().await?;
+                shutdown_tx.send(true)?;
+                Ok::<_, anyhow::Error>(stream)
+            })
+        })
+        .await?;
+        let _accepted = accepted?;
+        assert_eq!(outcome, ConnectOutcome::CleanShutdown);
+        Ok(())
     }
 
     // ── OutcomeSignal ─────────────────────────────────────────────────────────

@@ -16,14 +16,14 @@ concurrency:
 jobs:
   strict-rust:
     name: Strict Rust
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@998dcbfa4da43cc6419474d96ee69a7102e7957c # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@f01e6b6b93a444e11600b90b5ca5ff42ec4206ee # main
     with:
       cargo-args: --locked --workspace --exclude globalping-behavior --all-targets
       allow-test-panics: true
 
   stable:
     name: Rust 1.100 + WASIp2
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@18397eb8f0bd8a76f90010a66a8519011f7992ca # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@1c9f5c8968c4caf8754c98ebeb0889d9e774b5ed # main
     with:
       rust-toolchain: "1.100.0"
       rust-components: rustfmt clippy
