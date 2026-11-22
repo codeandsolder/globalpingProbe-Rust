@@ -60,7 +60,7 @@ fn validate(opts: &TracerouteOptions) -> Result<()> {
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 
-#[must_use]
+#[must_use = "the returned arguments are needed to execute the measurement command"]
 pub fn build_args(opts: &TracerouteOptions) -> Vec<String> {
     let mut args: Vec<String> = vec![
         format!("-{}", opts.ip_version),

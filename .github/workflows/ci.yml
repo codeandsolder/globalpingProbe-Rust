@@ -21,38 +21,17 @@ env:
 jobs:
   strict-rust:
     name: Strict Rust
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@82886ae85915af41ea90bf225bdffb3d9d359f69 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@55ac92efe89656b085a0210b8cec4f1431d96406 # main
     with:
       allow-test-panics: true
 
-  stable:
-    name: Rust 1.99
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install Rust 1.99.1
-        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
-      - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@9190509a6314e35770f27b70dc771d14227e95aa # main
-        with:
-          rust-toolchain: "1.99.1"
-      - name: Toolchain versions
-        run: |
-          rustc +1.99.1 --version
-          cargo +1.99.1 --version
-      - name: Lockfile consistency
-        run: cargo +1.99.1 metadata --locked --format-version 1 >/dev/null
-      - name: Format
-        run: cargo +1.99.1 fmt --all -- --check
-      - name: Check all targets
-        run: cargo +1.99.1 check --locked --all-targets
-      - name: Clippy production targets
-        run: cargo +1.99.1 clippy --locked --lib --bins -- -D warnings -D clippy::pedantic -D clippy::nursery
-      - name: Unit tests
-        run: cargo +1.99.1 test --locked --lib --bins
-      - name: Documentation
-        run: cargo +1.99.1 doc --locked --no-deps
-      - name: Finalize mandatory sccache
-        if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@9190509a6314e35770f27b70dc771d14227e95aa # main
+  rust:
+    name: Native nightly tests
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
+    with:
+      runner: ubuntu-26.04
+      command: |
+        cargo metadata --locked --format-version 1 >/dev/null
+        cargo check --locked --all-targets
+        cargo test --locked --lib --bins
+        cargo doc --locked --no-deps

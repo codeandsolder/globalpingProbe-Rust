@@ -95,7 +95,7 @@ fn validate(opts: &DnsOptions) -> Result<()> {
 
 // ── Arg builder ───────────────────────────────────────────────────────────────
 
-#[must_use]
+#[must_use = "the returned arguments are needed to execute the measurement command"]
 pub fn build_args(opts: &DnsOptions) -> Vec<String> {
     let mut args: Vec<String> = vec![];
 

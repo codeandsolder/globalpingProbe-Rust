@@ -11,7 +11,7 @@ pub struct MeasurementStats {
 }
 
 impl MeasurementStats {
-    #[must_use]
+    #[must_use = "the returned shared statistics object owns the measurement counters"]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             started: AtomicU64::new(0),

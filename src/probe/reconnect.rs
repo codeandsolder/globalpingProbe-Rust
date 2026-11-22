@@ -18,7 +18,7 @@ pub enum ConnectOutcome {
 }
 
 /// Parse the socket.io connect-error message and return the reconnect policy.
-#[must_use]
+#[must_use = "the returned classification determines reconnection behavior"]
 pub fn classify_error(msg: &str) -> ConnectOutcome {
     let lower = msg.to_lowercase();
     if lower.contains("invalid probe version") || lower.contains("invalid version") {
@@ -60,7 +60,7 @@ pub struct ExponentialBackoff {
 }
 
 impl ExponentialBackoff {
-    #[must_use]
+    #[must_use = "the returned backoff owns the reconnect timing bounds"]
     pub const fn new(min: Duration, max: Duration) -> Self {
         Self {
             current: min,

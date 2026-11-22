@@ -50,7 +50,7 @@ const PRIVATE_RANGES: &[IpNet] = &[
     IpNet::new_assert(IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8),
 ];
 
-#[must_use]
+#[must_use = "the returned classification determines whether the address is private"]
 pub fn is_ip_private(ip: IpAddr) -> bool {
     // Normalise IPv6 forms that embed an IPv4 address so that e.g.
     // `::ffff:127.0.0.1` (IPv4-mapped) or `64:ff9b::a.b.c.d` (NAT64) cannot be

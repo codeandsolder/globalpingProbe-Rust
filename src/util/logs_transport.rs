@@ -49,7 +49,7 @@ pub struct ApiLogsBuffer {
 }
 
 impl ApiLogsBuffer {
-    #[must_use]
+    #[must_use = "the returned transport owns the queued log records"]
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {

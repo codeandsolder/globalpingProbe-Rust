@@ -2,7 +2,7 @@ use crate::util::private_ip::is_ip_private;
 
 /// Read nameserver entries from /etc/resolv.conf, masking private IPs as "private".
 /// Mirrors `getDnsServers()` in src/lib/dns.ts.
-#[must_use]
+#[must_use = "the returned list identifies the configured resolvers"]
 pub async fn get_dns_servers() -> Vec<String> {
     let content = tokio::fs::read_to_string("/etc/resolv.conf")
         .await
@@ -10,7 +10,7 @@ pub async fn get_dns_servers() -> Vec<String> {
     parse_resolv_conf(&content)
 }
 
-#[must_use]
+#[must_use = "the returned list identifies the resolvers parsed from the configuration"]
 pub fn parse_resolv_conf(content: &str) -> Vec<String> {
     content
         .lines()

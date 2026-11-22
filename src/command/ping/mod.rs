@@ -69,7 +69,7 @@ fn validate(opts: &PingOptions) -> Result<()> {
 // ── Arg builder ──────────────────────────────────────────────────────────────
 
 /// Builds the argument list for the system `ping` binary (Linux format).
-#[must_use]
+#[must_use = "the returned arguments are needed to execute the measurement command"]
 pub fn build_args(opts: &PingOptions) -> Vec<String> {
     vec![
         format!("-{}", opts.ip_version), // -4 or -6

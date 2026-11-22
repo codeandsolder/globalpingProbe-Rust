@@ -68,7 +68,7 @@ impl Default for ClientConfig {
 // ── URL ───────────────────────────────────────────────────────────────────────
 
 /// Build the WebSocket handshake URL with probe metadata as query params.
-#[must_use]
+#[must_use = "the returned URL contains the connection parameters"]
 pub fn connection_url(cfg: &ClientConfig) -> String {
     let mem = total_memory_bytes();
     let (total_disk, avail_disk) = disk_info_mb();
