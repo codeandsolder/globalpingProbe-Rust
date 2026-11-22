@@ -3,8 +3,10 @@ use crate::util::private_ip::is_ip_private;
 /// Read nameserver entries from /etc/resolv.conf, masking private IPs as "private".
 /// Mirrors `getDnsServers()` in src/lib/dns.ts.
 #[must_use]
-pub fn get_dns_servers() -> Vec<String> {
-    let content = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+pub async fn get_dns_servers() -> Vec<String> {
+    let content = tokio::fs::read_to_string("/etc/resolv.conf")
+        .await
+        .unwrap_or_default();
     parse_resolv_conf(&content)
 }
 
@@ -97,9 +99,9 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn live_reads_resolv_conf() {
-        let servers = get_dns_servers();
+    #[tokio::test]
+    async fn live_reads_resolv_conf() {
+        let servers = get_dns_servers().await;
         println!("DNS servers: {servers:?}");
         // Should have at least one entry in a working Linux system
         // (could be empty in minimal containers, so don't assert non-empty)

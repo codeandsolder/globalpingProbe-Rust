@@ -368,7 +368,7 @@ pub async fn run_status_loop(
 
         // Refresh DNS servers in case resolvers changed since last connect.
         client
-            .emit("probe:dns:update", json!(get_dns_servers()))
+            .emit("probe:dns:update", json!(get_dns_servers().await))
             .await
             .ok();
 
@@ -407,7 +407,7 @@ async fn handle_open(state: ConnectionHandlers, client: Client) {
     let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
     debug!("Connection to API established.");
@@ -478,7 +478,7 @@ async fn handle_location(payload: Payload, client: Client) {
         );
     }
     client
-        .emit("probe:dns:update", json!(get_dns_servers()))
+        .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
         .ok();
 }
@@ -670,7 +670,17 @@ async fn connect_once(
 ) -> (ConnectOutcome, bool) {
     let state = ConnectionHandlers::new(status_manager);
     let connected_reader = Arc::clone(&state.already_connected);
-    let builder = ClientBuilder::new(connection_url(cfg))
+    // Disk telemetry invokes `df`; keep process spawning and filesystem I/O
+    // off Tokio's worker threads during reconnects.
+    let config_for_url = cfg.clone();
+    let url = match tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await {
+        Ok(url) => url,
+        Err(error) => {
+            error!(target: "api:error", "Failed to collect handshake metadata: {error}");
+            return (ConnectOutcome::Transient, false);
+        }
+    };
+    let builder = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
     let socket = match register_socket_handlers(builder, &state).connect().await {
