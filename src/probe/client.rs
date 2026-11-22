@@ -673,27 +673,43 @@ async fn connect_once(
     // Disk telemetry invokes `df`; keep process spawning and filesystem I/O
     // off Tokio's worker threads during reconnects.
     let config_for_url = cfg.clone();
-    let url = match tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await {
-        Ok(url) => url,
-        Err(error) => {
-            error!(target: "api:error", "Failed to collect handshake metadata: {error}");
-            return (ConnectOutcome::Transient, false);
+    let url = tokio::select! {
+        biased;
+        _ = shutdown_rx.wait_for(|requested| *requested) => {
+            return (ConnectOutcome::CleanShutdown, false);
+        }
+        result = async { tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await } => {
+            match result {
+                Ok(url) => url,
+                Err(error) => {
+                    error!(target: "api:error", "Failed to collect handshake metadata: {error}");
+                    return (ConnectOutcome::Transient, false);
+                }
+            }
         }
     };
     let builder = ClientBuilder::new(url)
         .transport_type(TransportType::Websocket)
         .namespace("/probes");
-    let socket = match register_socket_handlers(builder, &state).connect().await {
-        Ok(socket) => socket,
-        Err(error) => {
-            error!(target: "api:error", "Connection to API failed: {error}");
-            return (ConnectOutcome::Transient, false);
+    let socket = tokio::select! {
+        biased;
+        _ = shutdown_rx.wait_for(|requested| *requested) => {
+            return (ConnectOutcome::CleanShutdown, false);
+        }
+        result = register_socket_handlers(builder, &state).connect() => {
+            match result {
+                Ok(socket) => socket,
+                Err(error) => {
+                    error!(target: "api:error", "Connection to API failed: {error}");
+                    return (ConnectOutcome::Transient, false);
+                }
+            }
         }
     };
 
     let tasks = ConnectionTasks::spawn(&state, &socket, &cfg.ping_target);
     let outcome = tokio::select! {
-        _ = shutdown_rx.changed() => ConnectOutcome::CleanShutdown,
+        _ = shutdown_rx.wait_for(|requested| *requested) => ConnectOutcome::CleanShutdown,
         outcome = state.signal.wait() => outcome,
     };
     tasks.abort();
@@ -888,6 +904,43 @@ mod tests {
     fn url_omits_adoption_token_when_none() {
         let url = connection_url(&cfg("u"));
         assert!(!url.contains("adoptionToken"), "url: {url}");
+    }
+
+    #[tokio::test]
+    async fn pending_shutdown_skips_connection() {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(true);
+        let status = Arc::new(Mutex::new(StatusManager::new()));
+        assert_eq!(
+            connect_once(&cfg("shutdown"), status, shutdown_rx).await,
+            (ConnectOutcome::CleanShutdown, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_stalled_handshake() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let host = listener.local_addr()?;
+        let config = ClientConfig {
+            api_host: format!("http://{host}"),
+            ping_target: host.ip().to_string(),
+            ..cfg("shutdown")
+        };
+        let status = Arc::new(Mutex::new(StatusManager::with_api_host(
+            &config.ping_target,
+        )));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (outcome, accepted) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(connect_once(&config, status, shutdown_rx), async {
+                let (stream, _) = listener.accept().await?;
+                shutdown_tx.send(true)?;
+                // Retain the socket without replying until connect_once returns.
+                Ok::<_, anyhow::Error>(stream)
+            })
+        })
+        .await?;
+        let _accepted = accepted?;
+        assert_eq!(outcome, (ConnectOutcome::CleanShutdown, false));
+        Ok(())
     }
 
     // ── OutcomeSignal ─────────────────────────────────────────────────────────
