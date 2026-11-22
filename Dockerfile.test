@@ -1,3 +1,4 @@
+# Bootstrap rustup; the copied native manifest selects the test compiler.
 FROM rust:1.100.0-slim-bookworm
 
 RUN apt-get update -y && apt-get install --no-install-recommends -y \
@@ -7,4 +8,4 @@ RUN apt-get update -y && apt-get install --no-install-recommends -y \
 WORKDIR /app
 COPY . .
 
-CMD ["cargo", "test", "--all", "--", "--nocapture"]
+CMD ["cargo", "test", "--locked", "--workspace", "--exclude", "globalping-behavior", "--", "--nocapture"]

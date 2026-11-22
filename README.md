@@ -14,7 +14,7 @@ A Rust rewrite of the [globalping-probe](https://github.com/jsdelivr/globalping-
 
 | Tool | Version | Notes |
 |---|---|---|
-| Rust (stable) | 1.99.0 | edition 2024 |
+| Rust | dated nightly in `rust-toolchain.toml` | edition 2024 |
 | Linux (WSL Ubuntu-24.04 or native) | — | Build and run target |
 | `libssl-dev`, `pkg-config` | — | Required by `rust_socketio` → `openssl-sys` |
 | `traceroute` | any | Must have `cap_net_raw` for ICMP mode (see below) |
@@ -147,11 +147,11 @@ Behavior bootstrap is opt-in and fail-closed. With no `GP_BEHAVIOR_*` variables,
 The signing key stays outside the probe runtime. Build the WASIp2 behavior component, then use the separate offline packer to create the exact two files consumed by `GP_BEHAVIOR_UPDATE_URL`:
 
 ```bash
-cargo +1.99.0 build --locked --release \
+cargo build --locked --release \
   -p globalping-behavior --target wasm32-wasip2
 
 printf '%s\n' "$GP_BEHAVIOR_SIGNING_SEED_HEX" | \
-  cargo +1.99.0 run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
+  cargo run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
     --component target/wasm32-wasip2/release/globalping_behavior.wasm \
     --output-dir target/behavior-release-42 \
     --sequence 42 \
@@ -166,14 +166,14 @@ printf '%s\n' "$GP_BEHAVIOR_SIGNING_SEED_HEX" | \
 ## Test
 
 ```bash
-cargo test --all                          # all tests (unit + integration)
+cargo test --workspace --exclude globalping-behavior  # native unit + integration tests
 cargo test --lib                          # unit tests only
 cargo test --test integration             # integration tests only
-cargo test --all -- --nocapture           # show stdout during tests
+cargo test --workspace --exclude globalping-behavior -- --nocapture  # show stdout
 cargo test <name>                         # run tests matching name
 ```
 
-The Rust 1.99 CI matrix covers unit, integration, signed-behavior runtime, deterministic differential, and strict Clippy/rustdoc gates.
+The shared dated-nightly CI matrix covers native unit tests, signed WASIp2 components, deterministic differential tests, all guest fixture configurations, and strict Clippy/rustdoc gates. The freestanding guest is built and checked for `wasm32-wasip2`, not as a native test binary.
 
 ### Test layout
 

@@ -8,10 +8,8 @@
 # Build for the local platform only (no push):
 #   docker buildx build --load -t globalping-probe:dev .
 
-# ── Stage 1: dependency cache ─────────────────────────────────────────────────
-# Pre-build all crate dependencies so that rebuilds triggered by source-only
-# changes don't re-download/re-compile the entire dependency tree.
-FROM rust:1.100.0-slim-bookworm AS deps
+# ── Builder: rustup uses the repository's native toolchain manifest ─────────
+FROM rust:1.100.0-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
@@ -19,31 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-# Copy manifests only (.cargo/config.toml is a local Windows dev artifact, not needed in container)
-COPY Cargo.toml Cargo.lock ./
-
-# Stub out src so we can compile deps without the real source
-RUN mkdir -p src tests/integration \
- && echo 'fn main() {}' > src/main.rs \
- && echo '' > tests/integration/mod.rs
-
-# Build dependencies only (will be cached unless Cargo.toml/Cargo.lock change)
-RUN cargo build --release \
- && rm -rf src tests
-
-# ── Stage 2: compile the probe ────────────────────────────────────────────────
-FROM deps AS builder
-
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY wit ./wit
 COPY src ./src
 COPY tests ./tests
+RUN cargo build --locked --release --bin globalping-probe
 
-# Touch main.rs so cargo knows it changed (avoids stale-artifact issues)
-RUN touch src/main.rs
-
-RUN cargo build --release
-
-# ── Stage 3: minimal runtime image ───────────────────────────────────────────
+# ── Runtime: minimal runtime image ───────────────────────────────────────────
 FROM debian:bookworm-slim
 
 # Runtime tools the probe shells out to at measurement time:
