@@ -25,7 +25,7 @@ const MAX_HOST_LEN: usize = 253;
 ///
 /// Rejects anything else — in particular leading dashes (argument injection),
 /// whitespace, and shell metacharacters (`; | & $ \` ( ) < > ' " \\` …).
-#[must_use = "the returned validation decision determines whether the host is acceptable"]
+#[must_use = "the validation result must govern whether the host is accepted"]
 pub fn is_safe_host(s: &str) -> bool {
     if s.is_empty() || s.len() > MAX_HOST_LEN {
         return false;
@@ -52,7 +52,7 @@ pub fn is_safe_host(s: &str) -> bool {
 /// The path/query become part of a single curl URL argument, so the concern is
 /// not argument injection but request smuggling: reject ASCII control characters
 /// (CR/LF/NUL) and whitespace. Other URL characters (`/ ? = & % # …`) are allowed.
-#[must_use = "the returned validation decision determines whether the URL component is acceptable"]
+#[must_use = "the validation result must govern whether the URL component is accepted"]
 pub fn is_safe_url_component(s: &str) -> bool {
     !s.bytes().any(|b| b.is_ascii_control() || b == b' ')
 }

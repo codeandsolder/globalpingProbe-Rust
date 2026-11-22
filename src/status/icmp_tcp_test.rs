@@ -4,7 +4,14 @@ use tokio::time::{Duration, timeout};
 use tracing::warn;
 
 use crate::command::ping::parse::parse as parse_ping;
+use crate::util::resolve_target::resolve_command_target;
 use crate::util::tcp_ping::tcp_ping;
+
+pub const DEFAULT_TARGETS: &[&str] = &[
+    "s3.dualstack.us-east-1.amazonaws.com",
+    "s3.dualstack.eu-central-1.amazonaws.com",
+    "s3.dualstack.ap-southeast-6.amazonaws.com",
+];
 
 const VPN_DIFF_HIGH: f64 = 100.0; // ms — one hit is enough
 const VPN_DIFF_MED: f64 = 60.0; // ms — needs 2 hits, or 1 + is_proxy
@@ -14,7 +21,8 @@ const ICMP_PACKETS: u8 = 3;
 const TCP_PACKETS: u8 = 3;
 const TCP_TIMEOUT_MS: u64 = 10_000;
 const TCP_INTERVAL_MS: u64 = 500;
-const ICMP_TIMEOUT_SECS: u64 = 20;
+const ICMP_TIMEOUT_SECS: u64 = 12;
+const DNS_HEADROOM_SECS: u64 = 3;
 
 pub struct IcmpTcpTest {
     pub failed: bool,
@@ -24,7 +32,7 @@ pub struct IcmpTcpTest {
 }
 
 impl IcmpTcpTest {
-    #[must_use = "the returned test owns the protocol comparison state"]
+    #[must_use = "retain the test state to accumulate ICMP and TCP observations"]
     pub const fn new() -> Self {
         Self {
             failed: false,
@@ -46,28 +54,47 @@ impl IcmpTcpTest {
         self.is_proxy = Some(is_proxy);
     }
 
-    /// Measure ICMP vs TCP diffs for all `targets` and return true if VPN detected.
-    pub async fn run_once(&mut self, targets: &[&str]) -> bool {
+    /// Measure one complete ICMP/TCP comparison round and update the stored diffs.
+    pub async fn measure_once(&mut self, targets: &[&str]) -> bool {
         let (diffs_v4, diffs_v6) = tokio::join!(measure_all(targets, 4), measure_all(targets, 6),);
         self.diffs_v4 = diffs_v4;
         self.diffs_v6 = diffs_v6;
         self.failed = self.is_vpn_detected();
+        self.failed
+    }
+
+    /// Measure ICMP vs TCP diffs and confirm any VPN detection with a second round.
+    pub async fn run_once(&mut self, targets: &[&str]) -> bool {
+        self.measure_once(targets).await;
         if self.failed {
-            warn!(target: "status-manager", "ICMP/TCP ping RTT diff exceeds the threshold. Retrying in 1 hour. Probe temporarily disconnected.");
+            self.measure_once(targets).await;
+        }
+        if self.failed {
+            warn!(target: "status:icmp-tcp", "ICMP/TCP ping RTT diff exceeds the threshold. Retrying in 1 hour. Probe temporarily disconnected.");
         }
         self.failed
     }
 
-    #[must_use = "the returned decision indicates whether VPN characteristics were observed"]
+    #[must_use = "the result indicates whether the health test has collected data"]
+    pub const fn has_measurements(&self) -> bool {
+        !self.diffs_v4.is_empty() || !self.diffs_v6.is_empty()
+    }
+
+    #[must_use = "the result indicates the known proxy classification"]
+    pub const fn is_proxy(&self) -> Option<bool> {
+        self.is_proxy
+    }
+
+    #[must_use = "the result determines whether the probe fails the VPN check"]
     pub fn is_vpn_detected(&self) -> bool {
         is_vpn(&self.diffs_v4, self.is_proxy) || is_vpn(&self.diffs_v6, self.is_proxy)
     }
 
-    #[must_use = "the returned differences describe IPv4 measurement evidence"]
+    #[must_use = "the returned differences are the collected IPv4 timing evidence"]
     pub fn diffs_v4(&self) -> &[Option<f64>] {
         &self.diffs_v4
     }
-    #[must_use = "the returned differences describe IPv6 measurement evidence"]
+    #[must_use = "the returned differences are the collected IPv6 timing evidence"]
     pub fn diffs_v6(&self) -> &[Option<f64>] {
         &self.diffs_v6
     }
@@ -81,7 +108,7 @@ impl Default for IcmpTcpTest {
 
 /// Returns true if the diffs indicate a VPN/proxy setup.
 /// null diffs (error cases) are treated as pass (conservative).
-#[must_use = "the returned decision describes the measurement evidence for a VPN"]
+#[must_use = "the result determines whether the timing evidence indicates a VPN"]
 pub fn is_vpn(diffs: &[Option<f64>], is_proxy: Option<bool>) -> bool {
     let numeric: Vec<f64> = diffs.iter().filter_map(|d| *d).collect();
     let over_high = numeric.iter().filter(|&&d| d >= VPN_DIFF_HIGH).count();
@@ -109,6 +136,11 @@ async fn measure_all(targets: &[&str], ip_version: u8) -> Vec<Option<f64>> {
 
 /// Measure (ICMP avg) – (TCP avg) for one target. Returns None on any error.
 async fn measure_diff(target: &str, ip_version: u8) -> Option<f64> {
+    let resolved =
+        resolve_command_target(target, ip_version, Duration::from_secs(DNS_HEADROOM_SECS))
+            .await
+            .ok()?;
+    let address = resolved.address.to_string();
     let flag = format!("-{ip_version}");
 
     let icmp_fut = timeout(
@@ -116,19 +148,21 @@ async fn measure_diff(target: &str, ip_version: u8) -> Option<f64> {
         Command::new("ping")
             .args([
                 flag.as_str(),
+                "-O",
+                "-n",
                 "-c",
                 &ICMP_PACKETS.to_string(),
                 "-i",
                 "0.5",
-                "-w",
-                "10",
-                target,
+                "-W",
+                "5",
+                &address,
             ])
             .output(),
     );
 
     let tcp_fut = tcp_ping(
-        target,
+        &address,
         TCP_PORT,
         TCP_PACKETS,
         TCP_TIMEOUT_MS,

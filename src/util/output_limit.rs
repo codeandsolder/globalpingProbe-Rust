@@ -10,7 +10,7 @@ const TRUNCATION_MARKER: &str = "\n[...truncated]";
 /// Truncate `s` to at most `max_bytes` bytes, preserving valid UTF-8.
 /// Appends `[...truncated]` on a new line if any bytes were removed.
 /// Returns the original string unchanged if it fits within the limit.
-#[must_use = "the truncated string is returned rather than modifying the input"]
+#[must_use = "the returned string contains the bounded output; the input is unchanged"]
 pub fn truncate_output(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_owned();

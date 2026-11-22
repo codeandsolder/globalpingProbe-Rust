@@ -11,7 +11,7 @@ enum AltIpError {
 
 /// Enumerate all public IP addresses from local network interfaces.
 /// Uses `ip -o addr show scope global` to filter out loopback and link-local.
-#[must_use = "the returned addresses identify the probe interfaces"]
+#[must_use = "the returned addresses are the discovered public interfaces"]
 pub async fn get_local_public_ips() -> Vec<IpAddr> {
     let Ok(out) = tokio::process::Command::new("ip")
         .args(["-o", "addr", "show", "scope", "global"])
@@ -114,10 +114,10 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
                 tokens.push(serde_json::json!([confirmed_ip, token]));
             }
             Err(AltIpError::Rejected(reason)) => {
-                warn!(target: "api:connect:alt-ips-handler", "IP {ip} rejected: {reason}");
+                warn!(target: "probe-alt-ips", "IP {ip} rejected: {reason}");
             }
             Err(AltIpError::Failed(error)) => {
-                warn!(target: "api:connect:alt-ips-handler", "{error} (via {ip}).");
+                warn!(target: "probe-alt-ips", "{error} (via {ip}).");
             }
         }
     }

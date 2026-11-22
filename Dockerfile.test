@@ -8,4 +8,4 @@ RUN apt-get update -y && apt-get install --no-install-recommends -y \
 WORKDIR /app
 COPY . .
 
-CMD ["cargo", "test", "--locked", "--all", "--", "--nocapture"]
+CMD ["cargo", "test", "--locked", "--workspace", "--exclude", "globalping-behavior", "--", "--nocapture"]

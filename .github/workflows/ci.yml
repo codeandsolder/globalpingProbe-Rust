@@ -13,25 +13,57 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  CARGO_BUILD_WARNINGS: deny
-
 jobs:
   strict-rust:
     name: Strict Rust
     uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@55ac92efe89656b085a0210b8cec4f1431d96406 # main
     with:
+      cargo-args: --locked --workspace --exclude globalping-behavior --all-targets
       allow-test-panics: true
 
   rust:
-    name: Native nightly tests
+    name: Native nightly + WASIp2
     uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@ce8f8a2849c8cc0ce221e4cb283a4bef0de4a01a # main
     with:
+      rust-targets: wasm32-wasip2
+      rustflags: ""
       runner: ubuntu-26.04
+      timeout-minutes: 30
       command: |
+        set -euo pipefail
+        export CARGO_BUILD_WARNINGS=deny
+
         cargo metadata --locked --format-version 1 >/dev/null
+        cargo fmt --all -- --check
         cargo check --locked --all-targets
+
+        cargo build --locked --release --no-default-features --features wasm-core --bin globalping-sandbox --target wasm32-wasip2
+        cargo build --locked --release -p globalping-behavior --target wasm32-wasip2
+
+        # Deterministic public CI-only seed. Production signing material never enters the probe runtime.
+        printf '47%.0s' {1..32} | cargo run --locked --no-default-features --features behavior-artifact --bin globalping-behavior-pack -- \
+          --component "$CARGO_TARGET_DIR/wasm32-wasip2/release/globalping_behavior.wasm" \
+          --output-dir "$CARGO_TARGET_DIR/ci-behavior-artifact" \
+          --sequence 1 \
+          --build-id "ci-${GITHUB_SHA}" \
+          --signing-key -
+        test -f "$CARGO_TARGET_DIR/ci-behavior-artifact/manifest.json"
+        test -f "$CARGO_TARGET_DIR/ci-behavior-artifact/component.wasm"
+        test "$(find "$CARGO_TARGET_DIR/ci-behavior-artifact" -maxdepth 1 -type f | wc -l)" -eq 2
+
+        GLOBALPING_BEHAVIOR_COMPONENT="$CARGO_TARGET_DIR/wasm32-wasip2/release/globalping_behavior.wasm" \
+          cargo test --locked --test behavior_component -- --include-ignored
+        GLOBALPING_BEHAVIOR_COMPONENT="$CARGO_TARGET_DIR/wasm32-wasip2/release/globalping_behavior.wasm" \
+          cargo test --locked --lib differential_tests::differential_ -- --ignored
+
+        cargo clippy --locked --lib --bins -- -D warnings -D clippy::pedantic -D clippy::nursery
+        cargo clippy --locked -p globalping-behavior-core -- -D warnings -D clippy::pedantic -D clippy::nursery
+        cargo clippy --locked -p globalping-behavior --target wasm32-wasip2 -- -D warnings -D clippy::pedantic -D clippy::nursery
+        cargo clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-fault-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
+        cargo clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-divergence-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
+        cargo clippy --locked -p globalping-behavior --target wasm32-wasip2 --features post-start-invalid-output-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
+        cargo clippy --locked -p globalping-behavior --target wasm32-wasip2 --features pre-completion-final-fixture -- -D warnings -D clippy::pedantic -D clippy::nursery
+
         cargo test --locked --lib --bins
+        cargo test --locked -p globalping-behavior-core
         cargo doc --locked --no-deps
