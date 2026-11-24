@@ -16,14 +16,14 @@ concurrency:
 jobs:
   strict-rust:
     name: Strict Rust
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@1f3c1fab9972ecc4c85329c9651dfbed138e6736 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@7d0552029497cf094787c3593f804d5bce137c4b # main
     with:
       cargo-args: --locked --workspace --exclude globalping-behavior --all-targets
       allow-test-panics: true
 
   rust:
     name: Native nightly + WASIp2
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d3d509b57a06e72885a83ae743a4014e97cd9f95 # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@83ceff49d93d152cd95a1c9d6addb5cf03169477 # main
     with:
       rust-targets: wasm32-wasip2
       rustflags: ""
