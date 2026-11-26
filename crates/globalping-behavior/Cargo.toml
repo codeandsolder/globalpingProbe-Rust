@@ -31,5 +31,5 @@ pre-completion-final-fixture = []
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 dlmalloc = { version = "0.2", features = ["global"] }
-wit-bindgen = { version = "0.61", default-features = false, features = ["macros", "realloc"] }
+wit-bindgen = { version = "0.63", default-features = false, features = ["macros", "realloc"] }
 globalping-behavior-core = { path = "../globalping-behavior-core", default-features = false }
