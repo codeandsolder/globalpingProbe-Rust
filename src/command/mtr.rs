@@ -262,7 +262,7 @@ impl MtrEnrichmentBroker {
             .filter_map(hop_address_from_raw_line)
             .filter(|address| !is_ip_private(*address))
             .collect::<HashSet<_>>();
-        futures::future::join_all(addresses.into_iter().map(|address| async move {
+        futures_util::future::join_all(addresses.into_iter().map(|address| async move {
             #[cfg(test)]
             self.lookup_oracle(address, budget).await;
             #[cfg(not(test))]

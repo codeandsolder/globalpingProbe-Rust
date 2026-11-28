@@ -13,3 +13,6 @@ pub mod resolve_target;
 #[cfg(feature = "native")]
 pub mod tcp_ping;
 pub mod validate;
+
+#[cfg(feature = "native")]
+pub(crate) mod timestamp;

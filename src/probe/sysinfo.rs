@@ -1,4 +1,3 @@
-use regex::Regex;
 use std::path::Path;
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -152,8 +151,14 @@ pub fn looks_like_v1_hardware_values(
     hostname: &str,
     total_memory: u64,
 ) -> bool {
-    let hostname_matches =
-        Regex::new(r"^globalping-probe-\w{4}$").is_ok_and(|pattern| pattern.is_match(hostname));
+    let hostname_matches = hostname
+        .strip_prefix("globalping-probe-")
+        .is_some_and(|suffix| {
+            suffix.len() == 4
+                && suffix
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        });
     logical_cpus == 4
         && cpuinfo.contains("ARMv7 Processor rev 5 (v7l)")
         && hostname_matches
@@ -320,6 +325,28 @@ MemAvailable:   12000000 kB\n";
             "globalping-probe-708e",
             520_839_168,
         ));
+    }
+
+    #[test]
+    fn hostname_signature_uses_four_ascii_word_characters() {
+        for (suffix, expected) in [
+            ("aZ0_", true),
+            ("abc", false),
+            ("abcde", false),
+            ("ab-c", false),
+            ("éabc", false),
+            ("abcé", false),
+        ] {
+            assert_eq!(
+                looks_like_v1_hardware_values(
+                    4,
+                    "ARMv7 Processor rev 5 (v7l)",
+                    &format!("globalping-probe-{suffix}"),
+                    520_839_168
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use chrono::Utc;
+use jiff::Timestamp;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::VecDeque;
@@ -158,7 +158,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ApiLogsLayer {
         let mut v = MessageVisitor(String::new());
         event.record(&mut v);
 
-        let timestamp = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let timestamp = crate::util::timestamp::wire_timestamp(Timestamp::now());
 
         API_LOG_BUFFER.push(LogEntry {
             message: v.0,
