@@ -6,8 +6,8 @@ use axum::{
     http::{Method, Request, Response, StatusCode, header},
     response::IntoResponse,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
 use if_addrs::get_if_addrs;
+use jiff::Timestamp;
 use rand::random;
 use std::{collections::HashSet, fmt::Write as _, net::SocketAddr, sync::Arc, time::SystemTime};
 use tokio::{
@@ -85,6 +85,11 @@ impl AdoptionServer {
         let app = Router::new().fallback(adoption_request).with_state(state);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let lifetime = self.lifetime;
+        let expires = Timestamp::try_from(
+            SystemTime::now()
+                .checked_add(lifetime)
+                .context("adoption expiration overflow")?,
+        )?;
         let task = tokio::spawn(async move {
             let shutdown = async move {
                 tokio::select! {
@@ -104,10 +109,9 @@ impl AdoptionServer {
             task,
         });
 
-        let expires: DateTime<Utc> = (SystemTime::now() + self.lifetime).into();
         Ok(AdoptionSession {
             token,
-            expires_at: expires.to_rfc3339_opts(SecondsFormat::Millis, true),
+            expires_at: crate::util::timestamp::wire_timestamp(expires),
             address,
         })
     }

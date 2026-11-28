@@ -340,7 +340,7 @@ impl ProgressTx {
 mod tests {
     use std::task::Poll;
 
-    use futures::poll;
+    use futures_util::poll;
     use serde_json::json;
 
     use super::*;

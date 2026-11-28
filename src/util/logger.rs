@@ -1,4 +1,4 @@
-use chrono::Utc;
+use jiff::Timestamp;
 use std::fmt;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{
@@ -60,8 +60,12 @@ where
             return Ok(());
         }
 
-        let now = Utc::now();
-        write!(writer, "[{}] ", now.format("%Y-%m-%d %H:%M:%S +00:00"))?;
+        let now = Timestamp::now();
+        write!(
+            writer,
+            "[{}] ",
+            crate::util::timestamp::console_timestamp(&now)
+        )?;
 
         let level = match *event.metadata().level() {
             tracing::Level::ERROR => "[ERROR]",

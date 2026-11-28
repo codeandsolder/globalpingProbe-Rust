@@ -131,7 +131,7 @@ async fn measure_all(targets: &[&str], ip_version: u8) -> Vec<Option<f64>> {
         .iter()
         .map(|t| measure_diff(t, ip_version))
         .collect();
-    futures::future::join_all(futs).await
+    futures_util::future::join_all(futs).await
 }
 
 /// Measure (ICMP avg) – (TCP avg) for one target. Returns None on any error.

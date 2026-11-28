@@ -50,7 +50,7 @@ pub async fn tcp_ping(
     interval_ms: u64,
 ) -> TcpPingStats {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-    let probes = futures::future::join_all((0..packets).map(|index| async move {
+    let probes = futures_util::future::join_all((0..packets).map(|index| async move {
         if index > 0 {
             sleep(Duration::from_millis(u64::from(index) * interval_ms)).await;
         }
