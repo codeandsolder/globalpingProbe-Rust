@@ -125,8 +125,8 @@ fn endpoint(base: &str) -> Result<Url> {
     }
     let pairs = url
         .query_pairs()
-        .filter(|(key, _)| key != "EIO" && key != "transport" && key != "sid")
         .into_owned()
+        .filter(|(key, _)| key != "EIO" && key != "transport" && key != "sid")
         .collect::<Vec<_>>();
     url.query_pairs_mut()
         .clear()
@@ -547,7 +547,7 @@ async fn run_io(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::{SinkExt as _, StreamExt as _};
+    use futures_util::StreamExt as _;
     use serde_json::json;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{WebSocketStream, accept_async, tungstenite::Message as ServerMessage};
