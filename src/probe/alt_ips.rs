@@ -1,6 +1,6 @@
-use rust_socketio::asynchronous::Client;
+use crate::probe::socket::EventSender;
 use serde::Deserialize;
-use std::net::IpAddr;
+use std::{collections::BTreeMap, net::IpAddr};
 use tokio::time::Duration;
 use tracing::{info, warn};
 
@@ -55,8 +55,9 @@ async fn fetch_alt_ip_token(
     local_ip: IpAddr,
     http_host: &str,
 ) -> Result<(String, String), AltIpError> {
-    let client = reqwest::Client::builder()
+    let client = wreq::Client::builder()
         .local_address(local_ip)
+        .redirect(wreq::redirect::Policy::limited(10))
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| AltIpError::Failed(e.to_string()))?;
@@ -68,7 +69,7 @@ async fn fetch_alt_ip_token(
         .await
         .map_err(|e| AltIpError::Failed(e.to_string()))?;
 
-    if response.status() == reqwest::StatusCode::BAD_REQUEST {
+    if response.status() == wreq::StatusCode::BAD_REQUEST {
         let msg = response.text().await.unwrap_or_default();
         return Err(AltIpError::Rejected(msg));
     }
@@ -86,7 +87,7 @@ async fn fetch_alt_ip_token(
 /// Discover all local public IPs, fetch ownership tokens for each (excluding the
 /// main IP the API already knows), and emit `probe:alt-ips` so the API registers
 /// them all for this probe session.
-pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
+pub(crate) async fn refresh_alt_ips(socket: &EventSender, http_host: &str, main_ip: &str) {
     let local_ips = get_local_public_ips().await;
 
     let alt_ips: Vec<IpAddr> = local_ips
@@ -94,23 +95,14 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
         .filter(|ip| ip.to_string() != main_ip)
         .collect();
 
-    if alt_ips.is_empty() {
-        info!("IP address of the probe: {main_ip}.");
-        return;
-    }
-
     let results =
         futures_util::future::join_all(alt_ips.iter().map(|&ip| fetch_alt_ip_token(ip, http_host)))
             .await;
 
     let mut tokens: Vec<serde_json::Value> = Vec::new();
-    let mut confirmed_ips: Vec<String> = vec![main_ip.to_string()];
     for (ip, result) in alt_ips.iter().zip(results) {
         match result {
             Ok((confirmed_ip, token)) => {
-                if !confirmed_ips.contains(&confirmed_ip) {
-                    confirmed_ips.push(confirmed_ip.clone());
-                }
                 tokens.push(serde_json::json!([confirmed_ip, token]));
             }
             Err(AltIpError::Rejected(reason)) => {
@@ -122,25 +114,41 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
         }
     }
 
-    // Sort so IPv4 addresses appear before IPv6
-    confirmed_ips.sort_by_key(|ip| {
-        let parsed: std::net::IpAddr = ip
-            .parse()
-            .ok()
-            .unwrap_or(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-        u8::from(matches!(parsed, std::net::IpAddr::V6(_)))
-    });
+    let acknowledgement = socket
+        .emit_with_ack("probe:alt-ips", serde_json::Value::Array(tokens))
+        .await
+        .and_then(|response| {
+            let value = response
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing alternate-IP acknowledgement"))?;
+            Ok(serde_json::from_value::<AltIpAck>(value)?)
+        });
+    let accepted = match acknowledgement {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            warn!(target: "probe-alt-ips", "Failed to register alternate IPs: {error:#}");
+            return;
+        }
+    };
+    for (ip, reason) in accepted.rejected_ips_to_reasons {
+        warn!(target: "probe-alt-ips", "IP {ip} rejected: {reason}");
+    }
+    let mut confirmed_ips = vec![main_ip.to_owned()];
+    confirmed_ips.extend(accepted.added_alt_ips);
+    confirmed_ips.sort_unstable_by_key(|ip| (ip.parse::<IpAddr>().ok(), ip.clone()));
+    confirmed_ips.dedup();
     let noun = if confirmed_ips.len() == 1 {
         "IP address"
     } else {
         "IP addresses"
     };
     info!("{noun} of the probe: {}.", confirmed_ips.join(", "));
+}
 
-    if let Err(e) = socket
-        .emit("probe:alt-ips", serde_json::Value::Array(tokens))
-        .await
-    {
-        warn!("Failed to emit probe:alt-ips: {e}");
-    }
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AltIpAck {
+    added_alt_ips: Vec<String>,
+    rejected_ips_to_reasons: BTreeMap<String, String>,
 }

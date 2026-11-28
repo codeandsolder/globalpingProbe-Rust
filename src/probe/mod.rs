@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod progress;
 pub mod reconnect;
 pub mod settings;
+pub(crate) mod socket;
 pub mod stats;
 pub mod sysinfo;
 pub mod uuid;

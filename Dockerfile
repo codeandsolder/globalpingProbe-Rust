@@ -12,8 +12,7 @@
 FROM rust:1.100.0-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config \
-        libssl-dev \
+        build-essential cmake clang libclang-dev ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -41,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         dnsutils \
         iproute2 \
         iputils-ping \
+        libcap2-bin \
         traceroute \
         mtr-tiny \
     && rm -rf /var/lib/apt/lists/*

@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
 use rand::random_range;
-use reqwest::Client;
 use semver::Version;
 use serde::Deserialize;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{info, warn};
+use wreq::Client;
 
 use super::client::VERSION;
 
@@ -59,7 +59,7 @@ fn newer_release(current: &str, candidate: &str) -> Result<Option<Version>, semv
     Ok((candidate > current).then_some(candidate))
 }
 
-async fn fetch_release(client: &Client) -> Result<ReleaseInfo, reqwest::Error> {
+async fn fetch_release(client: &Client) -> Result<ReleaseInfo, wreq::Error> {
     client
         .get(RELEASE_URL)
         .send()
@@ -71,7 +71,11 @@ async fn fetch_release(client: &Client) -> Result<ReleaseInfo, reqwest::Error> {
 
 async fn run_update_loop(shutdown_tx: watch::Sender<bool>) {
     let interval = randomized_interval(UPDATE_INTERVAL, UPDATE_MAX_DEVIATION);
-    let client = match Client::builder().timeout(UPDATE_REQUEST_TIMEOUT).build() {
+    let client = match Client::builder()
+        .timeout(UPDATE_REQUEST_TIMEOUT)
+        .redirect(wreq::redirect::Policy::limited(10))
+        .build()
+    {
         Ok(client) => client,
         Err(error) => {
             warn!(target: "probe-self-update", %error, "Failed to create the probe update client.");

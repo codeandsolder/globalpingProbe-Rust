@@ -1,19 +1,12 @@
 use anyhow::Result;
-use futures_util::FutureExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::{Mutex, Notify, watch};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::{Mutex, watch};
 use tokio::time::Duration;
 use tracing::{debug, error, info, warn};
-
-use rust_socketio::{
-    Payload, TransportType,
-    asynchronous::{Client, ClientBuilder},
-};
 
 use crate::command::{
     ProgressSink, ProgressTx, dns::DnsCommand, http::HttpCommand, mtr::MtrCommand,
@@ -27,6 +20,7 @@ use crate::probe::{
     lifecycle::LifecycleTasks,
     reconnect::{ConnectOutcome, classify_error, reconnect_delay},
     settings::ProbeSettingsStore,
+    socket::{ConnectRejected, Disconnect, EventSender, Session, wait_closed},
     stats::get_cpu_usage,
     sysinfo::{disk_info_mb, effective_total_memory_bytes},
 };
@@ -126,52 +120,6 @@ pub struct MeasurementRequest {
     pub measurement_id: String,
     pub test_id: String,
     pub measurement: Value,
-}
-
-// ── Outcome signalling ────────────────────────────────────────────────────────
-
-/// Shared state for communicating disconnect/error outcomes from event handlers
-/// back to the outer reconnect loop.  First write wins (subsequent events ignored).
-#[derive(Clone)]
-struct OutcomeSignal {
-    value: Arc<Mutex<Option<ConnectOutcome>>>,
-    notify: Arc<Notify>,
-}
-
-impl OutcomeSignal {
-    fn new() -> Self {
-        Self {
-            value: Arc::new(Mutex::new(None)),
-            notify: Arc::new(Notify::new()),
-        }
-    }
-
-    /// Record the outcome and wake the waiter (only the first call has effect).
-    async fn signal(&self, outcome: ConnectOutcome) {
-        let should_notify = {
-            let mut guard = self.value.lock().await;
-            if guard.is_some() {
-                false
-            } else {
-                *guard = Some(outcome);
-                true
-            }
-        };
-        if should_notify {
-            self.notify.notify_one();
-        }
-    }
-
-    /// Block until an outcome has been signalled, then return it.
-    async fn wait(&self) -> ConnectOutcome {
-        loop {
-            self.notify.notified().await;
-            let outcome = self.value.lock().await.clone();
-            if let Some(outcome) = outcome {
-                return outcome;
-            }
-        }
-    }
 }
 
 // ── Measurement dispatch ──────────────────────────────────────────────────────
@@ -735,9 +683,9 @@ async fn run_measurement(
 ///
 /// The `ActiveJob` guard tracks stats and graceful shutdown for the API-visible
 /// measurement lifetime; upstream-compatible dispatch imposes no local cap.
-pub async fn dispatch(
+async fn dispatch(
     req: MeasurementRequest,
-    client: Client,
+    client: EventSender,
     status_manager: Arc<Mutex<StatusManager>>,
     jobs: ActiveJobs,
     behavior_controller: Option<Arc<BehaviorController>>,
@@ -849,23 +797,10 @@ pub async fn dispatch(
     }
 }
 
-// ── Payload helpers ───────────────────────────────────────────────────────────
-
-pub fn extract_first_value(payload: &Payload) -> Option<Value> {
-    match payload {
-        Payload::Text(values) => values.first().cloned(),
-        _ => None,
-    }
-}
-
-pub fn extract_first_string(payload: &Payload) -> Option<String> {
-    extract_first_value(payload).and_then(|v| v.as_str().map(str::to_string))
-}
-
 // ── Stats loop ────────────────────────────────────────────────────────────────
 
 /// Background task: report per-CPU utilization and active jobs every 10 seconds.
-pub async fn run_stats_loop(jobs: ActiveJobs, client: Client) {
+async fn run_stats_loop(jobs: ActiveJobs, client: EventSender) {
     loop {
         tokio::time::sleep(STATS_INTERVAL).await;
         match get_cpu_usage().await {
@@ -891,7 +826,7 @@ pub async fn run_stats_loop(jobs: ActiveJobs, client: Client) {
 // ── Status loop ───────────────────────────────────────────────────────────────
 
 /// Report the current nameserver configuration without blocking the executor.
-async fn emit_dns_update(client: &Client) {
+async fn emit_dns_update(client: &EventSender) {
     client
         .emit("probe:dns:update", json!(get_dns_servers().await))
         .await
@@ -902,7 +837,7 @@ async fn emit_dns_update(client: &Client) {
 // ICMP/TCP VPN detection every hour, matching the official probe.
 async fn run_ping_status_cycle(
     status: &Arc<Mutex<StatusManager>>,
-    client: &Client,
+    client: &EventSender,
     ping_target: &str,
 ) {
     let (ipv4, ipv6) = PingTest::new().run_once(ping_target).await;
@@ -926,7 +861,7 @@ async fn run_ping_status_cycle(
     emit_dns_update(client).await;
 }
 
-async fn run_icmp_tcp_status_cycle(status: &Arc<Mutex<StatusManager>>, client: &Client) {
+async fn run_icmp_tcp_status_cycle(status: &Arc<Mutex<StatusManager>>, client: &EventSender) {
     let initial_proxy = status.lock().await.icmp_tcp_test.is_proxy();
     let mut test = IcmpTcpTest::new();
     if let Some(is_proxy) = initial_proxy {
@@ -966,9 +901,9 @@ async fn run_icmp_tcp_status_cycle(status: &Arc<Mutex<StatusManager>>, client: &
 
 /// Run the upstream status checks on their independent schedules: connectivity
 /// ping every 10 minutes and ICMP/TCP VPN detection every hour.
-pub async fn run_status_loop(
+async fn run_status_loop(
     status: Arc<Mutex<StatusManager>>,
-    client: Client,
+    client: EventSender,
     ping_target: String,
 ) {
     let ping_loop = async {
@@ -996,8 +931,6 @@ struct ConnectionHandlers {
     is_hardware: bool,
     jobs: ActiveJobs,
     behavior_controller: Option<Arc<BehaviorController>>,
-    signal: OutcomeSignal,
-    already_connected: Arc<AtomicBool>,
 }
 
 impl ConnectionHandlers {
@@ -1015,53 +948,60 @@ impl ConnectionHandlers {
             is_hardware,
             jobs: ActiveJobs::new(),
             behavior_controller,
-            signal: OutcomeSignal::new(),
-            already_connected: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
-async fn handle_open(state: ConnectionHandlers, client: Client) {
-    if state.already_connected.swap(true, Ordering::Relaxed) {
-        state.signal.signal(ConnectOutcome::Transient).await;
-        return;
-    }
+async fn handle_open(state: &ConnectionHandlers, client: &EventSender) {
     let status = state.status_manager.lock().await.status().to_string();
     client.emit("probe:status:update", json!(status)).await.ok();
-    emit_dns_update(&client).await;
+    emit_dns_update(client).await;
     debug!(target: "api-connection", "Connection to API established.");
 }
 
-async fn handle_close(state: ConnectionHandlers, payload: Payload, client: Client) {
-    let reason = extract_first_string(&payload).unwrap_or_default();
-    debug!(target: "api-connection", "Disconnected from API: ({reason}).");
-    if reason == "ping timeout" || reason == "transport error" {
-        let status = {
-            let mut manager = state.status_manager.lock().await;
-            manager.report_disconnect();
-            manager.status().to_string()
-        };
-        client.emit("probe:status:update", json!(status)).await.ok();
+async fn handle_disconnect(state: &ConnectionHandlers, reason: Disconnect) -> ConnectOutcome {
+    let description = match reason {
+        Disconnect::PingTimeout => "ping timeout".to_owned(),
+        Disconnect::TransportError(error) => {
+            warn!(target: "api-connection", "Socket transport error: {error}");
+            "transport error".to_owned()
+        }
+        Disconnect::TransportClosed => "transport close".to_owned(),
+        Disconnect::ServerDisconnected => "io server disconnect".to_owned(),
+        Disconnect::ClientDisconnected => "io client disconnect".to_owned(),
+        Disconnect::ServerError(value) => return rejected_outcome(&value),
+    };
+    debug!(target: "api-connection", "Disconnected from API: ({description}).");
+    if description == "ping timeout" || description == "transport error" {
+        state.status_manager.lock().await.report_disconnect();
     }
-    state.signal.signal(ConnectOutcome::Transient).await;
+    ConnectOutcome::Transient
 }
 
-async fn handle_error(state: ConnectionHandlers, payload: Payload) {
-    let (message, ip_address) = parse_connect_error(&payload);
-    let outcome = classify_error(&message);
+fn rejected_outcome(value: &Value) -> ConnectOutcome {
+    let message = value
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.as_str())
+        .unwrap_or("Socket.IO connection rejected");
+    let outcome = classify_error(message);
     if !matches!(outcome, ConnectOutcome::ServerTerminating) {
         error!(target: "api-connection", "Connection to API failed: {message}");
     }
-    if matches!(outcome, ConnectOutcome::ProbePolicyError) && message.contains("ip limit") {
-        let ip = ip_address.as_deref().unwrap_or("");
+    if matches!(outcome, ConnectOutcome::ProbePolicyError) && message.starts_with("ip limit") {
+        let ip = value
+            .get("data")
+            .and_then(|data| data.get("ipAddress"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         error!(target: "api-connection",
             "Only 1 connection per IP address is allowed. Please make sure you don't have another probe running on IP {ip}.");
     }
-    state.signal.signal(outcome).await;
+    outcome
 }
 
-async fn handle_location(payload: Payload, client: Client) {
-    if let Some(location) = extract_first_value(&payload) {
+async fn handle_location(payload: Option<Value>, client: EventSender) {
+    if let Some(location) = payload {
         let text = |key: &str| {
             location
                 .get(key)
@@ -1099,8 +1039,8 @@ async fn handle_location(payload: Payload, client: Client) {
     emit_dns_update(&client).await;
 }
 
-async fn handle_adoption(state: ConnectionHandlers, payload: Payload, client: Client) {
-    let Some(value) = extract_first_value(&payload) else {
+async fn handle_adoption(state: ConnectionHandlers, payload: Option<Value>, client: EventSender) {
+    let Some(value) = payload else {
         return;
     };
     let message = value
@@ -1145,8 +1085,8 @@ async fn handle_adoption(state: ConnectionHandlers, payload: Payload, client: Cl
     }
 }
 
-fn handle_adoption_code(payload: &Payload) {
-    let Some(value) = extract_first_value(payload) else {
+fn handle_adoption_code(payload: Option<Value>) {
+    let Some(value) = payload else {
         return;
     };
     let Some(code) = value.get("code").and_then(Value::as_str) else {
@@ -1158,8 +1098,8 @@ fn handle_adoption_code(payload: &Payload) {
     );
 }
 
-async fn handle_settings(state: ConnectionHandlers, payload: Payload, client: Client) {
-    let Some(settings) = extract_first_value(&payload) else {
+async fn handle_settings(state: ConnectionHandlers, payload: Option<Value>, client: EventSender) {
+    let Some(settings) = payload else {
         return;
     };
     if state.settings.update(&settings).await {
@@ -1167,8 +1107,8 @@ async fn handle_settings(state: ConnectionHandlers, payload: Payload, client: Cl
     }
 }
 
-fn handle_ip(payload: &Payload, client: Client) {
-    let Some(value) = extract_first_value(payload) else {
+fn handle_ip(payload: Option<Value>, client: EventSender) {
+    let Some(value) = payload else {
         return;
     };
     let main_ip = value
@@ -1182,8 +1122,8 @@ fn handle_ip(payload: &Payload, client: Client) {
     });
 }
 
-async fn handle_proxy(state: ConnectionHandlers, payload: Payload, client: Client) {
-    let Some(value) = extract_first_value(&payload) else {
+async fn handle_proxy(state: ConnectionHandlers, payload: Option<Value>, client: EventSender) {
+    let Some(value) = payload else {
         return;
     };
     let is_proxy = value
@@ -1212,8 +1152,8 @@ async fn handle_proxy(state: ConnectionHandlers, payload: Payload, client: Clien
     client.emit("probe:status:update", json!(status)).await.ok();
 }
 
-fn handle_logs_transport(payload: &Payload) {
-    let Some(value) = extract_first_value(payload) else {
+fn handle_logs_transport(payload: Option<Value>) {
+    let Some(value) = payload else {
         return;
     };
     let is_active = value.get("isActive").and_then(serde_json::Value::as_bool);
@@ -1227,8 +1167,8 @@ fn handle_logs_transport(payload: &Payload) {
     API_LOG_BUFFER.update(is_active, send_interval, max_buffer);
 }
 
-fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Client) {
-    let Some(data) = extract_first_value(payload) else {
+fn handle_measurement(state: ConnectionHandlers, payload: Option<Value>, client: EventSender) {
+    let Some(data) = payload else {
         warn!("Empty measurement payload");
         return;
     };
@@ -1246,67 +1186,36 @@ fn handle_measurement(state: ConnectionHandlers, payload: &Payload, client: Clie
     }
 }
 
-fn register_socket_handlers(builder: ClientBuilder, state: &ConnectionHandlers) -> ClientBuilder {
-    let open = state.clone();
-    let close = state.clone();
-    let error = state.clone();
-    let proxy = state.clone();
-    let measurement = state.clone();
-    let restart = state.clone();
-    let adoption = state.clone();
-    let settings = state.clone();
-    builder
-        .on("open", move |_, client| {
-            let state = open.clone();
-            async move { handle_open(state, client).await }.boxed()
-        })
-        .on("close", move |payload, client| {
-            let state = close.clone();
-            async move { handle_close(state, payload, client).await }.boxed()
-        })
-        .on("error", move |payload, _| {
-            let state = error.clone();
-            async move { handle_error(state, payload).await }.boxed()
-        })
-        .on("probe:sigkill", move |_, _| {
-            let state = restart.clone();
-            async move {
+async fn dispatch_socket_events(
+    session: &mut Session,
+    state: &ConnectionHandlers,
+    sender: &EventSender,
+) -> Option<ConnectOutcome> {
+    handle_open(state, sender).await;
+    while let Some(event) = session.recv().await {
+        let payload = event.arguments.into_iter().next();
+        match event.name.as_str() {
+            "probe:sigkill" => {
                 info!(
                     "Probe restart requested by the API; draining {} active jobs.",
                     state.jobs.count()
                 );
-                state.signal.signal(ConnectOutcome::RestartRequested).await;
+                return Some(ConnectOutcome::RestartRequested);
             }
-            .boxed()
-        })
-        .on("api:connect:location", |payload, client| {
-            async move { handle_location(payload, client).await }.boxed()
-        })
-        .on("api:connect:adoption", move |payload, client| {
-            let state = adoption.clone();
-            async move { handle_adoption(state, payload, client).await }.boxed()
-        })
-        .on("api:connect:ip", |payload, client| {
-            async move { handle_ip(&payload, client) }.boxed()
-        })
-        .on("api:settings:update", move |payload, client| {
-            let state = settings.clone();
-            async move { handle_settings(state, payload, client).await }.boxed()
-        })
-        .on("api:connect:isProxy", move |payload, client| {
-            let state = proxy.clone();
-            async move { handle_proxy(state, payload, client).await }.boxed()
-        })
-        .on("api:logs-transport:set", |payload, _| {
-            async move { handle_logs_transport(&payload) }.boxed()
-        })
-        .on("probe:adoption:code", |payload, _| {
-            async move { handle_adoption_code(&payload) }.boxed()
-        })
-        .on("probe:measurement:request", move |payload, client| {
-            let state = measurement.clone();
-            async move { handle_measurement(state, &payload, client) }.boxed()
-        })
+            "api:connect:location" => handle_location(payload, sender.clone()).await,
+            "api:connect:adoption" => handle_adoption(state.clone(), payload, sender.clone()).await,
+            "api:connect:ip" => handle_ip(payload, sender.clone()),
+            "api:settings:update" => handle_settings(state.clone(), payload, sender.clone()).await,
+            "api:connect:isProxy" => handle_proxy(state.clone(), payload, sender.clone()).await,
+            "api:logs-transport:set" => handle_logs_transport(payload),
+            "probe:adoption:code" => handle_adoption_code(payload),
+            "probe:measurement:request" => {
+                handle_measurement(state.clone(), payload, sender.clone());
+            }
+            other => debug!(target: "api-connection", "Ignoring unhandled API event {other}"),
+        }
+    }
+    None
 }
 
 struct ConnectionTasks {
@@ -1317,7 +1226,7 @@ struct ConnectionTasks {
 }
 
 impl ConnectionTasks {
-    fn spawn(state: &ConnectionHandlers, socket: &Client, ping_target: &str) -> Self {
+    fn spawn(state: &ConnectionHandlers, socket: &EventSender, ping_target: &str) -> Self {
         Self {
             health: tokio::spawn(run_status_loop(
                 Arc::clone(&state.status_manager),
@@ -1338,7 +1247,7 @@ impl ConnectionTasks {
     }
 }
 
-async fn report_log_scopes(client: Client) {
+async fn report_log_scopes(client: EventSender) {
     tokio::time::sleep(log_scope_report_delay()).await;
     client
         .emit("probe:log-scopes", json!(REGISTERED_SCOPES))
@@ -1346,7 +1255,11 @@ async fn report_log_scopes(client: Client) {
         .ok();
 }
 
-async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_timeout: Duration) {
+async fn graceful_shutdown(
+    state: &ConnectionHandlers,
+    socket: &EventSender,
+    drain_timeout: Duration,
+) {
     state.status_manager.lock().await.set_sigterm();
     socket
         .emit("probe:status:update", json!("sigterm"))
@@ -1364,7 +1277,16 @@ async fn graceful_shutdown(state: &ConnectionHandlers, socket: &Client, drain_ti
             state.jobs.count()
         );
     }
-    flush_logs(socket).await;
+    if tokio::time::timeout(std::time::Duration::from_secs(10), flush_logs(socket))
+        .await
+        .is_err()
+    {
+        tracing::warn!(target: "api-connection", "Final probe log flush timed out");
+    }
+}
+
+async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|requested| *requested).await;
 }
 
 /// Connect once and run until shutdown, an API-requested restart, or disconnect.
@@ -1377,7 +1299,7 @@ async fn connect_once(
     let config_for_url = cfg.clone();
     let url = tokio::select! {
         biased;
-        _ = shutdown_rx.wait_for(|requested| *requested) => return ConnectOutcome::CleanShutdown,
+        () = wait_shutdown(&mut shutdown_rx) => return ConnectOutcome::CleanShutdown,
         result = async { tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await } => {
             match result {
                 Ok(url) => url,
@@ -1388,28 +1310,38 @@ async fn connect_once(
             }
         }
     };
-    let builder = ClientBuilder::new(url)
-        .transport_type(TransportType::Websocket)
-        .namespace("/probes");
-    let socket = tokio::select! {
+    let mut session = tokio::select! {
         biased;
-        _ = shutdown_rx.wait_for(|requested| *requested) => return ConnectOutcome::CleanShutdown,
-        result = register_socket_handlers(builder, &state).connect() => {
+        () = wait_shutdown(&mut shutdown_rx) => return ConnectOutcome::CleanShutdown,
+        result = Session::connect(&url) => {
             match result {
-                Ok(socket) => socket,
+                Ok(session) => session,
                 Err(error) => {
-                    error!(target: "api-connection", "Connection to API failed: {error}");
+                    if let Some(rejection) = error.downcast_ref::<ConnectRejected>() {
+                        return rejected_outcome(&rejection.0);
+                    }
+                    error!(target: "api-connection", "Connection to API failed: {error:#}");
                     return ConnectOutcome::Transient;
                 }
             }
         }
     };
 
+    let socket = session.sender();
+    let closed = session.closed();
     let tasks = ConnectionTasks::spawn(&state, &socket, &cfg.ping_target);
     let outcome = tokio::select! {
-        _ = shutdown_rx.wait_for(|requested| *requested) => ConnectOutcome::CleanShutdown,
-        outcome = state.signal.wait() => outcome,
+        biased;
+        () = wait_shutdown(&mut shutdown_rx) => ConnectOutcome::CleanShutdown,
+        outcome = dispatch_socket_events(&mut session, &state, &socket) => {
+            match outcome {
+                Some(outcome) => outcome,
+                None => handle_disconnect(&state, wait_closed(closed.clone()).await).await,
+            }
+        }
+        reason = wait_closed(closed.clone()) => handle_disconnect(&state, reason).await,
     };
+    session.stop_receiving();
     tasks.abort();
 
     match outcome {
@@ -1421,7 +1353,7 @@ async fn connect_once(
         }
         _ => {}
     }
-    socket.disconnect().await.ok();
+    session.disconnect().await;
     outcome
 }
 
@@ -1559,45 +1491,6 @@ async fn wait_for_signal() -> Result<()> {
     tokio::signal::ctrl_c().await?;
 
     Ok(())
-}
-
-// ── Error parsing ─────────────────────────────────────────────────────────────
-
-/// Extract (`inner_message`, `ip_address`) from a socket.io connect-error payload.
-///
-/// rust-socketio wraps connect errors as:
-///   `{ "message": "Received an ConnectError frame: {\"message\":\"ip limit\",\"data\":{...}}" }`
-///
-/// Node.js receives the inner message directly.  We parse the nested JSON so our
-/// logs match the Node.js format exactly.
-fn parse_connect_error(payload: &Payload) -> (String, Option<String>) {
-    let outer_msg = extract_first_value(payload)
-        .and_then(|v| {
-            v.get("message")
-                .and_then(|m| m.as_str())
-                .map(str::to_string)
-        })
-        .or_else(|| extract_first_string(payload))
-        .unwrap_or_default();
-
-    // Try to find an embedded JSON object inside the outer message.
-    if let Some(json_start) = outer_msg.find('{')
-        && let Ok(inner) = serde_json::from_str::<Value>(&outer_msg[json_start..])
-    {
-        let inner_msg = inner
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or(&outer_msg)
-            .to_string();
-        let ip = inner
-            .get("data")
-            .and_then(|d| d.get("ipAddress"))
-            .and_then(|ip| ip.as_str())
-            .map(str::to_string);
-        return (inner_msg, ip);
-    }
-
-    (outer_msg, None)
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -1745,28 +1638,6 @@ mod tests {
         Ok(())
     }
 
-    // ── OutcomeSignal ─────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn outcome_signal_delivers_first_value() {
-        let sig = OutcomeSignal::new();
-        let sig2 = sig.clone();
-        tokio::spawn(async move {
-            sig2.signal(ConnectOutcome::ProbePolicyError).await;
-        });
-        let outcome = sig.wait().await;
-        assert_eq!(outcome, ConnectOutcome::ProbePolicyError);
-    }
-
-    #[tokio::test]
-    async fn outcome_signal_only_first_write_wins() {
-        let sig = OutcomeSignal::new();
-        sig.signal(ConnectOutcome::MetadataError).await;
-        sig.signal(ConnectOutcome::Transient).await; // should be ignored
-        let outcome = sig.wait().await;
-        assert_eq!(outcome, ConnectOutcome::MetadataError);
-    }
-
     // ── MeasurementRequest deserialisation ────────────────────────────────────
 
     #[test]
@@ -1804,28 +1675,24 @@ mod tests {
         assert!(serde_json::from_value::<MeasurementRequest>(raw).is_err());
     }
 
-    // ── Payload helpers ───────────────────────────────────────────────────────
-
     #[test]
-    fn extract_value_from_text_payload() {
-        let p = Payload::Text(vec![json!({"key": "val"})]);
-        assert_eq!(extract_first_value(&p).unwrap()["key"], "val");
-    }
-
-    #[test]
-    fn extract_string_from_text_payload() {
-        let p = Payload::Text(vec![json!("hello")]);
-        assert_eq!(extract_first_string(&p), Some("hello".into()));
-    }
-
-    #[test]
-    fn extract_returns_none_for_empty_text() {
-        assert!(extract_first_value(&Payload::Text(vec![])).is_none());
-    }
-
-    #[test]
-    fn extract_returns_none_for_binary() {
-        assert!(extract_first_value(&Payload::Binary(bytes::Bytes::new())).is_none());
+    fn structured_socket_rejection_selects_reconnect_policy() {
+        assert_eq!(
+            rejected_outcome(&json!({"message":"ip limit", "data":{"ipAddress":"192.0.2.1"}})),
+            ConnectOutcome::ProbePolicyError
+        );
+        assert_eq!(
+            rejected_outcome(&json!({"message":"invalid probe version"})),
+            ConnectOutcome::InvalidVersion
+        );
+        assert_eq!(
+            rejected_outcome(&json!("server is terminating")),
+            ConnectOutcome::ServerTerminating
+        );
+        assert_eq!(
+            rejected_outcome(&json!({"message":"failed to collect probe metadata"})),
+            ConnectOutcome::MetadataError
+        );
     }
 
     // ── Type discriminator ────────────────────────────────────────────────────

@@ -16,14 +16,14 @@ A Rust rewrite of the [globalping-probe](https://github.com/jsdelivr/globalping-
 |---|---|---|
 | Rust | dated nightly in `rust-toolchain.toml` | edition 2024 |
 | Linux (WSL Ubuntu-24.04 or native) | — | Build and run target |
-| `libssl-dev`, `pkg-config` | — | Required by `rust_socketio` → `openssl-sys` |
+| `cmake`, `clang`, `libclang-dev`, C++ toolchain | — | Build the BTLS/BoringSSL transport |
 | `traceroute` | any | Must have `cap_net_raw` for ICMP mode (see below) |
 | `ping`, `dig`, `mtr`, `curl` | system | Used by measurement commands |
 
 ### First-time setup (WSL / Ubuntu)
 
 ```bash
-sudo apt-get install -y libssl-dev pkg-config traceroute mtr-tiny dnsutils curl
+sudo apt-get install -y build-essential cmake clang libclang-dev ninja-build traceroute mtr-tiny dnsutils curl openssl
 # Grant ICMP capability so traceroute works without root:
 sudo setcap cap_net_raw+ep $(readlink -f $(which traceroute))
 ```
@@ -192,7 +192,7 @@ Live tests (ping, traceroute, DNS, HTTP) require outbound internet access and th
 main.rs
   └─ probe::client::run(ClientConfig)
        ├─ connect_once()  ─────────────────────────────────────────────────────┐
-       │    ├─ ClientBuilder (rust_socketio)                                   │
+       │    ├─ Session (Wreq WebSocket)                                   │
        │    │    ├─ on("connect")         → emit status + DNS                  │
        │    │    ├─ on("disconnect")      → signal Transient outcome           │
        │    │    ├─ on("error")           → classify_error() → signal outcome  │
@@ -299,9 +299,7 @@ the findings below were fixed and covered with regression tests.
 
 ### Dependency audit
 
-`cargo audit` reports **no known vulnerabilities** in the dependency tree. Three
-transitive crates (`backoff`, `instant`, `rustls-pemfile`) carry informational
-*unmaintained* advisories only.
+The shared dependency-health CI gate runs RustSec and cargo-anoint against the locked workspace. See current CI results for findings.
 
 ### Running the security tests
 
@@ -319,21 +317,16 @@ cargo audit                                        # dependency CVE scan
 
 | Crate | Purpose |
 |---|---|
-| `tokio` | Async runtime (full feature set) |
+| `tokio` | Async runtime (explicit I/O/runtime features) |
 | `anyhow` | Ergonomic error propagation |
-| `thiserror` | Typed error definitions |
-| `async-trait` | Async methods in traits |
 | `tracing` / `tracing-subscriber` | Structured logging with env-filter |
 | `serde` / `serde_json` | Serialization for API messages |
-| `rust_socketio` | socket.io v4 client (async feature) |
+| `wreq` + BTLS | Unified native HTTP and WebSocket transport; Engine.IO v4 / Socket.IO JSON session |
 | `uuid` | Probe UUID generation |
-| `once_cell` | Lazy statics (regex, private-IP table) |
-| `regex` | Packet-line / hop-line matching for in-progress streaming |
-| `ipnet` | CIDR range parsing for private IP detection |
-| `futures-util` | `.boxed()` for event handler closures |
-| `bytes` | Binary payload type for `rust_socketio` |
+| `futures-util` | Future aggregation and WebSocket sink operations |
+| `jiff` | Native UTC timestamp formatting |
 
-**Dev only:** `tokio-test`, `mockall`, `assert_matches`, `tempfile`
+**Dev only:** `tempfile`, BTLS and Tokio WebSocket server fixtures
 
 ---
 

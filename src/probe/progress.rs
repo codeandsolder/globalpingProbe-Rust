@@ -4,16 +4,16 @@ use tokio::time::{Duration, Instant, sleep_until};
 use tracing::warn;
 
 use crate::command::{LazyProgress, ProgressUpdate};
+use crate::probe::socket::EventSender;
 use crate::util::output_limit::limit_raw_output;
 use crate::util::progress_buffer::{BufferMode, ProgressBuffer};
-use rust_socketio::asynchronous::Client;
 
 pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Receives partial string fields from a command and forwards coalesced
 /// `probe:measurement:progress` events using the same modes as upstream.
-pub struct ProgressEmitter {
-    client: Client,
+pub(crate) struct ProgressEmitter {
+    client: EventSender,
     test_id: String,
     measurement_id: String,
     buffer: Option<ProgressBuffer>,
@@ -22,7 +22,7 @@ pub struct ProgressEmitter {
 
 impl ProgressEmitter {
     pub fn new(
-        client: Client,
+        client: EventSender,
         test_id: impl Into<String>,
         measurement_id: impl Into<String>,
     ) -> Self {
