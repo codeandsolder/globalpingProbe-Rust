@@ -38,7 +38,8 @@ impl Default for Settings {
 
 struct Inner {
     entries: VecDeque<LogEntry>,
-    dropped: u64,
+    dropped: usize,
+    has_logged_discard: bool,
     settings: Settings,
 }
 
@@ -46,6 +47,7 @@ struct Inner {
 
 pub struct ApiLogsBuffer {
     inner: Mutex<Inner>,
+    send_lock: tokio::sync::Mutex<()>,
 }
 
 impl ApiLogsBuffer {
@@ -55,8 +57,10 @@ impl ApiLogsBuffer {
             inner: Mutex::new(Inner {
                 entries: VecDeque::new(),
                 dropped: 0,
+                has_logged_discard: false,
                 settings: Settings::default(),
             }),
+            send_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -67,7 +71,7 @@ impl ApiLogsBuffer {
         let overflow = g.entries.len().saturating_sub(max);
         if overflow > 0 {
             g.entries.drain(..overflow);
-            g.dropped += overflow as u64;
+            g.dropped = g.dropped.saturating_add(overflow);
         }
     }
 
@@ -99,19 +103,36 @@ impl ApiLogsBuffer {
             .map_or(10_000, |g| g.settings.send_interval_ms)
     }
 
-    /// Take buffered entries for sending. Returns None if inactive or empty.
-    pub fn take(&self) -> Option<serde_json::Value> {
-        let Ok(mut g) = self.inner.lock() else {
-            return None;
-        };
+    fn snapshot(&self) -> Option<LogBatch> {
+        let g = self.inner.lock().ok()?;
         if !g.settings.is_active || g.entries.is_empty() {
             return None;
         }
-        let logs: Vec<LogEntry> = g.entries.drain(..).collect();
-        let skipped = g.dropped;
-        g.dropped = 0;
-        Some(json!({ "logs": logs, "skipped": skipped }))
+        Some(LogBatch {
+            payload: json!({ "logs": g.entries, "skipped": g.dropped }),
+            present: g.entries.len(),
+            skipped: g.dropped,
+        })
     }
+
+    fn commit(&self, batch: &LogBatch, discarded: bool) -> bool {
+        let Ok(mut g) = self.inner.lock() else {
+            return false;
+        };
+        let lost = g.dropped.saturating_sub(batch.skipped);
+        let remaining = batch.present.saturating_sub(lost).min(g.entries.len());
+        g.entries.drain(..remaining);
+        g.dropped = lost.saturating_sub(batch.present);
+        let warn = discarded && !g.has_logged_discard;
+        g.has_logged_discard = discarded;
+        warn
+    }
+}
+
+struct LogBatch {
+    payload: serde_json::Value,
+    present: usize,
+    skipped: usize,
 }
 
 impl Default for ApiLogsBuffer {
@@ -145,7 +166,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ApiLogsLayer {
         let level = meta.level().as_str().to_lowercase();
         let target = meta.target();
         // "log" is the target used by the tracing-log bridge for the `log` crate.
-        // These are internal library messages (rust-socketio internals) that should
+        // These are internal library messages (transport library internals) that should
         // not appear in API logs, so we skip them here.
         let scope = if target == "log" {
             return;
@@ -171,19 +192,76 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for ApiLogsLayer {
 
 // ── Background flush loop ─────────────────────────────────────────────────────
 
-use rust_socketio::asynchronous::Client;
+use crate::probe::socket::EventSender;
 use tokio::time::{Duration, sleep};
 
-pub async fn flush_logs(client: &Client) {
-    if let Some(payload) = API_LOG_BUFFER.take() {
-        client.emit("probe:logs", payload).await.ok();
+pub(crate) async fn flush_logs(client: &EventSender) {
+    let _guard = API_LOG_BUFFER.send_lock.lock().await;
+    let Some(batch) = API_LOG_BUFFER.snapshot() else {
+        return;
+    };
+    match client
+        .emit_with_ack("probe:logs", batch.payload.clone())
+        .await
+    {
+        Ok(response) => match response.first().and_then(serde_json::Value::as_str) {
+            Some("success") => {
+                API_LOG_BUFFER.commit(&batch, false);
+            }
+            Some("discard") => {
+                if API_LOG_BUFFER.commit(&batch, true) {
+                    tracing::warn!(target: "api-connection", "API discarded probe log batch");
+                }
+            }
+            _ => {
+                tracing::warn!(target: "api-connection", "Unexpected probe log acknowledgement: {response:?}")
+            }
+        },
+        Err(error) => {
+            tracing::warn!(target: "api-connection", "Probe logs retained after delivery failure: {error:#}")
+        }
     }
 }
 
-pub async fn run_logs_loop(client: Client) {
+pub(crate) async fn run_logs_loop(client: EventSender) {
     loop {
         let interval = API_LOG_BUFFER.send_interval_ms();
         sleep(Duration::from_millis(interval)).await;
         flush_logs(&client).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(message: &str) -> LogEntry {
+        LogEntry {
+            message: message.to_owned(),
+            level: "info".to_owned(),
+            timestamp: "2026-01-01T00:00:00.000Z".to_owned(),
+            scope: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn acknowledgement_removes_only_the_sent_batch_after_overflow() {
+        let buffer = ApiLogsBuffer::new();
+        buffer.update(Some(true), None, Some(2));
+        for message in ["a", "b", "c"] {
+            buffer.push(log(message));
+        }
+        let Some(batch) = buffer.snapshot() else {
+            panic!("missing batch")
+        };
+        assert_eq!(batch.payload["skipped"], 1);
+        buffer.push(log("d"));
+        assert!(!buffer.commit(&batch, false));
+        let Some(next) = buffer.snapshot() else {
+            panic!("missing next batch")
+        };
+        assert_eq!(next.payload["skipped"], 0);
+        assert_eq!(next.payload["logs"][0]["message"], "d");
+        assert_eq!(next.present, 1);
     }
 }

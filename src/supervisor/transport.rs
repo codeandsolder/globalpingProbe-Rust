@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
-use reqwest::redirect::Policy;
+use futures_util::StreamExt as _;
 use tracing::{debug, info, warn};
 use url::Url;
+use wreq::redirect::Policy;
 
 use super::bootstrap::{BehaviorBootstrapConfig, BehaviorController, BootstrapError};
 use super::update::{BehaviorManifest, MAX_COMPONENT_BYTES, MAX_MANIFEST_BYTES};
@@ -41,8 +42,8 @@ pub enum BehaviorTransportError {
     UpdateUrlMissingHost,
     UpdateUrlCredentials,
     UpdateUrlQueryOrFragment,
-    HttpClient(reqwest::Error),
-    Http(reqwest::Error),
+    HttpClient(wreq::Error),
+    Http(wreq::Error),
     PayloadTooLarge {
         kind: &'static str,
         limit: usize,
@@ -212,14 +213,14 @@ pub enum BehaviorUpdateOutcome {
 
 #[derive(Clone)]
 pub struct BehaviorUpdater {
-    client: reqwest::Client,
+    client: wreq::Client,
     manifest_url: Url,
     component_url: Url,
     interval: Duration,
 }
 
-fn update_http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+fn update_http_client_builder() -> wreq::ClientBuilder {
+    wreq::Client::builder()
         .redirect(Policy::none())
         .https_only(true)
         .connect_timeout(UPDATE_CONNECT_TIMEOUT)
@@ -242,7 +243,7 @@ impl BehaviorUpdater {
     fn with_client(
         base: &Url,
         interval: Duration,
-        client: reqwest::Client,
+        client: wreq::Client,
     ) -> Result<Self, BehaviorTransportError> {
         let manifest_url = base
             .join("manifest.json")
@@ -355,9 +356,9 @@ impl BehaviorUpdater {
         limit: usize,
         kind: &'static str,
     ) -> Result<Vec<u8>, BehaviorTransportError> {
-        let mut response = self
+        let response = self
             .client
-            .get(url.clone())
+            .get(url.as_str())
             .send()
             .await
             .map_err(BehaviorTransportError::Http)?
@@ -375,11 +376,9 @@ impl BehaviorUpdater {
             .unwrap_or(0)
             .min(limit);
         let mut body = Vec::with_capacity(capacity);
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(BehaviorTransportError::Http)?
-        {
+        let mut stream = std::pin::pin!(response.bytes_stream());
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(BehaviorTransportError::Http)?;
             if body
                 .len()
                 .checked_add(chunk.len())
@@ -441,11 +440,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::{Router, routing::get};
+    use btls::{
+        pkey::PKey,
+        ssl::{Ssl, SslAcceptor, SslMethod},
+        x509::X509,
+    };
     use ed25519_dalek::{Signer as _, SigningKey};
     use sha2::{Digest as _, Sha256};
-    use tokio_rustls::TlsAcceptor;
-    use tokio_rustls::rustls::ServerConfig;
-    use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::pin::Pin;
 
     use super::*;
     use crate::supervisor::health::{BehaviorHealthEvent, BehaviorHealthPolicy};
@@ -491,18 +493,24 @@ mod tests {
 
     struct TestTlsListener {
         tcp: tokio::net::TcpListener,
-        acceptor: TlsAcceptor,
+        acceptor: SslAcceptor,
     }
 
     impl axum::serve::Listener for TestTlsListener {
-        type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+        type Io = tokio_btls::SslStream<tokio::net::TcpStream>;
         type Addr = SocketAddr;
 
         async fn accept(&mut self) -> (Self::Io, Self::Addr) {
             loop {
                 match self.tcp.accept().await {
                     Ok((stream, address)) => {
-                        if let Ok(stream) = self.acceptor.accept(stream).await {
+                        let Ok(ssl) = Ssl::new(self.acceptor.context()) else {
+                            continue;
+                        };
+                        let Ok(mut stream) = tokio_btls::SslStream::new(ssl, stream) else {
+                            continue;
+                        };
+                        if Pin::new(&mut stream).accept().await.is_ok() {
                             return (stream, address);
                         }
                     }
@@ -518,7 +526,7 @@ mod tests {
 
     struct TestHttpsServer {
         base: Url,
-        root_certificate: reqwest::Certificate,
+        root_certificate: wreq::tls::trust::CertStore,
         artifact_state: Arc<RwLock<ServedBehavior>>,
         component_hits: Arc<AtomicUsize>,
         task: tokio::task::JoinHandle<()>,
@@ -580,16 +588,20 @@ mod tests {
 
         // Fixed test-only localhost certificate and private key. These bytes are
         // intentionally public fixtures, not production signing or TLS material.
-        let cert_der = tokio_rustls::rustls::pki_types::CertificateDer::from(
-            include_bytes!("../../tests/fixtures/behavior-update-localhost-cert.der").to_vec(),
-        );
-        let key_der = PrivatePkcs8KeyDer::from(
-            include_bytes!("../../tests/fixtures/behavior-update-localhost-key.der").to_vec(),
-        );
-        let tls = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
-            .unwrap_or_else(|error| panic!("test TLS configuration failed: {error}"));
+        let cert = X509::from_der(include_bytes!(
+            "../../tests/fixtures/behavior-update-localhost-cert.der"
+        ))
+        .unwrap_or_else(|error| panic!("test certificate: {error}"));
+        let key = PKey::private_key_from_pkcs8(include_bytes!(
+            "../../tests/fixtures/behavior-update-localhost-key.der"
+        ))
+        .unwrap_or_else(|error| panic!("test private key: {error}"));
+        let mut tls = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+            .unwrap_or_else(|error| panic!("test TLS configuration: {error}"));
+        tls.set_certificate(&cert)
+            .and_then(|()| tls.set_private_key(&key))
+            .and_then(|()| tls.check_private_key())
+            .unwrap_or_else(|error| panic!("test TLS keypair: {error}"));
         let tcp = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap_or_else(|error| panic!("test HTTPS listener bind failed: {error}"));
@@ -598,17 +610,19 @@ mod tests {
             .unwrap_or_else(|error| panic!("test HTTPS listener address failed: {error}"));
         let listener = TestTlsListener {
             tcp,
-            acceptor: TlsAcceptor::from(Arc::new(tls)),
+            acceptor: tls.build(),
         };
         let task = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         let base = Url::parse(&format!("https://{address}/"))
             .unwrap_or_else(|error| panic!("test HTTPS URL failed: {error}"));
-        let root_certificate = reqwest::Certificate::from_der(include_bytes!(
-            "../../tests/fixtures/behavior-update-localhost-ca.der"
-        ))
-        .unwrap_or_else(|error| panic!("test root certificate failed: {error}"));
+        let root_certificate = wreq::tls::trust::CertStore::builder()
+            .add_der_cert(include_bytes!(
+                "../../tests/fixtures/behavior-update-localhost-ca.der"
+            ))
+            .build()
+            .unwrap_or_else(|error| panic!("test root certificate failed: {error}"));
         TestHttpsServer {
             base,
             root_certificate,
@@ -815,7 +829,7 @@ mod tests {
         let base = Url::parse(&format!("http://{address}/"))
             .unwrap_or_else(|error| panic!("test URL failed: {error}"));
         let updater = BehaviorUpdater {
-            client: reqwest::Client::builder()
+            client: wreq::Client::builder()
                 .redirect(Policy::none())
                 .build()
                 .unwrap_or_else(|error| panic!("test HTTP client failed: {error}")),
@@ -916,7 +930,7 @@ mod tests {
             assert_eq!(config.update_base(), Some(&https.base));
             assert!(config.updater().is_ok());
             let client = update_http_client_builder()
-                .add_root_certificate(https.root_certificate.clone())
+                .tls_cert_store(https.root_certificate.clone())
                 .build()
                 .unwrap_or_else(|error| panic!("test production HTTPS client failed: {error}"));
             let updater = BehaviorUpdater::with_client(&https.base, Duration::from_secs(1), client)

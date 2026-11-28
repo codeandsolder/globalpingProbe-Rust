@@ -224,12 +224,12 @@ mod tests {
         let server = AdoptionServer::new(0, Duration::from_secs(10), "https://dash.example");
         let session = server.start().await?;
         let base = format!("http://127.0.0.1:{}", session.address.port());
-        let client = reqwest::Client::new();
-        let no_redirect = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = wreq::Client::new();
+        let no_redirect = wreq::Client::builder()
+            .redirect(wreq::redirect::Policy::none())
             .build()?;
 
-        let root = client.get(&base).send().await?;
+        let root = client.get(base.as_str()).send().await?;
         assert_eq!(root.status(), StatusCode::OK);
         assert_eq!(root.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
         assert_eq!(root.json::<Value>().await?["token"], session.token);

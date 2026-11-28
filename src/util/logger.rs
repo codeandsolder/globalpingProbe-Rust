@@ -93,7 +93,8 @@ where
 pub fn init() {
     // Apply filter per-layer so each layer is independently filtered.
     // A single registry-level filter would be bypassed by outer layers.
-    let filter_str = "debug,hyper=warn,reqwest=warn,h2=warn,rustls=warn,log=warn";
+    let filter_str =
+        "debug,hyper=warn,wreq=warn,http2=warn,btls=warn,tungstenite=warn,netty=warn,log=warn";
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_str));
     let filter2 = EnvFilter::new(filter_str);
 
@@ -104,7 +105,7 @@ pub fn init() {
         .with_filter(filter);
 
     // ApiLogsLayer skips "log" target events internally; the per-layer filter2
-    // additionally suppresses library internals (hyper, reqwest, etc.) from the buffer.
+    // additionally suppresses library internals (hyper, Wreq, etc.) from the buffer.
     tracing_subscriber::registry()
         .with(fmt_layer)
         .with(ApiLogsLayer.with_filter(filter2))
