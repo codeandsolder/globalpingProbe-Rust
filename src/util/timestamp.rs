@@ -1,10 +1,10 @@
 use jiff::Timestamp;
 
-pub(crate) fn wire_timestamp(timestamp: Timestamp) -> String {
+pub fn wire_timestamp(timestamp: Timestamp) -> String {
     format!("{timestamp:.3}")
 }
 
-pub(crate) fn console_timestamp(timestamp: &Timestamp) -> impl std::fmt::Display + '_ {
+pub fn console_timestamp(timestamp: &Timestamp) -> impl std::fmt::Display + '_ {
     timestamp.strftime("%Y-%m-%d %H:%M:%S +00:00")
 }
 
