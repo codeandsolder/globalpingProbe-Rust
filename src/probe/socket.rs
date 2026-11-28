@@ -45,7 +45,7 @@ pub enum Disconnect {
     ClientDisconnected,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Event {
     pub name: String,
     pub arguments: Vec<Value>,
@@ -200,10 +200,10 @@ fn parse_namespace_packet(text: &str) -> Result<Packet> {
 
 fn encode_event(name: &str, value: Value, id: Option<u64>) -> Result<String> {
     let data = serde_json::to_string(&(name, value))?;
-    Ok(match id {
-        Some(id) => format!("42{NAMESPACE},{id}{data}"),
-        None => format!("42{NAMESPACE},{data}"),
-    })
+    Ok(id.map_or_else(
+        || format!("42{NAMESPACE},{data}"),
+        |id| format!("42{NAMESPACE},{id}{data}"),
+    ))
 }
 
 async fn write_message(socket: &mut WebSocket, message: Message) -> Result<()> {
@@ -478,10 +478,14 @@ impl Drop for Session {
 }
 
 pub async fn wait_closed(mut closed: watch::Receiver<Option<Disconnect>>) -> Disconnect {
-    match closed.wait_for(Option::is_some).await {
-        Ok(reason) => reason.clone().unwrap_or(Disconnect::TransportClosed),
-        Err(_) => Disconnect::TransportError("socket I/O task stopped unexpectedly".to_owned()),
-    }
+    closed.wait_for(Option::is_some).await.map_or_else(
+        |_| Disconnect::TransportError("socket I/O task stopped unexpectedly".to_owned()),
+        |reason| {
+            reason.clone().unwrap_or_else(|| {
+                Disconnect::TransportError("socket closed without a reason".to_owned())
+            })
+        },
+    )
 }
 
 fn transport_error(error: &anyhow::Error) -> Disconnect {

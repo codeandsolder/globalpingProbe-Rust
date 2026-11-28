@@ -214,11 +214,11 @@ pub(crate) async fn flush_logs(client: &EventSender) {
                 }
             }
             _ => {
-                tracing::warn!(target: "api-connection", "Unexpected probe log acknowledgement: {response:?}")
+                tracing::warn!(target: "api-connection", "Unexpected probe log acknowledgement: {response:?}");
             }
         },
         Err(error) => {
-            tracing::warn!(target: "api-connection", "Probe logs retained after delivery failure: {error:#}")
+            tracing::warn!(target: "api-connection", "Probe logs retained after delivery failure: {error:#}");
         }
     }
 }

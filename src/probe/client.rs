@@ -1210,7 +1210,7 @@ async fn dispatch_socket_events(
             "api:logs-transport:set" => handle_logs_transport(payload),
             "probe:adoption:code" => handle_adoption_code(payload),
             "probe:measurement:request" => {
-                handle_measurement(state.clone(), payload, sender.clone())
+                handle_measurement(state.clone(), payload, sender.clone());
             }
             other => debug!(target: "api-connection", "Ignoring unhandled API event {other}"),
         }
@@ -1285,6 +1285,10 @@ async fn graceful_shutdown(
     }
 }
 
+async fn wait_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|requested| *requested).await;
+}
+
 /// Connect once and run until shutdown, an API-requested restart, or disconnect.
 async fn connect_once(
     cfg: &ClientConfig,
@@ -1295,7 +1299,7 @@ async fn connect_once(
     let config_for_url = cfg.clone();
     let url = tokio::select! {
         biased;
-        _ = shutdown_rx.wait_for(|requested| *requested) => return ConnectOutcome::CleanShutdown,
+        () = wait_shutdown(&mut shutdown_rx) => return ConnectOutcome::CleanShutdown,
         result = async { tokio::task::spawn_blocking(move || connection_url(&config_for_url)).await } => {
             match result {
                 Ok(url) => url,
@@ -1308,7 +1312,7 @@ async fn connect_once(
     };
     let mut session = tokio::select! {
         biased;
-        _ = shutdown_rx.wait_for(|requested| *requested) => return ConnectOutcome::CleanShutdown,
+        () = wait_shutdown(&mut shutdown_rx) => return ConnectOutcome::CleanShutdown,
         result = Session::connect(&url) => {
             match result {
                 Ok(session) => session,
@@ -1328,7 +1332,7 @@ async fn connect_once(
     let tasks = ConnectionTasks::spawn(&state, &socket, &cfg.ping_target);
     let outcome = tokio::select! {
         biased;
-        _ = shutdown_rx.wait_for(|requested| *requested) => ConnectOutcome::CleanShutdown,
+        () = wait_shutdown(&mut shutdown_rx) => ConnectOutcome::CleanShutdown,
         outcome = dispatch_socket_events(&mut session, &state, &socket) => {
             match outcome {
                 Some(outcome) => outcome,
