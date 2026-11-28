@@ -100,7 +100,7 @@ pub async fn refresh_alt_ips(socket: &Client, http_host: &str, main_ip: &str) {
     }
 
     let results =
-        futures::future::join_all(alt_ips.iter().map(|&ip| fetch_alt_ip_token(ip, http_host)))
+        futures_util::future::join_all(alt_ips.iter().map(|&ip| fetch_alt_ip_token(ip, http_host)))
             .await;
 
     let mut tokens: Vec<serde_json::Value> = Vec::new();

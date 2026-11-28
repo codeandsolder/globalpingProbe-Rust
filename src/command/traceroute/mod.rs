@@ -207,7 +207,7 @@ impl TracerouteEnrichmentBroker {
             }
         }
         let per_lookup = budget.min(Duration::from_secs(2));
-        futures::future::join_all(addresses.into_iter().map(|address| async move {
+        futures_util::future::join_all(addresses.into_iter().map(|address| async move {
             #[cfg(test)]
             let hostname = self.lookup_oracle(address, per_lookup).await;
             #[cfg(not(test))]
